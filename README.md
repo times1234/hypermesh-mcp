@@ -32,6 +32,12 @@ refinement rules.
 - `get_hypermesh_meshing_strategy`: return generic meshing rules and workflows.
 - `get_meshing_rules`: return structured generic tetra/drag/spin rules.
 - `classify_hypermesh_part_strategy`: classify a part by geometry features.
+- `generate_geometry_probe_tcl`: generate a temporary coarse surface-mesh probe
+  for all or selected solids; probe elements and nodes are deleted before return.
+- `run_geometry_probe_gui`: run that temporary probe in the visible GUI and
+  return `MCP_PROBE_SOLID` lines for per-object sizing/strategy planning.
+- `recommend_tetra_sizes_from_probe_lines`: turn probe lines into per-solid
+  tetra element-size recommendations, reducing size for thin/small bodies.
 - `generate_surface_automesh_tcl`: generate simple surface automesh Tcl.
 - `generate_surface_deviation_rtrias_tcl`: generate surface deviation + R-trias Tcl.
 - `generate_gear_aware_tetra_tcl`: generate gear/tooth local-refinement tetra Tcl.

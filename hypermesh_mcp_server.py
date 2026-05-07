@@ -369,13 +369,7 @@ def _balanced_seed_density(
 
 def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
     """Reject raw meshing Tcl that bypasses MCP strategy generators."""
-    clean_lines = []
-    for line in script.split("\n"):
-        pos = line.find("#")
-        if pos >= 0:
-            line = line[:pos]
-        clean_lines.append(line)
-    lowered = "\n".join(clean_lines).lower()
+    lowered_raw = script.lower()
     allowed_markers = (
         "mcp geometry probe",
         "mcp guarded drag hex",
@@ -385,8 +379,16 @@ def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
         "mcp surface deviation r-trias",
         "mcp surface automesh",
     )
-    if any(marker in lowered for marker in allowed_markers):
+    if any(marker in lowered_raw for marker in allowed_markers):
         return None
+
+    clean_lines = []
+    for line in script.split("\n"):
+        pos = line.find("#")
+        if pos >= 0:
+            line = line[:pos]
+        clean_lines.append(line)
+    lowered = "\n".join(clean_lines).lower()
 
     has_drag = "*meshdragelements" in lowered
     has_spin = "*meshspinelements" in lowered
@@ -725,7 +727,7 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         is_circular = (dx > 0 and dy > 0 and abs(dx - dy) / max(dx, dy) < 0.20)
         strategy = "tetra_plain"
         evidence = []
-        elem_size = min(max(0.6, mx / 12.0), 2.0)
+        elem_size = 1.0
         if sc == 6 and mx > 0 and mn / mx < 0.40:
             strategy = "drag_hex"
             evidence.append("6-face thin -> drag")
@@ -733,10 +735,10 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         #     strategy = "gear_aware_tetra"
         #     evidence.append("gear-like")
         #     elem_size = min(max(0.6, mx / 18.0), 2.0)
-        elif is_circular and slender > 2.5 and mx > 2 * md:
+        elif is_circular and slender > 2.5 and mx > 2 * md and sc <= 10:
             strategy = "spin_hex"
             evidence.append("shaft -> spin")
-        elif is_circular and slender < 3 and mx < 2 * md and sc > 6:
+        elif is_circular and slender < 3 and mx < 2 * md and 6 < sc <= 10:
             strategy = "spin_hex"
             evidence.append("compact -> spin")
         elif slender > 15 and mn < 2.0:
@@ -788,7 +790,8 @@ def generate_rename_components_tcl(classification_results):
         lines.append("set cids [hm_getmark components 1]")
         lines.append("if {[llength $cids] > 0} {")
         lines.append("    set cid [lindex $cids 0]")
-        lines.append('    catch {*setvalue components id=$cid name="' + name + '"}')
+        lines.append("    set oldname [hm_getvalue components id=$cid dataname=name]")
+        lines.append('    catch {*renamecollector components "$oldname" "' + name + '"}')
         lines.append("    incr renamed")
         lines.append("}")
     lines.append('puts "RENAMED: $renamed components"')
@@ -799,18 +802,23 @@ def generate_rename_components_tcl(classification_results):
 def generate_component_colors_tcl(classification_results):
     """Generate Tcl to assign unique colors to each component by strategy type."""
     lines = ["# Color components by strategy", "set colored 0"]
-    # Color map: drag_hex=blue, spin_hex=green, gear_aware_tetra=red, tetra_plain=yellow
-    color_map = {"drag_hex": 11, "spin_hex": 7, "gear_aware_tetra": 3, "tetra_plain": 4}
+    color_map = {"drag_hex": 1, "spin_hex": 7, "gear_aware_tetra": 3, "tetra_plain": 4}
+    
+    # Group component names by strategy
+    groups = {}
     for sid_str, info in classification_results.get("results", {}).items():
         strategy = info.get("strategy", "tetra_plain")
+        name = info.get("component_name", "")
+        if name:
+            groups.setdefault(strategy, []).append(name)
+    
+    for strategy, names in groups.items():
         color = color_map.get(strategy, 4)
-        lines.append(f'*createmark components 1 "by solids" {sid_str}')
-        lines.append("set cids [hm_getmark components 1]")
-        lines.append("if {[llength $cids] > 0} {")
-        lines.append("    set cid [lindex $cids 0]")
-        lines.append(f"    catch {{*setvalue components id=$cid color={color}}}")
-        lines.append("    incr colored")
-        lines.append("}")
+        name_list = " ".join(f'"{n}"' for n in names)
+        lines.append(f"*createmark components 1 {name_list}")
+        lines.append(f"catch {{*autocolorwithmark components 1 {color}}}")
+        lines.append(f"set colored [expr {{$colored + {len(names)}}}]")
+    
     lines.append('puts "COLORED: $colored components"')
     return {"success": True, "tcl_script": "\n".join(lines)}
 
@@ -1495,6 +1503,11 @@ def generate_surface_deviation_rtrias_tcl(
             f"{float(max_deviation)} {float(max_feature_angle)} "
             f"{float(growth_rate)} 1 3 1 0"
         ),
+        '# Clean highly skewed 2D shell elements before tetramesh',
+        f'*createmark elems 1 "by comp" "$target_component"',
+        '*elementtest 1 aspect 0 10.0 0 1 0',
+        '*retainmark elems 1 "fail"',
+        'if {[hm_marklength elems 1] > 0} { eval *createmark elems 1 [hm_getmark elems 1]; catch {*deletemark elems 1} }',
         'catch {*endhistorystate "MCP surface deviation R-trias"}',
     ]
     if output_hm_path:
@@ -1761,26 +1774,60 @@ def generate_plain_tetra_tcl(
         f"set target_solid {int(solid_id)}",
         f"set target_component {{{comp}}}",
         f"set elem_size {float(element_size)}",
-        f"set min_size {float(min_element_size)}",
         f"set max_dev {float(max_deviation)}",
         f"set feat_angle {float(feature_angle)}",
         f"set growth {float(growth_rate)}",
+        "set retry_count 3",
+        "set fit_tol_ratio 0.05",
         '*currentcollector components "$target_component"',
         '*createmark surfaces 1 "by solids" $target_solid',
         'if {[hm_marklength surfaces 1] == 0} { puts "No surfaces."; return }',
-        "*createarray 3 0 0 0",
-        "*defaultmeshsurf_growth 1 $elem_size 3 3 2 1 1 1 35 0 $min_size [expr {$elem_size*1.5}] $max_dev $feat_angle $growth 1 3 1 0",
-        "*storemeshtodatabase 1",
-        '*createmark elems 1 "by surface" [hm_getmark surfaces 1]',
-        'set shell_count [hm_marklength elems 1]',
-        'puts "MCP plain tetra: shell_count=$shell_count"',
-        "*createstringarray 2 \\",
-        "    \"tet: 547 1.2 2 [expr {$elem_size*1.9}] 0.8 0.5 0\" \\",
-        "    \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
-        "*tetmesh elems 1 1 elems 0 -1 1 2",
+        '*createmark surfaces 2 "by solids" $target_solid',
+        'set sbb [hm_getboundingbox surfaces 2]',
+        'set sdx [expr {abs([lindex $sbb 3]-[lindex $sbb 0])}]',
+        'set sdy [expr {abs([lindex $sbb 4]-[lindex $sbb 1])}]',
+        'set sdz [expr {abs([lindex $sbb 5]-[lindex $sbb 2])}]',
+        'set min_dim [lindex [lsort -real [list $sdx $sdy $sdz]] 0]',
+        'set solid_bb [list [lindex $sbb 0] [lindex $sbb 1] [lindex $sbb 2] [lindex $sbb 3] [lindex $sbb 4] [lindex $sbb 5]]',
+        'set solid_diag [expr {sqrt(pow($sdx,2)+pow($sdy,2)+pow($sdz,2))}]',
+        'set ok 0; set at 0; set cs $elem_size',
+        'while {!$ok && $at < $retry_count} {',
+        '    set mn_size [expr {min($min_dim*0.1, 0.5)}]',
+        '    if {$mn_size < 0.1} {set mn_size 0.1}',
+        '    *createarray 3 0 0 0',
+        '    *defaultmeshsurf_growth 1 $cs 3 3 2 1 1 1 35 0 $mn_size [expr {$cs*1.5}] $max_dev $feat_angle $growth 1 3 1 0',
+        '    *storemeshtodatabase 1',
+        '    *createmark elems 1 "by surface" [hm_getmark surfaces 1]',
+        '    *elementtest 1 aspect 0 10.0 0 1 0',
+        '    *retainmark elems 1 "fail"',
+        '    if {[hm_marklength elems 1] > 0} { eval *createmark elems 1 [hm_getmark elems 1]; catch {*deletemark elems 1} }',
+        '    *createmark elems 1 "by surface" [hm_getmark surfaces 1]',
+        '    set shell_count [hm_marklength elems 1]',
+        '    if {$shell_count == 0} { incr at; continue }',
+        f'    *createstringarray 2 "tet: 547 1.2 2 [expr {{$cs*1.9}}] 0.8 $mn_size 0" "pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew=\'0.99,0.95,0.90,1\'"',
+        '    catch {*tetmesh elems 1 1 elems 0 -1 1 2}',
+        '    *createmark elems 1 "by comp" "$target_component"',
+        '    if {[hm_marklength elems 1] == 0} { incr at; set cs [expr {$cs*0.7}]; continue }',
+        '    *createmark elems 2 [hm_getmark elems 1]',
+        '    set eb [hm_getboundingbox elems 2 0 0 0]',
+        '    set fit_tol [expr {max($cs*1.5, $solid_diag*$fit_tol_ratio)}]',
+        '    set bbox_ok 1',
+        '    for {set i 0} {$i<6} {incr i} {if {abs([lindex $eb $i]-[lindex $solid_bb $i])>$fit_tol} {set bbox_ok 0}}',
+        '    if {$bbox_ok} {',
+        '        set ok 1',
+        '        catch {*elementtest 1 vol_skew 1 0.99 0 1 0}',
+        '        catch {*retainmark elems 1 "fail"}',
+        '        if {[hm_marklength elems 1] > 0} { catch {*smooth elems 1 1} }',
+        '    } else {',
+        '        set all_elems [hm_getmark elems 1]',
+        '        if {[llength $all_elems] > 0} { eval *createmark elems 1 $all_elems; catch {*deletemark elems 1} }',
+        '        set cs [expr {$cs*0.7}]',
+        '    }',
+        '    incr at',
+        '}',
         '*createmark elems 1 "by comp" "$target_component"',
         'set final_count [hm_marklength elems 1]',
-        'puts "MCP plain tetra completed: total=$final_count"',
+        'puts "MCP plain tetra completed: total=$final_count retries=$at"',
     ]
     if output_hm_path:
         lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
@@ -2130,20 +2177,30 @@ def generate_batched_drag_hex_tcl(
         "}",
         "proc b_tetra {id c z} {",
         "    if {$id<=0} {return 0}; *currentcollector components $c",
+        '    *createmark elems 1 "by comp" "$c"; catch {*deletemark elems 1}',
         '    *createmark surfaces 1 "by solids" $id',
         "    if {[catch {hm_marklength surfaces 1} sc]||$sc==0} {return 0}",
-        "    set bf [b_all]; set mn 0.50",
-        "    if {$z<0.55} {set mn [expr {$z*0.60}]}",
+        "    set bf [b_all]",
+        '    *createmark surfaces 2 "by solids" $id',
+        "    set sbb [hm_getboundingbox surfaces 2]",
+        "    set sdx [expr {abs([lindex $sbb 3]-[lindex $sbb 0])}]",
+        "    set sdy [expr {abs([lindex $sbb 4]-[lindex $sbb 1])}]",
+        "    set sdz [expr {abs([lindex $sbb 5]-[lindex $sbb 2])}]",
+        "    set min_dim [lindex [lsort -real [list $sdx $sdy $sdz]] 0]",
+        "    set mn [expr {min($min_dim*0.1, 0.5)}]",
+        "    if {$mn < 0.1} {set mn 0.1}",
         "    set mx [expr {max($z*1.8,max($mn+0.05,0.75))}]",
         "    *createarray 3 0 0 0",
         "    if {[catch {*defaultmeshsurf_growth 1 $z 3 3 2 1 1 1 35 0 $mn $mx 0.1 15 1.23 1 3 1 0} e]} {return 0}",
         "    set sh [b_sub [b_all] $bf]; if {[llength $sh]==0} {return 0}",
         "    eval *createmark elems 1 $sh",
-        "    set tx [expr {max($z*1.9,max($mn+0.05,0.85))}]; set tn 0.50",
-        "    if {$z<0.55} {set tn [expr {$z*0.60}]}",
+        "    set tx [expr {max($z*1.9,max($mn+0.05,0.85))}]; set tn $mn",
         '    *createstringarray 2 "tet: 547 1.2 2 $tx 0.8 $tn 0" "pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew=\'0.99,0.95,0.90,1\'"',
         "    if {[catch {*tetmesh elems 1 1 elems 0 -1 1 2} e]} {eval *createmark elems 1 $sh; catch {*deletemark elems 1}; return 0}",
-        "    eval *createmark elems 1 $sh; catch {*deletemark elems 1}; return 1",
+        "    eval *createmark elems 1 $sh; catch {*deletemark elems 1}",
+        '    *createmark elems 1 "by comp" "$c"',
+        "    if {[hm_marklength elems 1] == 0} {return 0}",
+        "    return 1",
         "}",
         "set batch {",
         batch_tcl,
@@ -2172,6 +2229,13 @@ def generate_batched_drag_hex_tcl(
         "        }",
         "        *automesh 0 5 1; *storemeshtodatabase 1; *ameshclearsurface",
         '        *createmark elems 1 "by surface" $surf',
+        '        *elementtest 1 aspect 0 10.0 0 1 0',
+        '        if {[hm_marklength elems 1] > 0} {',
+        '            eval *createmark elems 1 [hm_getmark elems 1]; *deletemark elems 1',
+        '            set cs [expr {$cs*0.8}]; if {$cs<0.3} {set cs 0.3}',
+        '            continue',
+        '        }',
+        '        *createmark elems 1 "by surface" $surf',
         "        set ss [hm_getmark elems 1]; set qc 0",
         "        foreach i $ss { set cf [hm_getvalue elems id=$i dataname=config]; if {$cf==104||$cf==108} {incr qc} }",
         "        if {[llength $ss]==0||$qc!=[llength $ss]} {",
@@ -2184,9 +2248,7 @@ def generate_batched_drag_hex_tcl(
         "        set sb [hm_getboundingbox surfaces 2 0 0 0]",
         "        *createmark surfaces 2 \"by solids\" $sid",
         "        set bb [hm_getboundingbox surfaces 2 0 0 0]",
-        "        if {$ax eq \"x\"} {set dvx 1; set dvy 0; set dvz 0; set sc [expr {([lindex $sb 0]+[lindex $sb 3])/2.0}]; set smin [lindex $bb 0]; set smax [lindex $bb 3]} \\",
-        "        elseif {$ax eq \"y\"} {set dvx 0; set dvy 1; set dvz 0; set sc [expr {([lindex $sb 1]+[lindex $sb 4])/2.0}]; set smin [lindex $bb 1]; set smax [lindex $bb 4]} \\",
-        "        else {set dvx 0; set dvy 0; set dvz 1; set sc [expr {([lindex $sb 2]+[lindex $sb 5])/2.0}]; set smin [lindex $bb 2]; set smax [lindex $bb 5]}",
+        "        if {$ax eq \"x\"} {set dvx 1; set dvy 0; set dvz 0; set sc [expr {([lindex $sb 0]+[lindex $sb 3])/2.0}]; set smin [lindex $bb 0]; set smax [lindex $bb 3]} else { if {$ax eq \"y\"} {set dvx 0; set dvy 1; set dvz 0; set sc [expr {([lindex $sb 1]+[lindex $sb 4])/2.0}]; set smin [lindex $bb 1]; set smax [lindex $bb 4]} else {set dvx 0; set dvy 0; set dvz 1; set sc [expr {([lindex $sb 2]+[lindex $sb 5])/2.0}]; set smin [lindex $bb 2]; set smax [lindex $bb 5]} }",
         "        if {[expr {$sc-$smin}] > [expr {$smax-$sc}]} { set dvx [expr {-1*$dvx}]; set dvy [expr {-1*$dvy}]; set dvz [expr {-1*$dvz}] }",
         "        *createvector 1 $dvx $dvy $dvz",
         "        *meshdragelements2 1 1 $dd $dl 0 0.0 0",

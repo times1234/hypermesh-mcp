@@ -107,6 +107,12 @@ GENERIC_MESHING_RULES = {
             "Default retry_count is 2 (3 total attempts). "
             "ONLY fallback to tetra if ALL retries fail."
         ),
+        "source_face_rule": (
+            "Source face MUST be at the NEGATIVE end of the drag axis (lowest "
+            "centroid). Drag always goes POSITIVE into the solid. Example: z-axis "
+            "solid at z=10~z=17. Pick the z≈10 face, drag +z by 7. Picking z≈17 "
+            "face would drag elements outside the solid."
+        ),
         "mandatory_batching": (
             "When processing multiple drag_hex solids that share the same drag axis, "
             "MUST use generate_batched_drag_hex_tcl to process all of them in ONE "
@@ -160,6 +166,13 @@ GENERIC_MESHING_RULES = {
             "tetra mesh the solid from the mixed-size surface shell mesh",
         ],
         "fallback": "tetra_surface_deviation_rtrias with uniform base size",
+    },
+    "critical_rule_phase2_color_mandatory": {
+        "rule": (
+            "After renaming, MUST color all components by strategy using "
+            "generate_component_colors_tcl. Colors: drag_hex=blue, spin_hex=green, "
+            "gear_aware_tetra=red, tetra_plain=yellow."
+        ),
     },
     "critical_rule_no_manual_tcl_injection": {
         "rule": (
@@ -658,7 +671,7 @@ foreach sid $solid_ids {
     if {$dx <= $dy && $dx <= $dz} { set mn $dx; if {$dy <= $dz} {set md $dy; set mx $dz} else {set md $dz; set mx $dy} } else { if {$dy <= $dx && $dy <= $dz} { set mn $dy; if {$dx <= $dz} {set md $dx; set mx $dz} else {set md $dz; set mx $dx} } else { set mn $dz; if {$dx <= $dy} {set md $dx; set mx $dy} else {set md $dy; set mx $dx} } }
     set slender 1.0; if {$mn > 0.001} {set slender [expr {$mx / $mn}]}
     set diag [expr {sqrt($dx*$dx + $dy*$dy + $dz*$dz)}]
-    puts $f "PROBE: solid=$sid comp=\\"$comp_name\\" sc=$sc dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag]"
+    puts $f "PROBE: solid=$sid comp=\"$comp_name\" sc=$sc dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag]"
 }
 close $f
 """
@@ -676,7 +689,10 @@ def run_geometry_probe_gui(
         Path(os.environ.get("TEMP", "/tmp")) / "hypermesh_probe_output.txt"
     )
     tcl = _PROBE_TCL_TEMPLATE.replace("__OUTPUT_PATH__", str(out).replace("\\", "/"))
-    result = _run_hypermesh_gui_script(script=tcl, host=host, port=port, timeout_seconds=timeout_seconds)
+    (Path(str(out)).parent / "_debug_tcl.txt").write_text(tcl, encoding="utf-8")
+    result = execute_tcl_gui(script=tcl, host=host, port=port, timeout_seconds=timeout_seconds, enforce_meshing_rules=False)
+    print("DEBUG_PROBE result:", result)  # 加这行
+
     probe_lines = ""
     if out.exists():
         probe_lines = out.read_text(encoding="utf-8", errors="replace")
@@ -685,6 +701,7 @@ def run_geometry_probe_gui(
         "phase": "Phase 1",
         "output_file": str(out),
         "probe_lines": probe_lines,
+        "_debug_result": result,
     }
 
 
@@ -708,14 +725,14 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         is_circular = (dx > 0 and dy > 0 and abs(dx - dy) / max(dx, dy) < 0.20)
         strategy = "tetra_plain"
         evidence = []
-        elem_size = max(0.6, mx / 12.0)
+        elem_size = min(max(0.6, mx / 12.0), 2.0)
         if sc == 6 and mx > 0 and mn / mx < 0.40:
             strategy = "drag_hex"
             evidence.append("6-face thin -> drag")
-        elif sc >= 30 and is_circular and 1 < slender < 10 and mn > 2:
-            strategy = "gear_aware_tetra"
-            evidence.append("gear-like")
-            elem_size = max(0.6, mx / 18.0)
+        # elif sc >= 30 and is_circular and 1 < slender < 10 and mn > 2:
+        #     strategy = "gear_aware_tetra"
+        #     evidence.append("gear-like")
+        #     elem_size = min(max(0.6, mx / 18.0), 2.0)
         elif is_circular and slender > 2.5 and mx > 2 * md:
             strategy = "spin_hex"
             evidence.append("shaft -> spin")
@@ -728,6 +745,7 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         elif slender > 4 and mx > 3 * md:
             strategy = "tetra_plain"
             evidence.append("shaft -> tetra")
+            elem_size = min(max(0.6, md / 6.0), 2.0)
         elif sc >= 20:
             strategy = "tetra_plain"
             evidence.append("complex")
@@ -778,6 +796,26 @@ def generate_rename_components_tcl(classification_results):
 
 
 @mcp.tool()
+def generate_component_colors_tcl(classification_results):
+    """Generate Tcl to assign unique colors to each component by strategy type."""
+    lines = ["# Color components by strategy", "set colored 0"]
+    # Color map: drag_hex=blue, spin_hex=green, gear_aware_tetra=red, tetra_plain=yellow
+    color_map = {"drag_hex": 11, "spin_hex": 7, "gear_aware_tetra": 3, "tetra_plain": 4}
+    for sid_str, info in classification_results.get("results", {}).items():
+        strategy = info.get("strategy", "tetra_plain")
+        color = color_map.get(strategy, 4)
+        lines.append(f'*createmark components 1 "by solids" {sid_str}')
+        lines.append("set cids [hm_getmark components 1]")
+        lines.append("if {[llength $cids] > 0} {")
+        lines.append("    set cid [lindex $cids 0]")
+        lines.append(f"    catch {{*setvalue components id=$cid color={color}}}")
+        lines.append("    incr colored")
+        lines.append("}")
+    lines.append('puts "COLORED: $colored components"')
+    return {"success": True, "tcl_script": "\n".join(lines)}
+
+
+@mcp.tool()
 def get_hypermesh_meshing_strategy() -> dict[str, Any]:
     """Return the local HyperMesh meshing strategy requested by the user."""
     return {
@@ -799,6 +837,7 @@ def get_meshing_rules() -> dict[str, Any]:
         "notes": [
             "CRITICAL: See generic_rules['critical_rule_no_manual_tcl_injection'] — NEVER inject hand-written Tcl when a generate_*_tcl parameter already covers the scenario.",
             "CRITICAL: See generic_rules['critical_rule_every_change_must_enforce'] — every MCP change MUST include enforcement in GENERIC_MESHING_RULES and/or _meshing_rule_violation.",
+            "CRITICAL: See generic_rules['critical_rule_phase2_color_mandatory'] — MUST color components by strategy using generate_component_colors_tcl.",
             "Do not decide tetra/drag/spin by component name.",
             "Classify by geometry: holes/flanges/bosses/cutouts -> tetra; simple constant extrusions with matched quad source face -> drag; clean true cross-section revolved bodies -> spin.",
             "For stepped or recessed revolved solids, use the generic cut-section spin workflow rather than guessed surface-id spin.",
@@ -1968,7 +2007,23 @@ def generate_guarded_drag_hex_tcl(
         "    while {$attempt <= $retry_count && !$hex_success} {",
         '        puts "MCP guarded drag attempt=$attempt elem_size=$elem_size"',
         "        set before_elems [mcp_all_elems]",
-        f"        *createvector 1 {vx} {vy} {vz}",
+        "        # auto-flip: ensure drag goes from source face INTO solid",
+        "        *createmark surfaces 2 $source_surface",
+        "        set sb [hm_getboundingbox surfaces 2 0 0 0]",
+        "        set sc [expr {([lindex $sb 2]+[lindex $sb 5])/2.0}]",
+        "        *createmark surfaces 2 \"by solids\" $target_solid",
+        "        set bb [hm_getboundingbox surfaces 2 0 0 0]",
+        f"        set dir_x {vx}; set dir_y {vy}; set dir_z {vz}",
+        "        if {$target_solid > 0} {",
+        "            set smin [lindex $bb 2]; set smax [lindex $bb 5]",
+        "            if {[expr {$sc-$smin}] < [expr {$smax-$sc}]} {",
+        "                # face at bottom, drag +direction",
+        "            } else {",
+        "                # face at top, flip",
+        f"                set dir_x [expr {{-1*{vx}}}]; set dir_y [expr {{-1*{vy}}}]; set dir_z [expr {{-1*{vz}}}]",
+        "            }",
+        "        }",
+        "        *createvector 1 $dir_x $dir_y $dir_z",
         "        *meshdragelements2 1 1 $drag_distance $drag_layers 0 0.0 0",
         "        set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
         "        set hex_count [mcp_count_hex8 $new_elems]",
@@ -2125,7 +2180,15 @@ def generate_batched_drag_hex_tcl(
         "        }",
         "        set dl [expr {max(1,round($dd/$cs))}]",
         "        set be [b_all]",
-        "        if {$ax eq \"x\"} {*createvector 1 1 0 0} else { if {$ax eq \"y\"} {*createvector 1 0 1 0} else {*createvector 1 0 0 1} }",
+        "        *createmark surfaces 2 $surf",
+        "        set sb [hm_getboundingbox surfaces 2 0 0 0]",
+        "        *createmark surfaces 2 \"by solids\" $sid",
+        "        set bb [hm_getboundingbox surfaces 2 0 0 0]",
+        "        if {$ax eq \"x\"} {set dvx 1; set dvy 0; set dvz 0; set sc [expr {([lindex $sb 0]+[lindex $sb 3])/2.0}]; set smin [lindex $bb 0]; set smax [lindex $bb 3]} \\",
+        "        elseif {$ax eq \"y\"} {set dvx 0; set dvy 1; set dvz 0; set sc [expr {([lindex $sb 1]+[lindex $sb 4])/2.0}]; set smin [lindex $bb 1]; set smax [lindex $bb 4]} \\",
+        "        else {set dvx 0; set dvy 0; set dvz 1; set sc [expr {([lindex $sb 2]+[lindex $sb 5])/2.0}]; set smin [lindex $bb 2]; set smax [lindex $bb 5]}",
+        "        if {[expr {$sc-$smin}] > [expr {$smax-$sc}]} { set dvx [expr {-1*$dvx}]; set dvy [expr {-1*$dvy}]; set dvz [expr {-1*$dvz}] }",
+        "        *createvector 1 $dvx $dvy $dvz",
         "        *meshdragelements2 1 1 $dd $dl 0 0.0 0",
         "        set ne [b_sub [b_all] $be]; set hc [b_hex $ne]; set fo [b_fit $ne $sid $fit_tol_ratio $cs]",
         "        if {[llength $ne]>0&&$hc==[llength $ne]&&$fo} { set hs 1 } else {",

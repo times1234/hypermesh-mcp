@@ -656,6 +656,68 @@ def _extract_probe_lines(text: str) -> list[str]:
 
 
 _PROBE_TCL_TEMPLATE = r"""
+proc find_best_source_surface {solid_id drag_axis sbb_min sbb_max} {
+    *createmark surfaces 1 "by solids" $solid_id
+    set all_surfs [hm_getmark surfaces 1]
+    set best_surf -1
+    set best_score 999999
+
+    # 根据 drag_axis 确定 bbox 数组的 index
+    if {$drag_axis eq "x"} {
+        set ax_idx 0; set ax_idx_max 3
+        set ax1_idx 1; set ax1_max 4
+        set ax2_idx 2; set ax2_max 5
+    } else { if {$drag_axis eq "y"} {
+        set ax_idx 1; set ax_idx_max 4
+        set ax1_idx 0; set ax1_max 3
+        set ax2_idx 2; set ax2_max 5
+    } else {
+        set ax_idx 2; set ax_idx_max 5
+        set ax1_idx 0; set ax1_max 3
+        set ax2_idx 1; set ax2_max 4
+    }}
+
+    set solid_ax_len [expr {abs([lindex $sbb_max $ax_idx] \
+                           - [lindex $sbb_min $ax_idx])}]
+    set tolerance [expr {$solid_ax_len * 0.05}]
+
+    foreach sid $all_surfs {
+        *createmark surfaces 2 $sid
+        if {[catch {hm_getboundingbox surfaces 2 0 0 0} s_sbb]} {continue}
+
+        # === 验证 1：面沿 drag_axis 方向厚度 ≈ 0 ===
+        set s_thick [expr {abs([lindex $s_sbb $ax_idx_max] \
+                          - [lindex $s_sbb $ax_idx])}]
+        if {$s_thick > $tolerance} {continue}
+
+        # === 验证 2：面重心在 solid 的 drag_axis 端点 ===
+        set s_center [expr {([lindex $s_sbb $ax_idx] \
+                        + [lindex $s_sbb $ax_idx_max]) / 2.0}]
+        set dist_to_min [expr {abs($s_center - [lindex $sbb_min $ax_idx])}]
+        set dist_to_max [expr {abs($s_center - [lindex $sbb_max $ax_idx])}]
+        if {$dist_to_min > $tolerance && $dist_to_max > $tolerance} {continue}
+
+        # === 验证 3：面在其他两个维度的尺寸匹配 solid 截面 ===
+        set s_ax1 [expr {abs([lindex $s_sbb $ax1_max] \
+                        - [lindex $s_sbb $ax1_idx])}]
+        set s_ax2 [expr {abs([lindex $s_sbb $ax2_max] \
+                        - [lindex $s_sbb $ax2_idx])}]
+        set sol_ax1 [expr {abs([lindex $sbb_max $ax1_idx] \
+                          - [lindex $sbb_min $ax1_idx])}]
+        set sol_ax2 [expr {abs([lindex $sbb_max $ax2_idx] \
+                          - [lindex $sbb_min $ax2_idx])}]
+        set r1 [expr {$s_ax1 / max($sol_ax1, 0.001)}]
+        set r2 [expr {$s_ax2 / max($sol_ax2, 0.001)}]
+        if {$r1 < 0.9 || $r2 < 0.9} {continue}
+
+        # === 评分：取最佳匹配 ===
+        set score [expr {min($dist_to_min, $dist_to_max) \
+                    + abs(1.0-$r1)*10 + abs(1.0-$r2)*10}]
+        if {$score < $best_score} {set best_score $score; set best_surf $sid}
+    }
+    return $best_surf
+}
+
 set f [open "__OUTPUT_PATH__" w]
 *createmark solids 1 "all"
 set solid_ids [hm_getmark solids 1]
@@ -676,18 +738,12 @@ foreach sid $solid_ids {
     set diag [expr {sqrt($dx*$dx + $dy*$dy + $dz*$dz)}]
     # 源面检测：找出最薄方向负端的面
     set drag_axis ""
-    set src_surf -1
     if {$mn == $dx} {set drag_axis "x"} elseif {$mn == $dy} {set drag_axis "y"} else {set drag_axis "z"}
-    set best_val 999999
-    foreach sf $surf_ids {
-        set cx 0; set cy 0; set cz 0
-        catch {set cx [hm_getcentroid surface $sf x]}
-        catch {set cy [hm_getcentroid surface $sf y]}
-        catch {set cz [hm_getcentroid surface $sf z]}
-        if {$drag_axis == "x" && $cx < $best_val} {set best_val $cx; set src_surf $sf}
-        if {$drag_axis == "y" && $cy < $best_val} {set best_val $cy; set src_surf $sf}
-        if {$drag_axis == "z" && $cz < $best_val} {set best_val $cz; set src_surf $sf}
-    }
+    
+    set sbb_min [list [lindex $bb 0] [lindex $bb 1] [lindex $bb 2]]
+    set sbb_max [list [lindex $bb 3] [lindex $bb 4] [lindex $bb 5]]
+    set src_surf [find_best_source_surface $sid $drag_axis $sbb_min $sbb_max]
+    
     puts $f "PROBE: solid=$sid comp=\"$comp_name\" sc=$sc dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag] src_surf=$src_surf drag_axis=$drag_axis"
 }
 close $f
@@ -747,7 +803,9 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         strategy = "tetra_plain"
         evidence = []
         elem_size = 1.0
-        if sc == 6 and mx > 0 and mn / mx < 0.40:
+        src_surf = f.get("source_surface_id", -1)
+        
+        if sc == 6 and mx > 0 and mn / mx < 0.40 and src_surf > 0:
             strategy = "drag_hex"
             evidence.append("6-face thin -> drag")
         # elif sc >= 30 and is_circular and 1 < slender < 10 and mn > 2:
@@ -1937,6 +1995,9 @@ def generate_guarded_drag_hex_tcl(
     if axis_key not in vectors:
         raise ValueError("axis must be one of: x, y, z.")
 
+    axis_indices = {"x": (0, 3), "y": (1, 4), "z": (2, 5)}
+    ax_min, ax_max = axis_indices[axis_key]
+
     vx, vy, vz = vectors[axis_key]
     layers = layer_count if layer_count and layer_count > 0 else max(
         1, round(float(drag_distance) / float(element_size))
@@ -2107,12 +2168,12 @@ def generate_guarded_drag_hex_tcl(
         "        # auto-flip: ensure drag goes from source face INTO solid",
         "        *createmark surfaces 2 $source_surface",
         "        set sb [hm_getboundingbox surfaces 2 0 0 0]",
-        "        set sc [expr {([lindex $sb 2]+[lindex $sb 5])/2.0}]",
+        f"        set sc [expr {{([lindex $sb {ax_min}]+[lindex $sb {ax_max}])/2.0}}]",
         "        *createmark surfaces 2 \"by solids\" $target_solid",
         "        set bb [hm_getboundingbox surfaces 2 0 0 0]",
         f"        set dir_x {vx}; set dir_y {vy}; set dir_z {vz}",
         "        if {$target_solid > 0} {",
-        "            set smin [lindex $bb 2]; set smax [lindex $bb 5]",
+        f"            set smin [lindex $bb {ax_min}]; set smax [lindex $bb {ax_max}]",
         "            if {[expr {$sc-$smin}] < [expr {$smax-$sc}]} {",
         "                # face at bottom, drag +direction",
         "            } else {",

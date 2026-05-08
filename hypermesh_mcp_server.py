@@ -503,7 +503,8 @@ def _parse_probe_facts(line: str):
         except ValueError:
             facts[k] = v
     ALIASES = {"solid": "solid_id", "sc": "surf_count", "comp": "component_name",
-               "mn": "min_dim", "mx": "max_dim", "md": "mid_dim", "diag": "diagonal"}
+               "mn": "min_dim", "mx": "max_dim", "md": "mid_dim", "diag": "diagonal",
+               "src_surf": "source_surface_id", "drag_axis": "drag_axis"}
     for old, new in ALIASES.items():
         if old in facts and new not in facts:
             facts[new] = facts[old]
@@ -673,7 +674,21 @@ foreach sid $solid_ids {
     if {$dx <= $dy && $dx <= $dz} { set mn $dx; if {$dy <= $dz} {set md $dy; set mx $dz} else {set md $dz; set mx $dy} } else { if {$dy <= $dx && $dy <= $dz} { set mn $dy; if {$dx <= $dz} {set md $dx; set mx $dz} else {set md $dz; set mx $dx} } else { set mn $dz; if {$dx <= $dy} {set md $dx; set mx $dy} else {set md $dy; set mx $dx} } }
     set slender 1.0; if {$mn > 0.001} {set slender [expr {$mx / $mn}]}
     set diag [expr {sqrt($dx*$dx + $dy*$dy + $dz*$dz)}]
-    puts $f "PROBE: solid=$sid comp=\"$comp_name\" sc=$sc dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag]"
+    # 源面检测：找出最薄方向负端的面
+    set drag_axis ""
+    set src_surf -1
+    if {$mn == $dx} {set drag_axis "x"} elseif {$mn == $dy} {set drag_axis "y"} else {set drag_axis "z"}
+    set best_val 999999
+    foreach sf $surf_ids {
+        set cx 0; set cy 0; set cz 0
+        catch {set cx [hm_getcentroid surface $sf x]}
+        catch {set cy [hm_getcentroid surface $sf y]}
+        catch {set cz [hm_getcentroid surface $sf z]}
+        if {$drag_axis == "x" && $cx < $best_val} {set best_val $cx; set src_surf $sf}
+        if {$drag_axis == "y" && $cy < $best_val} {set best_val $cy; set src_surf $sf}
+        if {$drag_axis == "z" && $cz < $best_val} {set best_val $cz; set src_surf $sf}
+    }
+    puts $f "PROBE: solid=$sid comp=\"$comp_name\" sc=$sc dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag] src_surf=$src_surf drag_axis=$drag_axis"
 }
 close $f
 """
@@ -707,9 +722,13 @@ def run_geometry_probe_gui(
     }
 
 
+# Global state to prevent AI from truncating the large JSON payload inside MCP tool calls
+_GLOBAL_CLASSIFICATION_RESULTS = {}
+
 @mcp.tool()
 def classify_all_solids_from_probe(probe_lines, visual_observations=None):
     """MANDATORY Phase 2: classify every probed solid from probe_lines."""
+    global _GLOBAL_CLASSIFICATION_RESULTS
     results = {}
     for line in probe_lines.splitlines():
         stripped = line.strip()
@@ -755,11 +774,21 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
             strategy = "tetra_plain"
             evidence.append("general")
         name = _generate_geometry_component_name(f, strategy, suffix_solid_id=True)
-        results[str(sid)] = {"solid_id": sid, "strategy": strategy, "component_name": name,
-                             "element_size": round(elem_size, 2), "evidence": evidence}
+        results[str(sid)] = {
+            "solid_id": sid, "strategy": strategy, "component_name": name,
+            "element_size": round(elem_size, 2), "evidence": evidence,
+            "source_surface_id": f.get("source_surface_id", -1),
+            "drag_axis": f.get("drag_axis", ""),
+            "dims": {"dx": dx, "dy": dy, "dz": dz, "mn": mn},
+        }
     counts = {}
     for r in results.values():
         counts[r["strategy"]] = counts.get(r["strategy"], 0) + 1
+        
+    # Save to global cache so downstream tools don't require the AI to pass back a massive dict
+    _GLOBAL_CLASSIFICATION_RESULTS.clear()
+    _GLOBAL_CLASSIFICATION_RESULTS.update(results)
+    
     return {"success": True, "phase": "Phase 2", "total_solids": len(results),
             "strategy_counts": counts, "results": results}
 
@@ -781,10 +810,23 @@ def suggest_component_names(probe_lines):
 
 
 @mcp.tool()
-def generate_rename_components_tcl(classification_results):
+def generate_rename_components_tcl(classification_results: dict | None = None):
     """Generate Tcl to rename HyperMesh components from classification results."""
     lines = ["# Rename components Tcl", "set renamed 0"]
-    for sid_str, info in classification_results.get("results", {}).items():
+    
+    # Use global cache if AI didn't pass results or passed an empty stub
+    target_results = {}
+    if classification_results:
+        # Handle both {"results": {...}} and flat {"1": {...}, "2": {...}} formats
+        if "results" in classification_results and isinstance(classification_results["results"], dict) and classification_results["results"]:
+            target_results = classification_results["results"]
+        elif "results" not in classification_results and classification_results:
+            target_results = classification_results
+
+    if not target_results:
+        target_results = _GLOBAL_CLASSIFICATION_RESULTS
+
+    for sid_str, info in target_results.items():
         name = info.get("component_name", "")
         lines.append('*createmark components 1 "by solids" ' + sid_str)
         lines.append("set cids [hm_getmark components 1]")
@@ -799,25 +841,33 @@ def generate_rename_components_tcl(classification_results):
 
 
 @mcp.tool()
-def generate_component_colors_tcl(classification_results):
+def generate_component_colors_tcl(classification_results: dict | None = None):
     """Generate Tcl to assign unique colors to each component by strategy type."""
     lines = ["# Color components by strategy", "set colored 0"]
     color_map = {"drag_hex": 1, "spin_hex": 7, "gear_aware_tetra": 3, "tetra_plain": 4}
     
-    # Group component names by strategy
-    groups = {}
-    for sid_str, info in classification_results.get("results", {}).items():
-        strategy = info.get("strategy", "tetra_plain")
+    # Use global cache if AI didn't pass results or passed an empty stub
+    target_results = {}
+    if classification_results:
+        # Handle both {"results": {...}} and flat {"1": {...}, "2": {...}} formats
+        if "results" in classification_results and isinstance(classification_results["results"], dict) and classification_results["results"]:
+            target_results = classification_results["results"]
+        elif "results" not in classification_results and classification_results:
+            target_results = classification_results
+
+    if not target_results:
+        target_results = _GLOBAL_CLASSIFICATION_RESULTS
+
+    # Assign unique color per component (cycle through colors 1-64)
+    color_idx = 0
+    for sid_str, info in target_results.items():
         name = info.get("component_name", "")
         if name:
-            groups.setdefault(strategy, []).append(name)
-    
-    for strategy, names in groups.items():
-        color = color_map.get(strategy, 4)
-        name_list = " ".join(f'"{n}"' for n in names)
-        lines.append(f"*createmark components 1 {name_list}")
-        lines.append(f"catch {{*autocolorwithmark components 1 {color}}}")
-        lines.append(f"set colored [expr {{$colored + {len(names)}}}]")
+            color = (color_idx % 64) + 1
+            lines.append(f'*createmark components 1 "{name}"')
+            lines.append(f"catch {{*colormark components 1 {color}}}")
+            color_idx += 1
+    lines.append(f"set colored [expr {{$colored + {color_idx}}}]")
     
     lines.append('puts "COLORED: $colored components"')
     return {"success": True, "tcl_script": "\n".join(lines)}
@@ -2271,6 +2321,86 @@ def generate_batched_drag_hex_tcl(
         "success": True,
         "script": "\n".join(lines),
         "strategy": "Batched drag-hex: processes multiple solids in one script.",
+    }
+
+
+@mcp.tool()
+def generate_all_meshing_tcl(
+    output_hm_path: str | None = None,
+) -> dict[str, Any]:
+    """从缓存自动生成全部 solid 的网格 Tcl（无参，防 AI 篡改）。"""
+    results = _GLOBAL_CLASSIFICATION_RESULTS
+    if not results:
+        return {"success": False, "error": "缓存为空，请先运行 classify_all_solids_from_probe"}
+
+    all_lines = ["# HyperMesh MCP 全自动网格脚本 (Phase 3)", ""]
+
+    # 分组：drag_hex 按 axis，tetra_plain 逐个
+    drag_by_axis: dict[str, list[dict[str, Any]]] = {}
+    tetra_list: list[dict[str, Any]] = []
+
+    for sid_str, info in results.items():
+        sid = info.get("solid_id", 0)
+        name = info.get("component_name", "")
+        elem_size = info.get("element_size", 1.0)
+        strategy = info.get("strategy", "tetra_plain")
+        dims = info.get("dims", {})
+        mn = dims.get("mn", 0)
+
+        if strategy == "drag_hex":
+            axis = info.get("drag_axis", "z")
+            src_surf = info.get("source_surface_id", -1)
+            if src_surf <= 0 or mn <= 0:
+                # 源面无效，降级为 tetra
+                tetra_list.append({"solid_id": sid, "component_name": name, "element_size": elem_size})
+                continue
+            drag_by_axis.setdefault(axis, []).append({
+                "solid_id": sid,
+                "source_surface_id": src_surf,
+                "drag_distance": mn,
+                "component_name": name,
+                "axis": axis,
+            })
+        else:
+            tetra_list.append({"solid_id": sid, "component_name": name, "element_size": elem_size})
+
+    # 生成 drag_hex 批量脚本
+    for axis, solids in drag_by_axis.items():
+        if not solids:
+            continue
+        result = generate_batched_drag_hex_tcl(
+            solids=solids,
+            element_size=1.5,
+            output_hm_path=None,
+        )
+        if result.get("success"):
+            all_lines.append(f"# === DRAG_HEX axis={axis} ({len(solids)} solids) ===")
+            all_lines.append(result["script"])
+            all_lines.append("")
+
+    # 生成 tetra 逐个脚本
+    for t in tetra_list:
+        result = generate_plain_tetra_tcl(
+            solid_id=t["solid_id"],
+            component_name=t["component_name"],
+            element_size=t.get("element_size", 1.0),
+            output_hm_path=None,
+        )
+        if result.get("success"):
+            all_lines.append(f"# === TETRA solid={t['solid_id']} ===")
+            all_lines.append(result["script"])
+            all_lines.append("")
+
+    # 末尾写文件
+    if output_hm_path:
+        all_lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
+
+    full_script = "\n".join(all_lines)
+    return {
+        "success": True,
+        "script": full_script,
+        "drag_hex_count": sum(len(v) for v in drag_by_axis.values()),
+        "tetra_count": len(tetra_list),
     }
 
 

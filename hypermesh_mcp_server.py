@@ -1269,17 +1269,24 @@ def recommend_tetra_sizes_from_probe_lines(
 
     recommendations: list[dict[str, Any]] = []
     for line in probe_lines:
-        if not line.strip().startswith("MCP_PROBE_SOLID"):
+        stripped = line.strip()
+        if not (stripped.startswith("MCP_PROBE_SOLID") or stripped.startswith("PROBE:")):
             continue
         facts: dict[str, str] = {}
-        for token in line.split()[1:]:
+        for token in stripped.split()[1:]:
             if "=" in token:
                 key, value = token.split("=", 1)
                 facts[key] = value
-        try:
-            solid_id = int(facts["id"])
-        except (KeyError, ValueError):
-            continue
+        if stripped.startswith("PROBE:"):
+            try:
+                solid_id = int(facts.get("solid", facts.get("id", "0")))
+            except (KeyError, ValueError):
+                continue
+        else:
+            try:
+                solid_id = int(facts["id"])
+            except (KeyError, ValueError):
+                continue
         if facts.get("exists") == "0" or facts.get("bbox_ok") == "0":
             recommendations.append(
                 {
@@ -2050,10 +2057,55 @@ def generate_plain_tetra_tcl(
         '    *createarray 3 0 0 0',
         '    *defaultmeshsurf_growth 1 $cs 3 3 2 1 1 1 35 0 $mn_size [expr {$cs*1.5}] $max_dev $feat_angle $growth 1 3 1 0',
         '    *storemeshtodatabase 1',
-        '    *createmark elems 1 "by surface" [hm_getmark surfaces 1]',
-        '    catch {*elementtestaspect 1 0 10.0 0 1 0}',
-        '    if {[hm_marklength elems 1] > 0} { eval *createmark elems 1 [hm_getmark elems 1]; catch {*deletemark elems 1} }',
-        '    *createmark elems 1 "by surface" [hm_getmark surfaces 1]',
+        '    set all_surfs [hm_getmark surfaces 1]',
+        '    set missing_surf_list {}',
+        '    foreach sid $all_surfs {',
+        '        *createmark elems 2 "by surface" $sid',
+        '        if {[hm_marklength elems 2] == 0} {',
+        '            lappend missing_surf_list $sid',
+        '            puts "MCP_PT_WARN solid=$target_solid missing_mesh_surface=$sid"',
+        '        }',
+        '    }',
+        '    if {[llength $missing_surf_list] > 0} {',
+        '        puts "MCP_PT_WARN solid=$target_solid surface_missing=[llength $missing_surf_list] retry=$at"',
+        '        incr at; set mn_factor [expr {$mn_factor*0.5}]; continue',
+        '    }',
+        '    set unfixed_aspect_report 0',
+        '    *createmark elems 1 "by surface" $all_surfs',
+        '    catch {*elementtestaspect 1 0 10.0 0}',
+        '    set bad_aspect_ids [hm_getmark elems 1]',
+        '    if {[llength $bad_aspect_ids] > 0} {',
+        '        set q_at 0',
+        '        while {[llength $bad_aspect_ids] > 0 && $q_at < 3} {',
+        '            eval *createmark elems 2 $bad_aspect_ids',
+        '            if {$q_at == 0} {',
+        '                puts "MCP_PT_INFO solid=$target_solid repair_strategy=light_smooth"',
+        '                catch {*smooth elems 2 1}',
+        '            } else { if {$q_at == 1} {',
+        '                puts "MCP_PT_INFO solid=$target_solid repair_strategy=heavy_smooth"',
+        '                catch {*smooth elems 2 5}',
+        '            } else {',
+        '                puts "MCP_PT_INFO solid=$target_solid repair_strategy=autocleanup"',
+        '                *createmark surfaces 3 "by elements" $bad_aspect_ids',
+        '                catch {*autocleanup surfaces 3 1 30 $cs [expr {$cs*0.25}] [expr {$cs*1.5}] 0 0}',
+        '                *storemeshtodatabase 1',
+        '            }}',
+        '            *createmark elems 3 "by surface" $all_surfs',
+        '            catch {*elementtestaspect 3 0 10.0 0}',
+        '            set bad_aspect_ids [hm_getmark elems 3]',
+        '            incr q_at',
+        '        }',
+        '        if {[llength $bad_aspect_ids] > 0} {',
+        '            puts "MCP_PT_WARN solid=$target_solid unfixed_aspect=[llength $bad_aspect_ids] proceeding"',
+        '            set unfixed_aspect_report [llength $bad_aspect_ids]',
+        '        } else {',
+        '            puts "MCP_PT_INFO solid=$target_solid aspect_fixed after=$q_at attempts"',
+        '            set unfixed_aspect_report 0',
+        '        }',
+        '    } else {',
+        '        set unfixed_aspect_report 0',
+        '    }',
+        '    *createmark elems 1 "by surface" $all_surfs',
         '    set shell_count [hm_marklength elems 1]',
         '    if {$shell_count == 0} { incr at; continue }',
         '    *createmark components 2 "$target_component"',
@@ -2085,7 +2137,7 @@ def generate_plain_tetra_tcl(
         '    if {$c==205} {incr t4}',
         '    if {$c==547} {incr t10}',
         '}',
-        'puts "MCP plain tetra completed: total=$final_count tet4=$t4 tet10=$t10 retries=$at"',
+        'puts "MCP_PT_DONE solid=$target_solid total=$final_count tet4=$t4 tet10=$t10 retries=$at unfixed_aspect=$unfixed_aspect_report"',
     ]
     if output_hm_path:
         lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')

@@ -543,9 +543,33 @@ proc ::mcp_hm_accept {{chan addr client_port}} {{
         return
     }}
 
+    # 保存原始 puts，创建捕获版本
+    rename puts ::_mcp_orig_puts
+    set ::mcp_capture ""
+    proc puts args {{
+        set len [llength $args]
+        if {{$len == 1}} {{
+            ::_mcp_orig_puts [lindex $args 0]
+            append ::mcp_capture [lindex $args 0] "\\n"
+        }} elseif {{$len == 2 && ([lindex $args 0] eq "stdout")}} {{
+            ::_mcp_orig_puts stdout [lindex $args 1]
+            append ::mcp_capture [lindex $args 1] "\\n"
+        }} else {{
+            eval [linsert $args 0 ::_mcp_orig_puts]
+        }}
+    }}
+
     set code [catch {{uplevel #0 $script}} result options]
+    
+    # 恢复原始 puts
+    rename puts ""
+    rename ::_mcp_orig_puts puts
+
     if {{$code == 0 || $code == 2}} {{
         puts $chan "OK"
+        if {{$::mcp_capture ne ""}} {{
+            puts $chan $::mcp_capture
+        }}
         if {{$result ne ""}} {{
             puts $chan $result
         }}
@@ -1898,44 +1922,48 @@ def generate_plain_tetra_tcl(
         'set min_dim [lindex [lsort -real [list $sdx $sdy $sdz]] 0]',
         'set solid_bb [list [lindex $sbb 0] [lindex $sbb 1] [lindex $sbb 2] [lindex $sbb 3] [lindex $sbb 4] [lindex $sbb 5]]',
         'set solid_diag [expr {sqrt(pow($sdx,2)+pow($sdy,2)+pow($sdz,2))}]',
-        'set ok 0; set at 0; set cs $elem_size',
+        'set ok 0; set at 0; set cs $elem_size; set mn_factor 0.1',
         'while {!$ok && $at < $retry_count} {',
-        '    set mn_size [expr {min($min_dim*0.1, 0.5)}]',
+        '    set mn_size [expr {min($min_dim*$mn_factor, 0.5)}]',
         '    if {$mn_size < 0.1} {set mn_size 0.1}',
         '    *createarray 3 0 0 0',
         '    *defaultmeshsurf_growth 1 $cs 3 3 2 1 1 1 35 0 $mn_size [expr {$cs*1.5}] $max_dev $feat_angle $growth 1 3 1 0',
         '    *storemeshtodatabase 1',
         '    *createmark elems 1 "by surface" [hm_getmark surfaces 1]',
-        '    *elementtest 1 aspect 0 10.0 0 1 0',
-        '    *retainmark elems 1 "fail"',
+        '    catch {*elementtestaspect 1 0 10.0 0 1 0}',
         '    if {[hm_marklength elems 1] > 0} { eval *createmark elems 1 [hm_getmark elems 1]; catch {*deletemark elems 1} }',
         '    *createmark elems 1 "by surface" [hm_getmark surfaces 1]',
         '    set shell_count [hm_marklength elems 1]',
         '    if {$shell_count == 0} { incr at; continue }',
         f'    *createstringarray 2 "tet: 547 1.2 2 [expr {{$cs*1.9}}] 0.8 $mn_size 0" "pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew=\'0.99,0.95,0.90,1\'"',
-        '    catch {*tetmesh elems 1 1 elems 0 -1 1 2}',
+        '    *tetmesh elems 1 1 elems 0 -1 1',
         '    *createmark elems 1 "by comp" "$target_component"',
-        '    if {[hm_marklength elems 1] == 0} { incr at; set cs [expr {$cs*0.7}]; continue }',
+        '    if {[hm_marklength elems 1] == 0} { incr at; set mn_factor [expr {$mn_factor*0.7}]; continue }',
         '    *createmark elems 2 [hm_getmark elems 1]',
         '    set eb [hm_getboundingbox elems 2 0 0 0]',
-        '    set fit_tol [expr {max($cs*1.5, $solid_diag*$fit_tol_ratio)}]',
+        '    set fit_tol [expr {max($cs*1.0, $solid_diag*0.03)}]',
         '    set bbox_ok 1',
         '    for {set i 0} {$i<6} {incr i} {if {abs([lindex $eb $i]-[lindex $solid_bb $i])>$fit_tol} {set bbox_ok 0}}',
         '    if {$bbox_ok} {',
         '        set ok 1',
-        '        catch {*elementtest 1 vol_skew 1 0.99 0 1 0}',
-        '        catch {*retainmark elems 1 "fail"}',
+        '        catch {*elementtestvolumetricskew 1 1 0.99 0 1 0}',
         '        if {[hm_marklength elems 1] > 0} { catch {*smooth elems 1 1} }',
         '    } else {',
         '        set all_elems [hm_getmark elems 1]',
         '        if {[llength $all_elems] > 0} { eval *createmark elems 1 $all_elems; catch {*deletemark elems 1} }',
-        '        set cs [expr {$cs*0.7}]',
+        '        set mn_factor [expr {$mn_factor*0.7}]',
         '    }',
         '    incr at',
         '}',
         '*createmark elems 1 "by comp" "$target_component"',
         'set final_count [hm_marklength elems 1]',
-        'puts "MCP plain tetra completed: total=$final_count retries=$at"',
+        'set t4 0; set t10 0',
+        'foreach eid [hm_getmark elems 1] {',
+        '    set c [hm_getvalue elems id=$eid dataname=config]',
+        '    if {$c==205} {incr t4}',
+        '    if {$c==547} {incr t10}',
+        '}',
+        'puts "MCP plain tetra completed: total=$final_count tet4=$t4 tet10=$t10 retries=$at"',
     ]
     if output_hm_path:
         lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
@@ -2413,7 +2441,7 @@ def generate_all_meshing_tcl(
             src_surf = info.get("source_surface_id", -1)
             if src_surf <= 0 or mn <= 0:
                 # 源面无效，降级为 tetra
-                tetra_list.append({"solid_id": sid, "component_name": name, "element_size": elem_size})
+                tetra_list.append({"solid_id": sid, "component_name": name, "element_size": elem_size, "mn": mn})
                 continue
             drag_by_axis.setdefault(axis, []).append({
                 "solid_id": sid,
@@ -2423,15 +2451,18 @@ def generate_all_meshing_tcl(
                 "axis": axis,
             })
         else:
-            tetra_list.append({"solid_id": sid, "component_name": name, "element_size": elem_size})
+            tetra_list.append({"solid_id": sid, "component_name": name, "element_size": elem_size, "mn": mn})
 
     # 生成 drag_hex 批量脚本
     for axis, solids in drag_by_axis.items():
         if not solids:
             continue
+        # 用批量中最薄的 min_dim / 4 作为自动尺寸，上限 1.5
+        batch_mn = min(s.get("drag_distance", 1.5) for s in solids)
+        auto_size = min(1.5, batch_mn / 4.0)
         result = generate_batched_drag_hex_tcl(
             solids=solids,
-            element_size=1.5,
+            element_size=auto_size,
             output_hm_path=None,
         )
         if result.get("success"):
@@ -2441,10 +2472,12 @@ def generate_all_meshing_tcl(
 
     # 生成 tetra 逐个脚本
     for t in tetra_list:
+        mn = t.get("mn", 1.0)
+        auto_size = min(1.5, mn / 4.0)
         result = generate_plain_tetra_tcl(
             solid_id=t["solid_id"],
             component_name=t["component_name"],
-            element_size=t.get("element_size", 1.0),
+            element_size=auto_size,
             output_hm_path=None,
         )
         if result.get("success"):

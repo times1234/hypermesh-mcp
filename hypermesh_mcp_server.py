@@ -193,6 +193,20 @@ GENERIC_MESHING_RULES = {
     },
 }
 
+# Strategy → HyperMesh color id mapping (verified with HM 2020 *colormark)
+FINALIZE_STRATEGY_COLORS = {
+    "drag_hex": 1,
+    "spin_hex": 7,
+    "gear_aware_tetra": 3,
+    "tetra_plain": 4,
+    "surface_tetra": 4,
+    "unknown": 4,
+}
+
+# Generated-script boundary markers used by _meshing_rule_violation
+MCP_SCRIPT_BEGIN = "# MCP_SCRIPT_BEGIN"
+MCP_SCRIPT_END = "# MCP_SCRIPT_END"
+
 SPECIAL_WORKFLOWS = {
     "visible_gui_mode": {
         "recommended": True,
@@ -368,92 +382,75 @@ def _balanced_seed_density(
 
 
 def _meshing_rule_violation(script: str) -> dict[str, Any] | None:
-    """Reject raw meshing Tcl that bypasses MCP strategy generators."""
-    lowered_raw = script.lower()
-    allowed_markers = (
-        "mcp geometry probe",
-        "mcp guarded drag hex",
-        "mcp guarded spin hex",
-        "mcp cut-section spin hex",
-        "mcp gear-aware tetra",
-        "mcp surface deviation r-trias",
-        "mcp surface automesh",
-    )
-    if any(marker in lowered_raw for marker in allowed_markers):
-        return None
+    """Reject raw meshing Tcl that bypasses MCP strategy generators.
 
+    Generated scripts are identified by containing both MCP_SCRIPT_BEGIN and
+    MCP_SCRIPT_END.  Forbidden commands are allowed inside those boundaries
+    but rejected anywhere else.
+    """
+    lowered = script.lower()
+
+    # ── strip comments so we only scan real commands ──────────────
     clean_lines = []
     for line in script.split("\n"):
         pos = line.find("#")
         if pos >= 0:
             line = line[:pos]
         clean_lines.append(line)
-    lowered = "\n".join(clean_lines).lower()
+    lowered_clean = "\n".join(clean_lines).lower()
 
-    has_drag = "*meshdragelements" in lowered
-    has_spin = "*meshspinelements" in lowered
-    has_tetra = "*tetmesh" in lowered
-    has_surface_growth = "*defaultmeshsurf_growth" in lowered
-    has_direct_seed = "*set_meshedgeparams" in lowered
+    forbidden_tokens = [
+        "*meshdragelements",
+        "*meshspinelements",
+        "*set_meshedgeparams",
+        "*interactiveremeshedge",
+        "*defaultmeshsurf_growth",
+        "*tetmesh",
+    ]
 
-    if has_drag or has_direct_seed:
-        return {
-            "success": False,
-            "policy_violation": True,
-            "blocked_command": "drag_or_seed",
-            "required_tool": "generate_guarded_drag_hex_tcl",
-            "message": (
-                "Raw Tcl drag/seed commands are blocked because they bypass the "
-                "MCP balanced seed policy. Use generate_guarded_drag_hex_tcl and "
-                "pass preview_edge_seed_counts or source_edge_lengths so large "
-                "inner/outer seed-count gaps are balanced instead of forcing all "
-                "edges to the largest count."
-            ),
-        }
+    has_generated_marker = "mcp_generated_by=" in lowered
+    has_begin = MCP_SCRIPT_BEGIN.lower() in lowered
+    has_end = MCP_SCRIPT_END.lower() in lowered
 
-    has_manual_remesh_edge = "*interactiveremeshedge" in lowered
-    if has_manual_remesh_edge:
-        return {
-            "success": False,
-            "policy_violation": True,
-            "blocked_command": "manual_edge_remesh",
-            "required_tool": "generate_guarded_drag_hex_tcl (matched_edge_groups parameter)",
-            "message": (
-                "Manual *interactiveremeshedge calls are blocked. Edge seed balancing "
-                "is already handled by generate_guarded_drag_hex_tcl via the "
-                "matched_edge_groups parameter. Do NOT inject manual edge remeshing."
-            ),
-        }
+    if has_generated_marker:
+        # ── generated script ── check structural integrity ───────
+        if not has_begin or not has_end:
+            return {
+                "success": False,
+                "policy_violation": True,
+                "message": (
+                    "Generated Tcl is missing MCP_SCRIPT_BEGIN or "
+                    "MCP_SCRIPT_END boundary markers."
+                ),
+            }
 
-    if has_spin:
-        return {
-            "success": False,
-            "policy_violation": True,
-            "blocked_command": "spin",
-            "required_tool": "generate_guarded_spin_hex_tcl or generate_cutsection_spin_hex_tcl",
-            "message": (
-                "Raw Tcl spin commands are blocked because they bypass MCP section "
-                "validation. Use generate_guarded_spin_hex_tcl for a proven true "
-                "section or generate_cutsection_spin_hex_tcl to cut the solid and "
-                "spin the validated all-quad section."
-            ),
-        }
+        # everything after MCP_SCRIPT_END must be clean
+        _, _, after_end = lowered.partition(MCP_SCRIPT_END.lower())
+        if any(token in after_end for token in forbidden_tokens):
+            return {
+                "success": False,
+                "policy_violation": True,
+                "message": (
+                    "Forbidden meshing Tcl was detected after MCP_SCRIPT_END. "
+                    "Appending raw meshing commands to a generated script is not "
+                    "allowed."
+                ),
+            }
 
-    if has_tetra or has_surface_growth:
-        return {
-            "success": False,
-            "policy_violation": True,
-            "blocked_command": "tetra_or_surface_growth",
-            "required_tool": "generate_gear_aware_tetra_tcl or generate_surface_deviation_rtrias_tcl",
-            "message": (
-                "Raw Tcl tetra/surface-growth meshing commands are blocked because "
-                "they bypass MCP geometry rules. If geometry inspection shows gear "
-                "features, use generate_gear_aware_tetra_tcl so only tooth/flank/root "
-                "or auto-detected outer gear-band faces are refined and the rest of "
-                "the object keeps the base size. For non-gear geometry, use "
-                "generate_surface_deviation_rtrias_tcl."
-            ),
-        }
+        return None
+
+    # ── non-generated script ── forbid all raw meshing commands ──
+    for token in forbidden_tokens:
+        if token in lowered_clean:
+            return {
+                "success": False,
+                "policy_violation": True,
+                "blocked_command": token.lstrip("*"),
+                "message": (
+                    "Raw meshing Tcl is blocked. Use the corresponding "
+                    "generate_*_tcl tool."
+                ),
+            }
 
     return None
 
@@ -478,6 +475,62 @@ def _tcl_escape_name(name: str) -> str:
     s = s.replace("[", "\\[").replace("]", "\\]")
     s = s.replace("$", "\\$").replace('"', '\\"')
     return s
+
+
+def _component_rename_tcl(*, component_id: int | None, old_name: str | None, new_name: str) -> list[str]:
+    """Generate Tcl lines to rename a single HyperMesh component."""
+    safe_new_name = _tcl_escape_name(new_name)
+    lines: list[str] = [f"# MCP rename -> {safe_new_name}"]
+
+    if component_id is not None:
+        lines.extend([
+            f"*createmark components 1 {int(component_id)}",
+            f'catch {{*renamecollector components {int(component_id)} "{safe_new_name}"}} _mcp_rename_err',
+            'if {[info exists _mcp_rename_err] && $_mcp_rename_err ne ""} { puts "MCP_RENAME_WARN $_mcp_rename_err" }',
+        ])
+    elif old_name:
+        safe_old_name = _tcl_escape_name(old_name)
+        lines.extend([
+            f'*createmark components 1 "{safe_old_name}"',
+            f'catch {{*renamecollector components "{safe_old_name}" "{safe_new_name}"}} _mcp_rename_err',
+            'if {[info exists _mcp_rename_err] && $_mcp_rename_err ne ""} { puts "MCP_RENAME_WARN $_mcp_rename_err" }',
+        ])
+    else:
+        lines.append('puts "MCP_RENAME_FAIL missing component_id or old_name"')
+
+    return lines
+
+
+def _component_color_tcl(*, component_id: int | None, component_name: str | None, strategy: str) -> list[str]:
+    """Generate Tcl lines to color a single HyperMesh component by strategy."""
+    color = FINALIZE_STRATEGY_COLORS.get(strategy, FINALIZE_STRATEGY_COLORS["unknown"])
+    lines: list[str] = [f"# MCP color strategy={strategy} color={color}"]
+
+    if component_name:
+        safe_name = _tcl_escape_name(component_name)
+        lines.extend([
+            f'*createmark components 1 "{safe_name}"',
+            f"catch {{*colormark components 1 {int(color)}}}",
+        ])
+    elif component_id is not None:
+        lines.extend([
+            f"*createmark components 1 {int(component_id)}",
+            f"catch {{*colormark components 1 {int(color)}}}",
+        ])
+    else:
+        lines.append('puts "MCP_COLOR_FAIL missing component_id or component_name"')
+
+    return lines
+
+
+def _wrap_generated_tcl(generator_name: str, body: str) -> str:
+    """Wrap generated Tcl with boundary markers for policy enforcement."""
+    return "\n".join([
+        f"# MCP_GENERATED_BY={generator_name}",
+        MCP_SCRIPT_BEGIN,
+        body,
+        MCP_SCRIPT_END,
+    ])
 
 
 def _parse_probe_facts(line: str):
@@ -953,6 +1006,73 @@ def generate_component_colors_tcl(classification_results: dict | None = None):
     
     lines.append('puts "COLORED: $colored components"')
     return {"success": True, "tcl_script": "\n".join(lines)}
+
+
+@mcp.tool()
+def generate_finalize_components_tcl(assignments: list[dict[str, Any]]) -> dict[str, Any]:
+    """Generate Tcl that finalizes components after meshing.
+
+    This step is mandatory after meshing.
+    It renames components, colors them by strategy, and emits MCP_FINALIZE_OK.
+
+    assignments example:
+    [
+        {
+            "component_id": 12,
+            "old_name": "component12",
+            "new_name": "shaft_ring_s12",
+            "strategy": "drag_hex"
+        }
+    ]
+    """
+    if not assignments:
+        return {"success": False, "message": "assignments cannot be empty."}
+
+    lines: list[str] = [
+        "# MCP finalization",
+        "# MCP_FINALIZE_COMPONENTS",
+        'puts "MCP_FINALIZE_BEGIN"',
+    ]
+
+    finalized_count = 0
+
+    for item in assignments:
+        component_id_raw = item.get("component_id")
+        component_id = int(component_id_raw) if component_id_raw not in (None, "") else None
+        old_name = item.get("old_name")
+        new_name = item.get("new_name")
+        strategy = str(item.get("strategy", "unknown"))
+
+        if not new_name:
+            return {"success": False, "message": f"new_name is required for assignment: {item}"}
+
+        lines.extend(
+            _component_rename_tcl(
+                component_id=component_id,
+                old_name=str(old_name) if old_name else None,
+                new_name=str(new_name),
+            )
+        )
+        lines.extend(
+            _component_color_tcl(
+                component_id=component_id,
+                component_name=str(new_name),
+                strategy=strategy,
+            )
+        )
+
+        safe_new_name = _tcl_escape_name(str(new_name))
+        lines.append(f'puts "MCP_FINALIZED_COMP name={safe_new_name} strategy={strategy}"')
+        finalized_count += 1
+
+    lines.append(f'puts "MCP_FINALIZE_OK count={finalized_count}"')
+
+    return {
+        "success": True,
+        "script": "\n".join(lines),
+        "required_next_step": "execute_tcl_gui or execute_tcl",
+        "completion_token": "MCP_FINALIZE_OK",
+    }
 
 
 @mcp.tool()
@@ -1593,7 +1713,7 @@ def generate_surface_automesh_tcl(
     if output_hm_path:
         lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
 
-    return {"success": True, "script": "\n".join(lines) + "\n"}
+    return {"success": True, "script": _wrap_generated_tcl("generate_surface_automesh_tcl", "\n".join(lines))}
 
 
 @mcp.tool()
@@ -1647,7 +1767,7 @@ def generate_surface_deviation_rtrias_tcl(
 
     return {
         "success": True,
-        "script": "\n".join(lines) + "\n",
+        "script": _wrap_generated_tcl("generate_surface_deviation_rtrias_tcl", "\n".join(lines)),
         "strategy": HYPERMESH_MESHING_STRATEGY.strip(),
     }
 
@@ -1845,10 +1965,11 @@ def generate_gear_aware_tetra_tcl(
         "        eval *createmark elems 1 $shell_ids",
         "        catch {*triangle_clean_up elems 1 \"aspect=10.0 height=0.2\"}",
         "        set tet_max [expr {max($base_size * 1.9, $gear_size * 2.2)}]",
+        "        *createmark components 2 \"$comp\"",
         "        *createstringarray 2 \\",
-        "            \"tet: 547 1.2 2 $tet_max 0.8 $min_size 0\" \\",
-        "            \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
-        "        if {[catch {*tetmesh elements 1 1 elements 0 -1 1 2} tet_err]} {",
+        "            \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\" \\",
+        "            \"tet: 67 1.3 -1 0 0.8 -1 -1\"",
+        "        if {[catch {*tetmesh components 2 1 elements 0 -1 1 2} tet_err]} {",
         '            puts "MCP gear-aware tetra volume mesh failed: $tet_err"',
         "            set failed_after_cleanup [mcp_list_subtract [mcp_all_elems] $before_shell_mesh]",
         "            mcp_delete_elems $failed_after_cleanup",
@@ -1872,7 +1993,7 @@ def generate_gear_aware_tetra_tcl(
 
     return {
         "success": True,
-        "script": "\n".join(lines) + "\n",
+        "script": _wrap_generated_tcl("generate_gear_aware_tetra_tcl", "\n".join(lines)),
         "strategy": (
             "Use for gear-like shafts, including helical gears. Identify repeated "
             "tooth/flank/root surfaces as gear_surface_ids when possible; otherwise "
@@ -1935,8 +2056,9 @@ def generate_plain_tetra_tcl(
         '    *createmark elems 1 "by surface" [hm_getmark surfaces 1]',
         '    set shell_count [hm_marklength elems 1]',
         '    if {$shell_count == 0} { incr at; continue }',
-        f'    *createstringarray 2 "tet: 547 1.2 2 [expr {{$cs*1.9}}] 0.8 $mn_size 0" "pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew=\'0.99,0.95,0.90,1\'"',
-        '    *tetmesh elems 1 1 elems 0 -1 1',
+        '    *createmark components 2 "$target_component"',
+        '    *createstringarray 2 "pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew=\'0.99,0.95,0.90,1\'" "tet: 67 1.3 -1 0 0.8 -1 -1"',
+        '    *tetmesh components 2 1 elements 0 -1 1 2',
         '    *createmark elems 1 "by comp" "$target_component"',
         '    if {[hm_marklength elems 1] == 0} { incr at; set mn_factor [expr {$mn_factor*0.7}]; continue }',
         '    *createmark elems 2 [hm_getmark elems 1]',
@@ -1969,7 +2091,7 @@ def generate_plain_tetra_tcl(
         lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
     return {
         "success": True,
-        "script": "\n".join(lines),
+        "script": _wrap_generated_tcl("generate_plain_tetra_tcl", "\n".join(lines)),
     }
 
 
@@ -2152,10 +2274,11 @@ def generate_guarded_drag_hex_tcl(
         "    set tet_max [expr {max($elem_size * 1.9, 0.85)}]",
         "    set tet_min 0.50",
         "    if {$elem_size < 0.55} {set tet_min [expr {$elem_size * 0.60}]}",
+        "    *createmark components 2 \"$comp\"",
         "    *createstringarray 2 \\",
-        "        \"tet: 547 1.2 2 $tet_max 0.8 $tet_min 0\" \\",
-        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
-        "    if {[catch {*tetmesh elements 1 1 elements 0 -1 1 2} tet_err]} {",
+        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\" \\",
+        "        \"tet: 67 1.3 -1 0 0.8 -1 -1\"",
+        "    if {[catch {*tetmesh components 2 1 elements 0 -1 1 2} tet_err]} {",
         "        eval *createmark elems 1 $shell_ids",
         "        catch {*deletemark elems 1}",
         "        return 0",
@@ -2234,7 +2357,7 @@ def generate_guarded_drag_hex_tcl(
 
     return {
         "success": True,
-        "script": "\n".join(lines) + "\n",
+        "script": _wrap_generated_tcl("generate_guarded_drag_hex_tcl", "\n".join(lines)),
         "strategy": (
             "Use this only for simple straight tubes/extrusions. Before drag, "
             "force corresponding edge groups to a compatible target_density. "
@@ -2334,8 +2457,9 @@ def generate_batched_drag_hex_tcl(
         "    set sh [b_sub [b_all] $bf]; if {[llength $sh]==0} {return 0}",
         "    eval *createmark elems 1 $sh",
         "    set tx [expr {max($z*1.9,max($mn+0.05,0.85))}]; set tn $mn",
-        '    *createstringarray 2 "tet: 547 1.2 2 $tx 0.8 $tn 0" "pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew=\'0.99,0.95,0.90,1\'"',
-        "    if {[catch {*tetmesh elems 1 1 elems 0 -1 1 2} e]} {eval *createmark elems 1 $sh; catch {*deletemark elems 1}; return 0}",
+        '    *createmark components 2 "$c"',
+        '    *createstringarray 2 "pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew=\'0.99,0.95,0.90,1\'" "tet: 67 1.3 -1 0 0.8 -1 -1"',
+        "    if {[catch {*tetmesh components 2 1 elements 0 -1 1 2} e]} {eval *createmark elems 1 $sh; catch {*deletemark elems 1}; return 0}",
         "    eval *createmark elems 1 $sh; catch {*deletemark elems 1}",
         '    *createmark elems 1 "by comp" "$c"',
         "    if {[hm_marklength elems 1] == 0} {return 0}",
@@ -2348,7 +2472,7 @@ def generate_batched_drag_hex_tcl(
         "    catch {*beginhistorystate \"MCP guarded drag hex batch s$sid\"}",
         '    *currentcollector components "$dc"',
         "    catch {*setedgedensitylinkwithaspectratio -1}; *setedgedensitylink 1",
-        "    set hs 0; set at 0; set cs $elem_size",
+        "    set hs 0; set at 0; set cs [expr {max(0.5, min(1.5, $dd/4.0))}]",
         "    while {$at<=$retry_count&&!$hs} {",
         "        *createmark surfaces 1 $surf",
         "        *interactiveremeshsurf 1 $cs 1 1 1 1 1",
@@ -2371,7 +2495,7 @@ def generate_batched_drag_hex_tcl(
         '        *elementtest 1 aspect 0 10.0 0 1 0',
         '        if {[hm_marklength elems 1] > 0} {',
         '            eval *createmark elems 1 [hm_getmark elems 1]; *deletemark elems 1',
-        '            set cs [expr {$cs*0.8}]; if {$cs<0.3} {set cs 0.3}',
+        '            set cs [expr {$cs*0.8}]; if {$cs<0.5} {set cs 0.5}',
         '            continue',
         '        }',
         '        *createmark elems 1 "by surface" $surf',
@@ -2395,7 +2519,7 @@ def generate_batched_drag_hex_tcl(
         "        if {[llength $ne]>0&&$hc==[llength $ne]&&$fo} { set hs 1 } else {",
         "            if {[llength $ne]>0} {eval *createmark elems 1 $ne; catch {*deletemark elems 1}}",
         "            eval *createmark elems 1 $ss; catch {*deletemark elems 1}",
-        "            set cs [expr {$cs*0.8}]; if {$cs<0.3} {set cs 0.3}",
+        "            set cs [expr {$cs*0.8}]; if {$cs<0.5} {set cs 0.5}",
         "        }; incr at",
         "    }",
         "    if {!$hs} {b_tetra $sid $dc $elem_size}",
@@ -2408,7 +2532,7 @@ def generate_batched_drag_hex_tcl(
 
     return {
         "success": True,
-        "script": "\n".join(lines),
+        "script": _wrap_generated_tcl("generate_batched_drag_hex_tcl", "\n".join(lines)),
         "strategy": "Batched drag-hex: processes multiple solids in one script.",
     }
 
@@ -2473,7 +2597,7 @@ def generate_all_meshing_tcl(
     # 生成 tetra 逐个脚本
     for t in tetra_list:
         mn = t.get("mn", 1.0)
-        auto_size = min(1.5, mn / 4.0)
+        auto_size = max(0.5, min(1.5, mn / 4.0))
         result = generate_plain_tetra_tcl(
             solid_id=t["solid_id"],
             component_name=t["component_name"],
@@ -2492,7 +2616,7 @@ def generate_all_meshing_tcl(
     full_script = "\n".join(all_lines)
     return {
         "success": True,
-        "script": full_script,
+        "script": _wrap_generated_tcl("generate_all_meshing_tcl", full_script),
         "drag_hex_count": sum(len(v) for v in drag_by_axis.values()),
         "tetra_count": len(tetra_list),
     }
@@ -2606,10 +2730,11 @@ def generate_guarded_spin_hex_tcl(
         "    set tet_max [expr {max($elem_size * 1.9, 0.85)}]",
         "    set tet_min 0.50",
         "    if {$elem_size < 0.55} {set tet_min [expr {$elem_size * 0.60}]}",
+        "    *createmark components 2 \"$comp\"",
         "    *createstringarray 2 \\",
-        "        \"tet: 547 1.2 2 $tet_max 0.8 $tet_min 0\" \\",
-        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
-        "    if {[catch {*tetmesh elements 1 1 elements 0 -1 1 2} tet_err]} {",
+        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\" \\",
+        "        \"tet: 67 1.3 -1 0 0.8 -1 -1\"",
+        "    if {[catch {*tetmesh components 2 1 elements 0 -1 1 2} tet_err]} {",
         "        eval *createmark elems 1 $shell_ids",
         "        catch {*deletemark elems 1}",
         "        return 0",
@@ -2674,7 +2799,7 @@ def generate_guarded_spin_hex_tcl(
 
     return {
         "success": True,
-        "script": "\n".join(lines) + "\n",
+        "script": _wrap_generated_tcl("generate_guarded_spin_hex_tcl", "\n".join(lines)),
         "strategy": (
             "Use spin for clean revolved bodies when the source section can be "
             "meshed as 100% quads. Fall back to tetra for flanges, protrusions, "
@@ -2875,10 +3000,11 @@ def generate_cutsection_spin_hex_tcl(
         "    set tet_max [expr {max($elem_size * 1.9, 0.85)}]",
         "    set tet_min 0.50",
         "    if {$elem_size < 0.55} {set tet_min [expr {$elem_size * 0.60}]}",
+        "    *createmark components 2 \"$comp\"",
         "    *createstringarray 2 \\",
-        "        \"tet: 547 1.2 2 $tet_max 0.8 $tet_min 0\" \\",
-        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\"",
-        "    if {[catch {*tetmesh elements 1 1 elements 0 -1 1 2} tet_err]} {",
+        "        \"pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew='0.99,0.95,0.90,1'\" \\",
+        "        \"tet: 67 1.3 -1 0 0.8 -1 -1\"",
+        "    if {[catch {*tetmesh components 2 1 elements 0 -1 1 2} tet_err]} {",
         '        puts "MCP fallback tetra volume mesh failed: $tet_err"',
         "        mcp_delete_elems $shell_ids",
         "        return 0",
@@ -3005,7 +3131,7 @@ def generate_cutsection_spin_hex_tcl(
 
     return {
         "success": True,
-        "script": "namespace eval ::mcp_meshing {\n" + "\n".join(lines) + "\n}\n",
+        "script": _wrap_generated_tcl("generate_cutsection_spin_hex_tcl", "namespace eval ::mcp_meshing {\n" + "\n".join(lines) + "\n}\n"),
         "strategy": (
             "Generic cut-section spin: split the actual solid first, accept only "
             "new all-quad surfaces that lie on that cut plane, then spin those "

@@ -119,10 +119,20 @@ hex8 mesh bounding box fits the target solid. If the drag result is missing,
 non-hex, or poorly fitted, it deletes invalid elements and retries. Tetra is no
 longer hidden inside drag; it is handled only by the explicit tetra phase.
 
+Drag hex sizing is bounded to `0.5..1.5` mm. The initial size is not based only
+on extrusion thickness; it also considers the source-face bounding box and uses
+the smallest of the requested size, `drag_distance/4`, `source_minor/3`, and
+`source_major/8`.
+
 For long drag runs, `generate_batched_drag_hex_tcl` inserts a short pause after
 each solid and can checkpoint the `.hm` file every few solids. Tetra work should
 be run explicitly in small batches after drag, reducing the chance of a
 HyperMesh crash after many consecutive heavy operations.
+
+After `classify_all_solids_from_probe`, use the returned `phase3_tetra_batches`
+order for tetra work. Do not run tetra solids simply by increasing solid id:
+high-risk tetra solids are intentionally isolated into their own batches so they
+still run, but not immediately after another expensive tetra operation.
 
 The batched drag workflow does not run hidden tetra fallback during drag batches.
 If a drag source is invalid or drag fails, it reports `MCP_DRAG_SKIP_TETRA` and

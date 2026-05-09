@@ -110,11 +110,12 @@ GENERIC_MESHING_RULES = {
         "default_element_size": 1.5,
         "default_retry_count": 2,
         "element_size_rule": (
-            "Default element_size is 1.5 mm for drag_hex unless the solid is very "
-            "small (min dimension < 3 mm) or very large (min dimension > 50 mm). "
-            "Layer count is auto-computed as round(drag_distance / element_size). "
-            "Minimum 1 layer. A thin solid with 1 layer is acceptable 闁?do NOT "
-            "fallback to tetra just because the drag direction is thin."
+            "Drag hex element_size is clamped to 0.5-1.5 mm and must be chosen "
+            "from both extrusion thickness and source-face size: min(requested, "
+            "drag_distance/4, source_minor/3, source_major/8). Layer count is "
+            "auto-computed as round(drag_distance / element_size). Minimum 1 "
+            "layer. A thin solid with 1 layer is acceptable; do not fallback to "
+            "tetra just because the drag direction is thin."
         ),
         "retry_policy": (
             "After each failed attempt, reduce element_size by 20% and retry. "
@@ -721,6 +722,16 @@ def _parse_probe_facts(line: str):
     return facts
 
 
+def _probe_lines_iter(probe_lines) -> list[str]:
+    if probe_lines is None:
+        return []
+    if isinstance(probe_lines, str):
+        return probe_lines.splitlines()
+    if isinstance(probe_lines, (list, tuple)):
+        return [str(line) for line in probe_lines]
+    return str(probe_lines).splitlines()
+
+
 def _generate_geometry_component_name(facts, strategy, suffix_solid_id=True):
     """Generate a geometry-driven component name from probe facts."""
     dx, dy, dz = facts.get("dx", 0), facts.get("dy", 0), facts.get("dz", 0)
@@ -735,6 +746,73 @@ def _generate_geometry_component_name(facts, strategy, suffix_solid_id=True):
     elif strategy == "spin_hex":
         return "disc_D" + str(round(md)) + "_t" + str(round(mn)) + sfx
     return "solid_" + str(round(dx)) + "x" + str(round(dy)) + "x" + str(round(dz)) + sfx
+
+
+def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return tetra batches ordered to reduce HyperMesh memory-crash risk."""
+    tetra = [
+        item for item in results.values()
+        if item.get("strategy") in {"tetra_plain", "tetra_surface_deviation_rtrias", "surface_tetra"}
+    ]
+
+    def risk_score(item: dict[str, Any]) -> float:
+        dims = item.get("dims", {})
+        dx = float(dims.get("dx", 0))
+        dy = float(dims.get("dy", 0))
+        dz = float(dims.get("dz", 0))
+        diag = (dx * dx + dy * dy + dz * dz) ** 0.5
+        sc = float(item.get("surf_count", 0))
+        min_size = max(0.2, float(item.get("min_element_size", 0.5)))
+        return sc * max(diag, 1.0) / min_size
+
+    batches: list[dict[str, Any]] = []
+    current: list[int] = []
+    current_score = 0.0
+    batch_index = 1
+    for item in sorted(tetra, key=lambda value: int(value.get("solid_id", 0))):
+        sid = int(item.get("solid_id", 0))
+        sc = int(item.get("surf_count", 0))
+        score = risk_score(item)
+        high_risk = sc >= TETRA_VERY_COMPLEX_SURFACE_COUNT or score >= 20000
+        if high_risk:
+            if current:
+                batches.append({
+                    "batch": batch_index,
+                    "solid_ids": current,
+                    "reason": "low/medium-risk tetra batch",
+                    "pause_seconds_after_batch": 5,
+                })
+                batch_index += 1
+                current = []
+                current_score = 0.0
+            batches.append({
+                "batch": batch_index,
+                "solid_ids": [sid],
+                "reason": "high-risk tetra solid; run alone, then save/cool down before the next tetra batch",
+                "pause_seconds_after_batch": 10,
+            })
+            batch_index += 1
+            continue
+        if current and (len(current) >= 4 or current_score + score > 18000):
+            batches.append({
+                "batch": batch_index,
+                "solid_ids": current,
+                "reason": "low/medium-risk tetra batch",
+                "pause_seconds_after_batch": 5,
+            })
+            batch_index += 1
+            current = []
+            current_score = 0.0
+        current.append(sid)
+        current_score += score
+    if current:
+        batches.append({
+            "batch": batch_index,
+            "solid_ids": current,
+            "reason": "low/medium-risk tetra batch",
+            "pause_seconds_after_batch": 5,
+        })
+    return batches
 
 
 def _gui_listener_script(host: str = "127.0.0.1", port: int = DEFAULT_GUI_PORT) -> str:
@@ -1109,6 +1187,7 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
     counts = {}
     for r in results.values():
         counts[r["strategy"]] = counts.get(r["strategy"], 0) + 1
+    tetra_batches = _tetra_execution_batches(results)
         
     # Save to global cache so downstream tools don't require the AI to pass back a massive dict
     _GLOBAL_CLASSIFICATION_RESULTS.clear()
@@ -1122,9 +1201,15 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         "total_solids": len(results),
         "strategy_counts": counts,
         "results": results,
+        "phase3_tetra_batches": tetra_batches,
+        "phase3_tetra_batching_required": True,
         "phase2_finalize_script": finalize.get("script", ""),
         "phase2_finalize_required": True,
-        "required_next_step": "Execute phase2_finalize_script with execute_tcl_gui before Phase 3 meshing.",
+        "required_next_step": (
+            "Execute phase2_finalize_script with execute_tcl_gui before Phase 3 meshing. "
+            "During Phase 3, process tetra solids in phase3_tetra_batches order; do not "
+            "run high-risk tetra solids back-to-back in solid-id order."
+        ),
         "completion_token": "MCP_FINALIZE_OK",
     }
 
@@ -1809,6 +1894,8 @@ def generate_plain_tetra_tcl(
         "set ok 0",
         "set unfixed_aspect_report 0",
         "set unrepaired_vol_skew_report 0",
+        "set final_bad_solid 0",
+        "set final_bad_vol_count 0",
         "set target_vol_skew_report -1",
         "proc mcp_all_elems {} {",
         '    *createmark elems 1 "all"',
@@ -1887,6 +1974,15 @@ def generate_plain_tetra_tcl(
         "    foreach eid $ids {",
         "        set aspect [mcp_shell_aspect $eid]",
         "        if {$aspect > $threshold} {lappend out $eid}",
+        "    }",
+        "    return $out",
+        "}",
+        "proc mcp_tetra_ids_in_component {component_name} {",
+        "    set out {}",
+        "    *createmark elems 1 \"by comp\" \"$component_name\"",
+        "    foreach eid [hm_getmark elems 1] {",
+        "        set c [hm_getvalue elems id=$eid dataname=config]",
+        "        if {$c==204 || $c==205 || $c==210 || $c==547} {lappend out $eid}",
         "    }",
         "    return $out",
         "}",
@@ -1998,9 +2094,7 @@ def generate_plain_tetra_tcl(
         '    }',
         '    set unfixed_aspect_report [llength $bad_aspect_ids]',
         '    if {$unfixed_aspect_report > 0} {',
-        '        puts "MCP_PT_WARN solid=$target_solid aspect_unfixed=$unfixed_aspect_report remesh_with_smaller_min"',
-        '        mcp_delete_elems $shell_ids',
-        '        continue',
+        '        puts "MCP_PT_WARN solid=$target_solid aspect_unfixed=$unfixed_aspect_report continue_to_tetmesh_keep_surface_mesh=1"',
         '    }',
         '    if {!$allow_tetmesh} {',
         '        puts "MCP_PT_STOP solid=$target_solid shell_count=$shell_count tetmesh_disabled_for_high_risk_geometry before_tetmesh"',
@@ -2019,10 +2113,8 @@ def generate_plain_tetra_tcl(
         '        mcp_delete_elems $shell_ids',
         '        continue',
         '    }',
-        '    mcp_delete_elems $shell_ids',
-        '    *createmark elems 1 "by comp" "$target_component"',
-        '    set comp_elems [hm_getmark elems 1]',
-        '    if {[llength $comp_elems] == 0} { puts "MCP_PT_WARN solid=$target_solid no_tetra_after_tetmesh"; continue }',
+        '    set comp_elems [mcp_tetra_ids_in_component $target_component]',
+        '    if {[llength $comp_elems] == 0} { puts "MCP_PT_WARN solid=$target_solid no_tetra_after_tetmesh_keep_surface_mesh=1"; continue }',
         '    puts "MCP_PT_INFO solid=$target_solid tetmesh_generation_vol_skew_target=$target_vol_skew"',
         '    eval *createmark elems 1 $comp_elems',
         '    set repair_rc [catch {*elementtestvolumetricskew elems 1 $repair_vol_skew 1 0 ""} repair_err]',
@@ -2035,10 +2127,24 @@ def generate_plain_tetra_tcl(
         '            set bad_vol_ids {}',
         '        }',
         '        set vol_repair_at 0',
-        '        while {[llength $bad_vol_ids] > 0 && $vol_repair_at < 3} {',
+        '        while {[llength $bad_vol_ids] > 0 && $vol_repair_at < 4} {',
         '            eval *createmark elems 1 $bad_vol_ids',
-        '            puts "MCP_PT_INFO solid=$target_solid vol_skew_repair=smooth iter=$vol_repair_at count=[llength $bad_vol_ids]"',
-        '            if {$vol_repair_at == 0} { catch {*smooth elems 1 3} } elseif {$vol_repair_at == 1} { catch {*smooth elems 1 8} } else { catch {*smooth elems 1 15} }',
+        '            if {$vol_repair_at == 0} {',
+        '                puts "MCP_PT_INFO solid=$target_solid vol_skew_repair=solid_mesh_optimization count=[llength $bad_vol_ids] threshold=$repair_vol_skew"',
+        '                *clearmark elements 2',
+        '                *createstringarray 2 "tet: 256 1.2 2 0.0 0.8 0.0 0" "pars: fix_comp_bdr= 1 fix_top_bdr= 0 shell_swap=0 shell_remesh=0 use_optimizer=1 skip_aflr3=1 feature_angle=35.0 niter=3 upd_shell=0 vol_skew=\'0.99,0.60,0.10,1.0\'"',
+        '                catch {*tetmesh elements 1 6 elements 2 1 1 2} opt_err',
+        '            } elseif {$vol_repair_at == 1} {',
+        '                puts "MCP_PT_INFO solid=$target_solid vol_skew_repair=smooth_3 count=[llength $bad_vol_ids]"',
+        '                catch {*smooth elems 1 3}',
+        '            } elseif {$vol_repair_at == 2} {',
+        '                puts "MCP_PT_INFO solid=$target_solid vol_skew_repair=smooth_8 count=[llength $bad_vol_ids]"',
+        '                catch {*smooth elems 1 8}',
+        '            } else {',
+        '                puts "MCP_PT_INFO solid=$target_solid vol_skew_repair=smooth_15 count=[llength $bad_vol_ids]"',
+        '                catch {*smooth elems 1 15}',
+        '            }',
+        '            set comp_elems [mcp_tetra_ids_in_component $target_component]',
         '            eval *createmark elems 1 $comp_elems',
         '            set repair_rc [catch {*elementtestvolumetricskew elems 1 $repair_vol_skew 1 0 ""} repair_err]',
         '            if {$repair_rc && $repair_err ne "0"} {',
@@ -2051,6 +2157,15 @@ def generate_plain_tetra_tcl(
         '        }',
         '        set unrepaired_vol_skew_report [llength $bad_vol_ids]',
         '    }',
+        '    if {$unrepaired_vol_skew_report > 0} {',
+        '        puts "MCP_PT_FAIL solid=$target_solid unrepaired_vol_skew_over_$repair_vol_skew=$unrepaired_vol_skew_report delete_tetra_keep_surface_shells=1"',
+        '        set final_bad_solid $target_solid',
+        '        set final_bad_vol_count $unrepaired_vol_skew_report',
+        '        mcp_delete_elems [mcp_tetra_ids_in_component $target_component]',
+        '        set ok 0',
+        '        break',
+        '    }',
+        '    mcp_delete_elems $shell_ids',
         '    set ok 1',
         '}',
         '*createmark elems 1 "by comp" "$target_component"',
@@ -2062,7 +2177,8 @@ def generate_plain_tetra_tcl(
         '    if {$c==204 || $c==205} {incr t4}',
         '    if {$c==210 || $c==547} {incr t10}',
         '}',
-        'if {!$ok} { puts "MCP_PT_FAIL solid=$target_solid no_accepted_tetra_after_retries" }',
+        'if {!$ok && $final_bad_vol_count > 0} { puts "MCP_PT_QUALITY_FAIL solid=$final_bad_solid bad_volume_elements=$final_bad_vol_count kept_surface_shells=1" }',
+        'if {!$ok && $final_bad_vol_count == 0} { puts "MCP_PT_FAIL solid=$target_solid no_accepted_tetra_after_retries" }',
         'puts "MCP_PT_DONE solid=$target_solid ok=$ok total=$final_count tet4=$t4 tet10=$t10 unfixed_aspect=$unfixed_aspect_report tetmesh_generation_vol_skew_target=$target_vol_skew unrepaired_vol_skew_over_$repair_vol_skew=$unrepaired_vol_skew_report"',
     ]
     if output_hm_path:
@@ -2126,9 +2242,7 @@ def generate_guarded_drag_hex_tcl(
     ax_min, ax_max = axis_indices[axis_key]
 
     vx, vy, vz = vectors[axis_key]
-    layers = layer_count if layer_count and layer_count > 0 else max(
-        1, round(float(drag_distance) / float(element_size))
-    )
+    layers = int(layer_count) if layer_count and layer_count > 0 else 0
     comp = component_name.replace('"', '\\"')
     balanced_density, density_source = _balanced_seed_density(
         element_size=float(element_size),
@@ -2189,6 +2303,7 @@ def generate_guarded_drag_hex_tcl(
         f'set drag_component "{comp}"',
         f"set source_surface {int(source_surface_id)}",
         f"set target_solid {int(solid_id) if solid_id is not None else 0}",
+        f"set requested_elem_size {float(element_size)}",
         f"set elem_size {float(element_size)}",
         f"set drag_distance {float(drag_distance)}",
         f"set drag_layers {int(layers)}",
@@ -2234,6 +2349,16 @@ def generate_guarded_drag_hex_tcl(
         '*currentcollector components "$drag_component"',
         "catch {*setedgedensitylinkwithaspectratio -1}",
         "*setedgedensitylink 1",
+        "*createmark surfaces 2 $source_surface",
+        "set size_bb [hm_getboundingbox surfaces 2 0 0 0]",
+        "set size_dims [lsort -real [list [expr {abs([lindex $size_bb 3]-[lindex $size_bb 0])}] [expr {abs([lindex $size_bb 4]-[lindex $size_bb 1])}] [expr {abs([lindex $size_bb 5]-[lindex $size_bb 2])}]]]",
+        "set source_minor [lindex $size_dims 1]",
+        "set source_major [lindex $size_dims 2]",
+        "set thickness_size [expr {$drag_distance/4.0}]",
+        "set source_size [expr {min($source_minor/3.0, $source_major/8.0)}]",
+        "set elem_size [expr {max(0.5, min(1.5, min($requested_elem_size, $thickness_size, $source_size)))}]",
+        "if {$drag_layers <= 0} {set drag_layers [expr {max(1, round($drag_distance/$elem_size))}]}",
+        'puts "MCP_DRAG_SIZE single solid=$target_solid thickness=$drag_distance source_minor=$source_minor source_major=$source_major requested=$requested_elem_size thickness_size=$thickness_size source_size=$source_size chosen=$elem_size layers=$drag_layers limits=0.5..1.5"',
         "*createmark surfaces 1 $source_surface",
         "*interactiveremeshsurf 1 $elem_size 1 1 1 1 1",
         "*set_meshfaceparams 0 5 1 0 0 1 0.5 1 1",
@@ -2414,7 +2539,16 @@ def generate_batched_drag_hex_tcl(
         "    catch {*beginhistorystate \"MCP guarded drag hex batch s$sid\"}",
         '    *currentcollector components "$dc"',
         "    catch {*setedgedensitylinkwithaspectratio -1}; *setedgedensitylink 1",
-        "    set hs 0; set at 0; set cs [expr {max(0.5, min(1.5, $dd/4.0))}]",
+        "    *createmark surfaces 2 $surf",
+        "    set size_bb [hm_getboundingbox surfaces 2 0 0 0]",
+        "    set size_dims [lsort -real [list [expr {abs([lindex $size_bb 3]-[lindex $size_bb 0])}] [expr {abs([lindex $size_bb 4]-[lindex $size_bb 1])}] [expr {abs([lindex $size_bb 5]-[lindex $size_bb 2])}]]]",
+        "    set source_minor [lindex $size_dims 1]",
+        "    set source_major [lindex $size_dims 2]",
+        "    set thickness_size [expr {$dd/4.0}]",
+        "    set source_size [expr {min($source_minor/3.0, $source_major/8.0)}]",
+        "    set cs [expr {max(0.5, min(1.5, min($elem_size, $thickness_size, $source_size)))}]",
+        '    puts "MCP_DRAG_SIZE solid=$sid thickness=$dd source_minor=$source_minor source_major=$source_major requested=$elem_size thickness_size=$thickness_size source_size=$source_size chosen=$cs limits=0.5..1.5"',
+        "    set hs 0; set at 0",
         "    while {$at<=$retry_count&&!$hs} {",
         "        *createmark surfaces 1 $surf",
         "        *interactiveremeshsurf 1 $cs 1 1 1 1 1",

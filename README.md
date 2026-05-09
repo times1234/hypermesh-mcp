@@ -120,10 +120,9 @@ non-hex, or poorly fitted, it deletes invalid elements and retries. Tetra is no
 longer hidden inside drag; it is handled only by the explicit tetra phase.
 
 For long drag runs, `generate_batched_drag_hex_tcl` inserts a short pause after
-each solid and can checkpoint the `.hm` file every few solids. The all-meshing
-workflow also writes a drag checkpoint and pauses before entering tetra, reducing
-the chance of a HyperMesh crash after many consecutive `*meshdragelements2`
-operations.
+each solid and can checkpoint the `.hm` file every few solids. Tetra work should
+be run explicitly in small batches after drag, reducing the chance of a
+HyperMesh crash after many consecutive heavy operations.
 
 The batched drag workflow does not run hidden tetra fallback during drag batches.
 If a drag source is invalid or drag fails, it reports `MCP_DRAG_SKIP_TETRA` and

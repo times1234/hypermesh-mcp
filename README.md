@@ -83,15 +83,10 @@ Required checks:
   `min_element_size` to capture small faces/features instead of coarsening the
   part
 - clean/check 2D aspect issues
-- stop and report before `*tetmesh` if the surface shell count exceeds the
-  crash-safety guard
-- use a lower `*tetmesh` shell-count guard for high-face-count solids, so the
-  script reports `MCP_PT_STOP` instead of entering a known crash-prone volume
-  mesh call
-- high-risk tetra solids with many faces are surface-meshed and stopped before
-  `*tetmesh` by default; this prevents the Gear1-style HyperMesh hard crash and
-  leaves an explicit `MCP_PT_STOP ... tetmesh_disabled_for_high_risk_geometry`
-  diagnostic
+- continue to `*tetmesh` even for complex solids, while logging shell-count
+  guard warnings for crash diagnosis
+- run high-risk tetra solids in isolated Phase 3 batches rather than stopping
+  them or making them coarser
 - tetramesh per component/object
 - check and locally repair/report volume quality
 
@@ -130,9 +125,15 @@ be run explicitly in small batches after drag, reducing the chance of a
 HyperMesh crash after many consecutive heavy operations.
 
 After `classify_all_solids_from_probe`, use the returned `phase3_tetra_batches`
-order for tetra work. Do not run tetra solids simply by increasing solid id:
-high-risk tetra solids are intentionally isolated into their own batches so they
-still run, but not immediately after another expensive tetra operation.
+for tetra work. The batcher is model-agnostic: it preserves solid-id order but
+isolates high-risk tetra solids into single-solid batches so they still run
+without being placed back-to-back inside one heavy command sequence.
+
+Use `generate_batched_plain_tetra_tcl` for tetra batches of up to four solids.
+The generated script defines the shared tetra Tcl helpers once, then runs each
+solid with its own size/component parameters. It also embeds
+`MCP_RECOMMENDED_TIMEOUT_SECONDS`; `execute_tcl_gui` and `execute_tcl`
+automatically honor that value when it is larger than the caller's timeout.
 
 The batched drag workflow does not run hidden tetra fallback during drag batches.
 If a drag source is invalid or drag fails, it reports `MCP_DRAG_SKIP_TETRA` and

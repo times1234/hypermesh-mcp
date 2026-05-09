@@ -73,12 +73,9 @@ HyperMesh meshing strategy for this workstation:
 12. Surface-deviation tetra sizing policy: do not make complex/high-face-count
     solids coarser just because they are complex. Keep the requested nominal
     element size, but allow a smaller minimum element size so small faces,
-    fillets, teeth, holes, and chamfers can be captured. Use a shell-count guard
-    before *tetmesh so a dangerously dense surface mesh is reported instead of
-    crashing HyperMesh.
-    High-risk solids such as gears or very high-face-count chamfered bodies must
-    not call *tetmesh in the same long GUI run unless explicitly allowed; stop
-    after safe surface mesh and report MCP_PT_STOP instead.
+    fillets, teeth, holes, and chamfers can be captured. Log shell-count guard
+    warnings before *tetmesh for crash diagnosis, but do not stop complex solids;
+    isolate high-risk tetra solids into separate Phase 3 batches instead.
 13. Phase 2 finalization is mandatory. After classification, execute the
     generated finalize Tcl so components are renamed and colored by strategy
     before Phase 3 meshing.
@@ -235,6 +232,7 @@ MCP_SCRIPT_END = "# MCP_SCRIPT_END"
 TRUSTED_MESHING_GENERATORS = {
     "generate_surface_automesh_tcl",
     "generate_plain_tetra_tcl",
+    "generate_batched_plain_tetra_tcl",
     "generate_guarded_drag_hex_tcl",
     "generate_batched_drag_hex_tcl",
     "generate_guarded_spin_hex_tcl",
@@ -691,6 +689,37 @@ def _wrap_generated_tcl(generator_name: str, body: str) -> str:
     ])
 
 
+def _unwrap_generated_tcl(script: str) -> str:
+    """Return body inside generated-script markers."""
+    text = str(script)
+    if MCP_SCRIPT_BEGIN in text and MCP_SCRIPT_END in text:
+        return text.split(MCP_SCRIPT_BEGIN, 1)[1].split(MCP_SCRIPT_END, 1)[0].strip()
+    return text
+
+
+def _estimate_tetra_timeout_seconds(
+    *,
+    surf_count: int = 0,
+    min_element_size: float = 0.5,
+    diagonal: float = 0.0,
+    batch_size: int = 1,
+) -> int:
+    min_size = max(0.2, float(min_element_size or 0.5))
+    complexity = max(1.0, float(surf_count or 1)) * max(1.0, float(diagonal or 1.0)) / min_size
+    return int(max(300, min(7200, 240 + complexity * 0.03 + max(1, batch_size) * 120)))
+
+
+def _recommended_timeout_from_script(script: str) -> int | None:
+    for line in str(script).splitlines()[:20]:
+        stripped = line.strip()
+        if stripped.startswith("# MCP_RECOMMENDED_TIMEOUT_SECONDS="):
+            try:
+                return int(float(stripped.split("=", 1)[1].strip()))
+            except ValueError:
+                return None
+    return None
+
+
 def _parse_probe_facts(line: str):
     """Parse a PROBE: line into a dict with field aliases."""
     import re
@@ -1099,7 +1128,7 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
     """MANDATORY Phase 2: classify every probed solid from probe_lines."""
     global _GLOBAL_CLASSIFICATION_RESULTS, _GLOBAL_PHASE2_FINALIZED
     results = {}
-    for line in probe_lines.splitlines():
+    for line in _probe_lines_iter(probe_lines):
         stripped = line.strip()
         if not stripped or not (
             stripped.startswith("PROBE:")
@@ -1207,8 +1236,9 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         "phase2_finalize_required": True,
         "required_next_step": (
             "Execute phase2_finalize_script with execute_tcl_gui before Phase 3 meshing. "
-            "During Phase 3, process tetra solids in phase3_tetra_batches order; do not "
-            "run high-risk tetra solids back-to-back in solid-id order."
+            "During Phase 3, use phase3_tetra_batches as model-agnostic batching "
+            "guidance: preserve solid-id order, but isolate high-risk tetra solids "
+            "so they are not run back-to-back inside one heavy command sequence."
         ),
         "completion_token": "MCP_FINALIZE_OK",
     }
@@ -1218,7 +1248,7 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
 def suggest_component_names(probe_lines):
     """Generate geometry-based component names from probe_lines."""
     names = {}
-    for line in probe_lines.splitlines():
+    for line in _probe_lines_iter(probe_lines):
         stripped = line.strip()
         if not stripped or not stripped.startswith("PROBE:"):
             continue
@@ -1876,6 +1906,7 @@ def generate_plain_tetra_tcl(
     clamped_size = max(1.5, min(float(element_size), 2.0))
     lines = [
         "# HyperMesh MCP generated tetra script: surface deviation R-trias -> smooth-pyramid tetra",
+        f"# MCP_RECOMMENDED_TIMEOUT_SECONDS={_estimate_tetra_timeout_seconds(surf_count=max_shell_elements_before_tetmesh, min_element_size=clamped_min, batch_size=1)}",
         f"set target_solid {int(solid_id)}",
         f"set target_component {{{comp}}}",
         f"set requested_elem_size {clamped_size}",
@@ -1890,12 +1921,17 @@ def generate_plain_tetra_tcl(
         f"set target_vol_skew {float(target_vol_skew)}",
         f"set repair_vol_skew {float(repair_vol_skew)}",
         f"set delete_existing_component_elements {1 if delete_existing_component_elements else 0}",
+        "set surface_aspect_threshold 10.0",
+        "set surface_growth_limit 1.23",
+        "set surface_max_to_min_ratio 6.0",
         "set retry_count 4",
         "set ok 0",
         "set unfixed_aspect_report 0",
         "set unrepaired_vol_skew_report 0",
         "set final_bad_solid 0",
         "set final_bad_vol_count 0",
+        "set kept_surface_shell_count 0",
+        "set last_param_key \"\"",
         "set target_vol_skew_report -1",
         "proc mcp_all_elems {} {",
         '    *createmark elems 1 "all"',
@@ -1977,6 +2013,70 @@ def generate_plain_tetra_tcl(
         "    }",
         "    return $out",
         "}",
+        "proc mcp_shells_on_surfaces {surfs} {",
+        "    set out {}",
+        "    foreach sid $surfs {",
+        "        *createmark elems 2 \"by surface\" $sid",
+        "        foreach eid [hm_getmark elems 2] {lappend out $eid}",
+        "    }",
+        "    return $out",
+        "}",
+        "proc mcp_surfaces_from_elems {elems fallback_surfs} {",
+        "    if {[llength $elems] == 0} {return {}}",
+        "    if {![catch {eval *createmark elems 1 $elems; *createmark surfaces 1 \"by elems\"}]} {",
+        "        set surfs [hm_getmark surfaces 1]",
+        "        if {[llength $surfs] > 0} {return $surfs}",
+        "    }",
+        "    array set bad {}",
+        "    foreach eid $elems {set bad($eid) 1}",
+        "    set out {}",
+        "    foreach sid $fallback_surfs {",
+        "        *createmark elems 2 \"by surface\" $sid",
+        "        set surface_elems [hm_getmark elems 2]",
+        "        foreach se $surface_elems {",
+        "            if {[info exists bad($se)]} {lappend out $sid; break}",
+        "        }",
+        "    }",
+        "    return [lsort -unique -integer $out]",
+        "}",
+        "proc mcp_local_remesh_bad_shells {bad_ids fallback_surfs elem_size min_size max_size max_dev feat_angle growth} {",
+        "    set target_surfs [mcp_surfaces_from_elems $bad_ids $fallback_surfs]",
+        "    if {[llength $target_surfs] == 0} {return 0}",
+        "    set before [mcp_all_elems]",
+        "    foreach sid $target_surfs {",
+        "        *createmark elems 1 \"by surface\" $sid",
+        "        set old [hm_getmark elems 1]",
+        "        if {[llength $old] > 0} {mcp_delete_elems $old}",
+        "        *createmark surfaces 1 $sid",
+        "        *createarray 3 0 0 0",
+        "        catch {*defaultmeshsurf_growth 1 $elem_size 3 3 2 1 1 1 35 0 $min_size $max_size $max_dev $feat_angle $growth 1 3 1 0}",
+        "        catch {*storemeshtodatabase 1}",
+        "    }",
+        "    set after [mcp_all_elems]",
+        "    set new_ids [mcp_list_subtract $after $before]",
+        "    if {[llength $new_ids] == 0} {set new_ids [mcp_shells_on_surfaces $target_surfs]}",
+        "    return [llength $new_ids]",
+        "}",
+        "proc mcp_collapse_bad_triangles {bad_ids} {",
+        "    set changed 0",
+        "    foreach eid $bad_ids {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=nodes} nodes]} {continue}",
+        "        if {[llength $nodes] != 3} {continue}",
+        "        set n0 [lindex $nodes 0]; set n1 [lindex $nodes 1]; set n2 [lindex $nodes 2]",
+        "        set p0 [mcp_node_xyz $n0]; set p1 [mcp_node_xyz $n1]; set p2 [mcp_node_xyz $n2]",
+        "        set d01 [mcp_dist3 $p0 $p1]; set d12 [mcp_dist3 $p1 $p2]; set d20 [mcp_dist3 $p2 $p0]",
+        "        set keep $n0; set move $n1; set dst $p0",
+        "        if {$d12 < $d01 && $d12 <= $d20} {set keep $n1; set move $n2; set dst $p1}",
+        "        if {$d20 < $d01 && $d20 < $d12} {set keep $n2; set move $n0; set dst $p2}",
+        "        set x [lindex $dst 0]; set y [lindex $dst 1]; set z [lindex $dst 2]",
+        "        set moved 0",
+        "        if {![catch {*nodemodify $move $x $y $z}]} {set moved 1}",
+        "        if {!$moved && ![catch {*nodesmodify $move $x $y $z}]} {set moved 1}",
+        "        if {!$moved} {continue}",
+        "        incr changed",
+        "    }",
+        "    return $changed",
+        "}",
         "proc mcp_tetra_ids_in_component {component_name} {",
         "    set out {}",
         "    *createmark elems 1 \"by comp\" \"$component_name\"",
@@ -2019,7 +2119,16 @@ def generate_plain_tetra_tcl(
         'for {set at 0} {$at < $retry_count && !$ok} {incr at} {',
         '    set cs [expr {max(1.5, $elem_size * pow(0.90, $at))}]',
         '    set mn_size [expr {max(0.20, $base_min_size * pow(0.80, $at))}]',
-        '    set max_size [expr {max($cs * 1.50, $mn_size + 0.05)}]',
+        '    set effective_growth [expr {min($growth, $surface_growth_limit)}]',
+        '    set max_size [expr {max($cs * 1.35, $mn_size + 0.05)}]',
+        '    set max_size [expr {min($max_size, max($mn_size + 0.05, $mn_size * $surface_max_to_min_ratio))}]',
+        '    set max_size [expr {max($max_size, $cs)}]',
+        '    set param_key [format "%.4f|%.4f|%.4f|%.4f|%.4f" $cs $mn_size $max_size $max_dev $effective_growth]',
+        '    if {$param_key eq $last_param_key} {',
+        '        puts "MCP_PT_STOP solid=$target_solid duplicate_retry_params attempt=$at params=$param_key keep_previous_surface_mesh=1"',
+        '        break',
+        '    }',
+        '    set last_param_key $param_key',
         '    *createmark surfaces 1 "by solids" $target_solid',
         '    set all_surfs [hm_getmark surfaces 1]',
         '    *createmark elems 1 "by surface" $all_surfs',
@@ -2029,9 +2138,9 @@ def generate_plain_tetra_tcl(
         '        mcp_delete_elems $stale_shells',
         '    }',
         '    set before_surface_elems [mcp_all_elems]',
-        '    puts "MCP_PT_SURFACE_ATTEMPT solid=$target_solid attempt=$at size=$cs min=$mn_size max=$max_size"',
+        '    puts "MCP_PT_SURFACE_ATTEMPT solid=$target_solid attempt=$at size=$cs min=$mn_size max=$max_size growth=$effective_growth max_to_min_ratio=$surface_max_to_min_ratio"',
         '    *createarray 3 0 0 0',
-        '    if {[catch {*defaultmeshsurf_growth 1 $cs 3 3 2 1 1 1 35 0 $mn_size $max_size $max_dev $feat_angle $growth 1 3 1 0} surf_err]} {',
+        '    if {[catch {*defaultmeshsurf_growth 1 $cs 3 3 2 1 1 1 35 0 $mn_size $max_size $max_dev $feat_angle $effective_growth 1 3 1 0} surf_err]} {',
         '        puts "MCP_PT_WARN solid=$target_solid surface_mesh_failed=$surf_err attempt=$at"',
         '        *createmark elems 1 "by surface" $all_surfs',
         '        set failed_shells [hm_getmark elems 1]',
@@ -2074,22 +2183,26 @@ def generate_plain_tetra_tcl(
         '        puts "MCP_PT_WARN solid=$target_solid shell_count=$shell_count exceeds_guard=$max_shell_before_tetmesh continuing_to_tetmesh"',
         '    }',
         '    set bad_aspect_ids {}',
-        '    set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids 10.0]',
+        '    set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold]',
         '    puts "MCP_PT_INFO solid=$target_solid aspect_bad_local=[llength $bad_aspect_ids]"',
         '    set repair_at 0',
         '    while {[llength $bad_aspect_ids] > 0 && $repair_at < 3} {',
         '        eval *createmark elems 1 $bad_aspect_ids',
+        '        set before_repair_count [llength $bad_aspect_ids]',
         '        if {$repair_at == 0} {',
         '            puts "MCP_PT_INFO solid=$target_solid aspect_repair=triangle_cleanup count=[llength $bad_aspect_ids]"',
-        '            catch {*triangle_clean_up elems 1 "aspect=10.0 height=0.2"}',
+        '            catch {*triangle_clean_up elems 1 "aspect=6.0 height=0.3"}',
         '        } elseif {$repair_at == 1} {',
         '            puts "MCP_PT_INFO solid=$target_solid aspect_repair=smooth_5 count=[llength $bad_aspect_ids]"',
         '            catch {*smooth elems 1 5}',
-        '        } else {',
-        '            puts "MCP_PT_INFO solid=$target_solid aspect_repair=smooth_15 count=[llength $bad_aspect_ids]"',
-        '            catch {*smooth elems 1 15}',
+        '        } elseif {$repair_at == 2} {',
+        '            puts "MCP_PT_INFO solid=$target_solid aspect_repair=local_remesh count=[llength $bad_aspect_ids]"',
+        '            set local_new [mcp_local_remesh_bad_shells $bad_aspect_ids $all_surfs $cs $mn_size $max_size $max_dev $feat_angle $effective_growth]',
+        '            puts "MCP_PT_INFO solid=$target_solid local_remesh_new_shells=$local_new"',
+        '            set shell_ids [mcp_shells_on_surfaces $all_surfs]',
         '        }',
-        '        set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids 10.0]',
+        '        set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold]',
+        '        puts "MCP_PT_INFO solid=$target_solid aspect_repair_after before=$before_repair_count after=[llength $bad_aspect_ids] threshold=$surface_aspect_threshold"',
         '        incr repair_at',
         '    }',
         '    set unfixed_aspect_report [llength $bad_aspect_ids]',
@@ -2097,8 +2210,8 @@ def generate_plain_tetra_tcl(
         '        puts "MCP_PT_WARN solid=$target_solid aspect_unfixed=$unfixed_aspect_report continue_to_tetmesh_keep_surface_mesh=1"',
         '    }',
         '    if {!$allow_tetmesh} {',
-        '        puts "MCP_PT_STOP solid=$target_solid shell_count=$shell_count tetmesh_disabled_for_high_risk_geometry before_tetmesh"',
-        '        mcp_delete_elems $shell_ids',
+        '        puts "MCP_PT_STOP solid=$target_solid shell_count=$shell_count tetmesh_disabled_for_high_risk_geometry keep_surface_mesh=1"',
+        '        set kept_surface_shell_count $shell_count',
         '        return',
         '    }',
         '    set before_tetmesh_elems [mcp_all_elems]',
@@ -2110,11 +2223,11 @@ def generate_plain_tetra_tcl(
         '        puts "MCP_PT_WARN solid=$target_solid tetmesh_failed=$tet_err surface_not_closed_or_tetmesh_rejected=1"',
         '        set failed_new_elems [mcp_list_subtract [mcp_all_elems] $before_tetmesh_elems]',
         '        mcp_delete_elems $failed_new_elems',
-        '        mcp_delete_elems $shell_ids',
+        '        set kept_surface_shell_count $shell_count',
         '        continue',
         '    }',
         '    set comp_elems [mcp_tetra_ids_in_component $target_component]',
-        '    if {[llength $comp_elems] == 0} { puts "MCP_PT_WARN solid=$target_solid no_tetra_after_tetmesh_keep_surface_mesh=1"; continue }',
+        '    if {[llength $comp_elems] == 0} { puts "MCP_PT_WARN solid=$target_solid no_tetra_after_tetmesh_keep_surface_mesh=1"; set kept_surface_shell_count $shell_count; continue }',
         '    puts "MCP_PT_INFO solid=$target_solid tetmesh_generation_vol_skew_target=$target_vol_skew"',
         '    eval *createmark elems 1 $comp_elems',
         '    set repair_rc [catch {*elementtestvolumetricskew elems 1 $repair_vol_skew 1 0 ""} repair_err]',
@@ -2178,7 +2291,7 @@ def generate_plain_tetra_tcl(
         '    if {$c==210 || $c==547} {incr t10}',
         '}',
         'if {!$ok && $final_bad_vol_count > 0} { puts "MCP_PT_QUALITY_FAIL solid=$final_bad_solid bad_volume_elements=$final_bad_vol_count kept_surface_shells=1" }',
-        'if {!$ok && $final_bad_vol_count == 0} { puts "MCP_PT_FAIL solid=$target_solid no_accepted_tetra_after_retries" }',
+        'if {!$ok && $final_bad_vol_count == 0} { puts "MCP_PT_FAIL solid=$target_solid no_accepted_tetra_after_retries kept_surface_shells=$kept_surface_shell_count" }',
         'puts "MCP_PT_DONE solid=$target_solid ok=$ok total=$final_count tet4=$t4 tet10=$t10 unfixed_aspect=$unfixed_aspect_report tetmesh_generation_vol_skew_target=$target_vol_skew unrepaired_vol_skew_over_$repair_vol_skew=$unrepaired_vol_skew_report"',
     ]
     if output_hm_path:
@@ -2186,6 +2299,136 @@ def generate_plain_tetra_tcl(
     return {
         "success": True,
         "script": _wrap_generated_tcl("generate_plain_tetra_tcl", "\n".join(lines)),
+    }
+
+
+@mcp.tool()
+def generate_batched_plain_tetra_tcl(
+    solids: list[dict[str, Any]],
+    output_hm_path: str | None = None,
+    pause_seconds_after_each_solid: float = 5.0,
+    checkpoint_every_n_solids: int = 1,
+    checkpoint_hm_path: str | None = None,
+    default_element_size: float = 1.5,
+    default_min_element_size: float = 0.5,
+    max_deviation: float = 0.05,
+    feature_angle: float = 15,
+    growth_rate: float = 1.23,
+    fit_tolerance_ratio: float = 0.01,
+    target_vol_skew: float = 0.70,
+    repair_vol_skew: float = 0.99,
+    delete_existing_component_elements: bool = True,
+) -> dict[str, Any]:
+    """Generate one compact Tcl script for a small batch of plain tetra solids."""
+    if not solids:
+        raise ValueError("solids list cannot be empty.")
+    if len(solids) > 4:
+        raise ValueError("Keep tetra batches small: pass at most 4 solids.")
+    if pause_seconds_after_each_solid < 0:
+        raise ValueError("pause_seconds_after_each_solid cannot be negative.")
+    if checkpoint_every_n_solids < 0:
+        raise ValueError("checkpoint_every_n_solids cannot be negative.")
+    if default_element_size <= 0:
+        raise ValueError("default_element_size must be > 0.")
+    if default_min_element_size <= 0:
+        raise ValueError("default_min_element_size must be > 0.")
+
+    max_timeout = 300
+    body_lines: list[str] = [
+        "# HyperMesh MCP generated batched tetra script",
+        "# MCP_RECOMMENDED_TIMEOUT_SECONDS=__MCP_TIMEOUT_PLACEHOLDER__",
+        f"set mcp_tetra_batch_count {len(solids)}",
+        f"set mcp_tetra_pause_ms {int(float(pause_seconds_after_each_solid) * 1000)}",
+        f"set mcp_tetra_checkpoint_every {int(checkpoint_every_n_solids)}",
+        f'set mcp_tetra_checkpoint_path "{_quote_tcl_path(checkpoint_hm_path) if checkpoint_hm_path else ""}"',
+        "set mcp_tetra_completed 0",
+    ]
+    summaries: list[dict[str, Any]] = []
+    common_end = 0
+
+    for index, item in enumerate(solids):
+        sid = int(item.get("solid_id", 0))
+        comp = str(item.get("component_name", "")).strip()
+        if sid <= 0 or not comp:
+            raise ValueError(f"Invalid tetra solid spec: {item}")
+        elem = float(item.get("element_size", default_element_size))
+        mn = float(item.get("min_element_size", default_min_element_size))
+        max_shell = int(item.get("max_shell_elements_before_tetmesh", TETRA_MAX_SHELL_ELEMENTS))
+        allow_tet = bool(item.get("allow_tetmesh", True))
+        allow_surf = bool(item.get("allow_surface_mesh", True))
+        surf_count = int(item.get("surf_count", 0) or 0)
+        dims = item.get("dims", {}) if isinstance(item.get("dims", {}), dict) else {}
+        diagonal = float((float(dims.get("dx", 0)) ** 2 + float(dims.get("dy", 0)) ** 2 + float(dims.get("dz", 0)) ** 2) ** 0.5)
+        recommended_timeout = _estimate_tetra_timeout_seconds(
+            surf_count=surf_count,
+            min_element_size=mn,
+            diagonal=diagonal,
+            batch_size=len(solids),
+        )
+        max_timeout = max(max_timeout, recommended_timeout)
+        summaries.append({
+            "solid_id": sid,
+            "component_name": comp,
+            "surf_count": surf_count,
+            "recommended_timeout_seconds": recommended_timeout,
+        })
+
+        script_obj = generate_plain_tetra_tcl(
+            solid_id=sid,
+            component_name=comp,
+            element_size=elem,
+            min_element_size=mn,
+            max_deviation=max_deviation,
+            feature_angle=feature_angle,
+            growth_rate=growth_rate,
+            max_shell_elements_before_tetmesh=max_shell,
+            allow_tetmesh=allow_tet,
+            allow_surface_mesh=allow_surf,
+            fit_tolerance_ratio=fit_tolerance_ratio,
+            target_vol_skew=target_vol_skew,
+            repair_vol_skew=repair_vol_skew,
+            delete_existing_component_elements=delete_existing_component_elements,
+        )
+        one_lines = _unwrap_generated_tcl(script_obj["script"]).splitlines()
+        proc_start = next((i for i, line in enumerate(one_lines) if line.startswith("proc mcp_all_elems")), None)
+        exec_start = next((i for i, line in enumerate(one_lines) if line.startswith('*currentcollector components')), None)
+        if proc_start is None or exec_start is None:
+            raise RuntimeError("Could not compact generated tetra script.")
+        if index == 0:
+            body_lines.extend(one_lines)
+            common_end = exec_start
+        else:
+            body_lines.extend(one_lines[:proc_start])
+            body_lines.extend(one_lines[exec_start:])
+        body_lines.extend([
+            "incr mcp_tetra_completed",
+            'puts "MCP_BT_PROGRESS completed=$mcp_tetra_completed total=$mcp_tetra_batch_count"',
+            'if {$mcp_tetra_checkpoint_path ne "" && $mcp_tetra_checkpoint_every > 0 && ($mcp_tetra_completed % $mcp_tetra_checkpoint_every) == 0} {',
+            '    puts "MCP_BT_CHECKPOINT completed=$mcp_tetra_completed path=$mcp_tetra_checkpoint_path"',
+            "    catch {*writefile $mcp_tetra_checkpoint_path 1}",
+            "}",
+            "if {$mcp_tetra_pause_ms > 0} {after $mcp_tetra_pause_ms}",
+        ])
+
+    if output_hm_path:
+        body_lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
+
+    body_lines = [
+        line.replace("__MCP_TIMEOUT_PLACEHOLDER__", str(max_timeout))
+        for line in body_lines
+    ]
+    compact_saved_lines = max(0, common_end * max(0, len(solids) - 1))
+    return {
+        "success": True,
+        "script": _wrap_generated_tcl("generate_batched_plain_tetra_tcl", "\n".join(body_lines)),
+        "solid_count": len(solids),
+        "solid_summaries": summaries,
+        "recommended_timeout_seconds": max_timeout,
+        "compact_saved_lines_estimate": compact_saved_lines,
+        "required_next_step": (
+            "Execute this script with execute_tcl_gui using at least "
+            f"{max_timeout} seconds timeout. Keep high-risk solids in separate batches."
+        ),
     }
 
 
@@ -3092,6 +3335,9 @@ def execute_tcl(
     """Execute a raw HyperMesh Tcl script with hmbatch."""
     if not script.strip():
         raise ValueError("script cannot be empty.")
+    recommended_timeout = _recommended_timeout_from_script(script)
+    if recommended_timeout and timeout_seconds < recommended_timeout:
+        timeout_seconds = recommended_timeout
     if enforce_meshing_rules:
         violation = _meshing_rule_violation(script)
         if violation:
@@ -3124,6 +3370,9 @@ def execute_tcl_gui(
     """Execute Tcl inside an already visible HyperMesh GUI listener session."""
     if not script.strip():
         raise ValueError("script cannot be empty.")
+    recommended_timeout = _recommended_timeout_from_script(script)
+    if recommended_timeout and timeout_seconds < recommended_timeout:
+        timeout_seconds = recommended_timeout
     if enforce_meshing_rules:
         violation = _meshing_rule_violation(script)
         if violation:

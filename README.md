@@ -1,4 +1,4 @@
-# HyperMesh MCP Server
+﻿# HyperMesh MCP Server
 
 Local MCP server for driving Altair HyperMesh with generated Tcl scripts.
 
@@ -21,6 +21,11 @@ was produced by one of the MCP strategy generators. This prevents agents from
 bypassing balanced drag seeding, cut-section validation, and gear-local
 refinement rules.
 
+Generated scripts from trusted MCP generators are allowed deterministically when
+their `MCP_SCRIPT_BEGIN` / `MCP_SCRIPT_END` markers are intact. For example,
+`generate_batched_drag_hex_tcl` is always allowed to contain
+`*meshdragelements2` inside its generated block.
+
 ## Main Tools
 
 - `locate_hypermesh`: find candidate HyperMesh batch and GUI executables.
@@ -31,16 +36,18 @@ refinement rules.
 - `execute_tcl_gui`: run raw Tcl in the visible GUI listener session.
 - `get_hypermesh_meshing_strategy`: return generic meshing rules and workflows.
 - `get_meshing_rules`: return structured generic tetra/drag/spin rules.
-- `classify_hypermesh_part_strategy`: classify a part by geometry features.
 - `generate_geometry_probe_tcl`: generate a temporary coarse surface-mesh probe
   for all or selected solids; probe elements and nodes are deleted before return.
 - `run_geometry_probe_gui`: run that temporary probe in the visible GUI and
   return `MCP_PROBE_SOLID` lines for per-object sizing/strategy planning.
 - `recommend_tetra_sizes_from_probe_lines`: turn probe lines into per-solid
   tetra element-size recommendations, reducing size for thin/small bodies.
+- `generate_phase2_finalize_tcl`: generate the mandatory Phase 2 rename/color
+  Tcl from cached or supplied classification results.
 - `generate_surface_automesh_tcl`: generate simple surface automesh Tcl.
-- `generate_surface_deviation_rtrias_tcl`: generate surface deviation + R-trias Tcl.
-- `generate_gear_aware_tetra_tcl`: generate gear/tooth local-refinement tetra Tcl.
+- `generate_plain_tetra_tcl`: generate the only supported tetra path:
+  surface-deviation R-trias, 2D fit/quality checks, tetra generation, and
+  volume-quality repair.
 - `generate_guarded_drag_hex_tcl`: generate guarded drag-hex Tcl.
 - `generate_guarded_spin_hex_tcl`: generate guarded spin-hex Tcl for a known true section.
 - `get_cutsection_spin_workflow`: explain the generic cut-section spin workflow.
@@ -48,7 +55,7 @@ refinement rules.
 
 ## Generic Strategy Rules
 
-Use `classify_hypermesh_part_strategy` and geometry facts, not component names.
+Use `classify_all_solids_from_probe` and geometry facts, not component names.
 The intended order is:
 
 1. Try the structured hex route that matches the geometry: drag, spin, or
@@ -59,7 +66,7 @@ The intended order is:
    object with tetra.
 4. For bearing/ring-like revolved bodies, do not stop after direct spin fails.
    Use a real cut plane through the rotation axis, mesh the true radial section,
-   and spin that section before tetra fallback.
+   and spin that section before the explicit tetra phase.
 
 ### Tetra
 
@@ -72,9 +79,29 @@ Use `tetra_surface_deviation_rtrias` for:
 Required checks:
 
 - create 2D surface-deviation R-trias mesh first
+- keep the nominal `element_size`; for high-face-count solids, reduce
+  `min_element_size` to capture small faces/features instead of coarsening the
+  part
 - clean/check 2D aspect issues
+- stop and report before `*tetmesh` if the surface shell count exceeds the
+  crash-safety guard
+- use a lower `*tetmesh` shell-count guard for high-face-count solids, so the
+  script reports `MCP_PT_STOP` instead of entering a known crash-prone volume
+  mesh call
+- high-risk tetra solids with many faces are surface-meshed and stopped before
+  `*tetmesh` by default; this prevents the Gear1-style HyperMesh hard crash and
+  leaves an explicit `MCP_PT_STOP ... tetmesh_disabled_for_high_risk_geometry`
+  diagnostic
 - tetramesh per component/object
 - check and locally repair/report volume quality
+
+### Phase 2 Finalization
+
+After `classify_all_solids_from_probe`, Phase 2 is incomplete until components
+are renamed and assigned their Phase 2 colors. Execute the returned
+`phase2_finalize_script`, or call `generate_phase2_finalize_tcl` and execute its
+script. The execution tools block generated meshing scripts after classification
+until `MCP_FINALIZE_OK` has been observed.
 
 ### Drag Hex
 
@@ -89,9 +116,19 @@ Preconditions:
 
 Pass `solid_id` when possible. The generator then validates that the generated
 hex8 mesh bounding box fits the target solid. If the drag result is missing,
-non-hex, or poorly fitted, it deletes invalid elements, retries once with the
-same element size, and then falls back to tetra when `fallback_to_tetra` is
-enabled.
+non-hex, or poorly fitted, it deletes invalid elements and retries. Tetra is no
+longer hidden inside drag; it is handled only by the explicit tetra phase.
+
+For long drag runs, `generate_batched_drag_hex_tcl` inserts a short pause after
+each solid and can checkpoint the `.hm` file every few solids. The all-meshing
+workflow also writes a drag checkpoint and pauses before entering tetra, reducing
+the chance of a HyperMesh crash after many consecutive `*meshdragelements2`
+operations.
+
+The batched drag workflow does not run hidden tetra fallback during drag batches.
+If a drag source is invalid or drag fails, it reports `MCP_DRAG_SKIP_TETRA` and
+leaves tetra work to the explicit tetra phase, where shell-count guards are
+active.
 
 Seed policy: if inner/outer preview counts or edge lengths differ greatly, pass
 `preview_edge_seed_counts` or `source_edge_lengths`. When the largest/smallest
@@ -153,17 +190,17 @@ drag-style source section for a constant-section body, not a spin section.
 The generator validates the spin result. If no valid 3D hex8 elements are
 created, it deletes temporary section/invalid elements and retries once with the
 same requested element size. It does not shrink/refine the hex mesh for the
-retry. If the second attempt still fails, it falls back to tetra when
-`fallback_to_tetra` is enabled.
+retry. If the second attempt still fails, the explicit tetra phase handles the
+solid.
 
 The cut-section generator also considers existing section surfaces on the target
 solid after a split. This helps when a model has already been split or when
 HyperMesh does not create new surface IDs. If mapped quads fail, it can try a
-quad-only section mesh mode with the same element size before falling back.
+quad-only section mesh mode with the same element size before stopping for the explicit tetra phase.
 
 ### Gear-Aware Tetra
 
-Use `classify_hypermesh_part_strategy` from geometry facts only. Do not classify
+Use `classify_all_solids_from_probe` from geometry facts only. Do not classify
 gear regions from component names, file names, or natural-language labels.
 Set one or more of these when geometry inspection shows a gear-like region:
 `has_gear_teeth`, `has_helical_teeth`, `has_twisted_tooth_faces`,
@@ -171,55 +208,14 @@ Set one or more of these when geometry inspection shows a gear-like region:
 `has_outer_tooth_band`, `has_repeated_tooth_flanks`, `tooth_count`, or
 `outer_radius_variation_ratio`.
 
-Negative bearing/ring evidence wins over gear hints. If the part is a smooth
-concentric ring, bearing race, or annular-groove-only body, set
-`is_smooth_concentric_ring`, `has_bearing_race_grooves`, or
-`has_annular_grooves_only`; the classifier must not treat it as a gear.
-
-As a last-resort workflow aid, callers may set `name_hint_indicates_gear=True`
-when the user has intentionally named a part as gear. This hint only asks the MCP
-to inspect/refine possible tooth geometry; it does not replace geometry checks,
-and it is still overridden by bearing/ring evidence.
-
-Then use `generate_gear_aware_tetra_tcl`:
-
-- pass `solid_id` and `component_name`
-- pass `base_element_size` for shaft/hub surfaces
-- pass `gear_surface_ids` for repeated tooth, flank, and root surfaces
-- optionally pass `gear_element_size`; otherwise it uses
-  `base_element_size * gear_size_factor`
-- pass `gear_axis` (`x`, `y`, or `z`) so automatic tooth-band detection uses
-  the correct shaft axis
-
-If `gear_surface_ids` are not supplied, the script auto-detects the outer gear
-band from surface radii using `gear_outer_band_fraction` and meshes that band
-finer. This is meant to catch helical gears where tooth surfaces are
-oblique/twisted rather than simple radial faces. If auto-detection finds nothing,
-it falls back to uniform base-size tetra.
-
-For automatic detection, prefer passing `geometry_confirms_gear_teeth=True` only
-after geometry inspection sees tooth peaks/roots, repeated flanks, or twisted
-helical tooth faces. If only the last-resort name hint is available, pass
-`name_hint_indicates_gear=True`; the script will run cautious outer-band
-detection, but this should not be used for bearing/ring geometry.
-
-The intended behavior is local refinement only: tooth, flank, root, or detected
-outer gear-band faces use `gear_element_size`; shaft, bore, hub, and non-tooth
-faces keep `base_element_size`.
-
-Do not run a raw uniform `*defaultmeshsurf_growth` + `*tetmesh` script for a part
-whose geometry inspection indicates gear features. The execution tools block raw
-tetra/surface-growth meshing by default; use `generate_gear_aware_tetra_tcl` for
-gear-like geometry so the local tooth-band refinement rule is applied.
-
 ## Known Limitations
 
-- Some bearing/ring solids still fall back to tetra even though a human can see
+- Some bearing/ring solids still need the explicit tetra phase even though a human can see
   they should be sweepable by cutting a radial section and spinning it. The
   current `generate_cutsection_spin_hex_tcl` requires HyperMesh to expose a
   usable all-quad true section after `*body_splitmerge_with_plane`; on some
   recessed bearing geometry it only produces invalid/non-quad sections, so the
-  guarded workflow correctly falls back to tetra. Future work: add a more robust
+  guarded workflow correctly stops before tetra. Future work: add a more robust
   profile extraction path that derives ordered radial profile loops from solid
   edges instead of relying only on newly split surfaces.
 

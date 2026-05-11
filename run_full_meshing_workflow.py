@@ -81,6 +81,86 @@ def _build_tetra_batches(classification: dict[str, Any]) -> list[dict[str, Any]]
     return list(classification.get("phase3_tetra_batches") or [])
 
 
+def _tcl_braced(value: Any) -> str:
+    text = str(value if value is not None else "")
+    return "{" + text.replace("\\", "\\\\").replace("}", "\\}") + "}"
+
+
+def _detect_existing_mesh_by_solid(
+    results: dict[str, dict[str, Any]],
+    *,
+    host: str,
+    port: int,
+    timeout_seconds: int,
+) -> dict[str, dict[str, Any]]:
+    solid_ids = [int(key) for key in sorted(results, key=lambda value: int(value))]
+    if not solid_ids:
+        return {}
+    solid_list = " ".join(str(sid) for sid in solid_ids)
+    script = f"""
+puts "MCP_EXISTING_MESH_BEGIN"
+foreach sid {{{solid_list}}} {{
+    set comp_name ""
+    set elem_count 0
+    *createmark components 1 "by solids" $sid
+    set cids [hm_getmark components 1]
+    if {{[llength $cids] > 0}} {{
+        set cid [lindex $cids 0]
+        catch {{set comp_name [hm_getvalue components id=$cid dataname=name]}}
+        catch {{
+            *createmark elements 1 "by comp" "$comp_name"
+            set elem_count [llength [hm_getmark elements 1]]
+        }}
+    }}
+    puts "MCP_EXISTING_MESH solid=$sid elems=$elem_count comp=<$comp_name>"
+}}
+puts "MCP_EXISTING_MESH_END"
+""".lstrip()
+    response = hm.execute_tcl_gui(
+        script,
+        host=host,
+        port=port,
+        timeout_seconds=timeout_seconds,
+        enforce_meshing_rules=False,
+    )
+    text = str(response.get("response", "") or response.get("stdout", ""))
+    detected: dict[str, dict[str, Any]] = {}
+    for line in text.splitlines():
+        match = re.search(r"MCP_EXISTING_MESH solid=(\d+) elems=(\d+) comp=<([^>]*)>", line)
+        if not match:
+            continue
+        sid, elems, comp = match.group(1), int(match.group(2)), match.group(3)
+        detected[sid] = {
+            "solid_id": int(sid),
+            "component_name": comp,
+            "element_count": elems,
+            "has_existing_mesh": elems > 0,
+        }
+    return detected
+
+
+def _filter_tetra_batches_for_active_results(
+    classification: dict[str, Any],
+    active_results: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    active_ids = {int(key) for key in active_results}
+    filtered: list[dict[str, Any]] = []
+    next_batch = 1
+    for batch in _build_tetra_batches(classification):
+        solid_ids = [int(value) for value in batch.get("solid_ids", []) if int(value) in active_ids]
+        if not solid_ids:
+            continue
+        filtered.append(
+            {
+                **batch,
+                "batch": next_batch,
+                "solid_ids": solid_ids,
+            }
+        )
+        next_batch += 1
+    return filtered
+
+
 def _run_async_and_wait(
     *,
     script: str,
@@ -435,6 +515,68 @@ puts "MCP_FINAL_COUNTS elems=[llength $all_elems] shells=$shell_count tet4=$tet4
     return result
 
 
+def _isolate_rolled_back_solids(
+    rolled_back_solids: list[dict[str, Any]],
+    repair_summary: dict[str, Any],
+    *,
+    host: str,
+    port: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    if not rolled_back_solids:
+        return {"success": True, "skipped": True}
+
+    solid_ids = " ".join(str(item["solid_id"]) for item in rolled_back_solids)
+    message_lines = ["退回到 2D 面网格的部件："]
+    repair_by_solid = repair_summary.get("repair_by_solid", {})
+    for item in rolled_back_solids:
+        sid = str(item["solid_id"])
+        info = repair_by_solid.get(sid, {})
+        name = item.get("component_name") or "未命名"
+        message_lines.extend(
+            [
+                "",
+                f"solid {sid}（{name}）",
+                f"2D 最开始不合格单元数量：{int(info.get('initial_bad') or 0)}",
+                f"2D 修复后不合格单元数量：{int(info.get('final_bad') or 0)}",
+                f"3D 最开始不合格单元数量：{int(info.get('vol_skew_initial_bad') or 0)}",
+                f"3D 修复后不合格单元数量：{int(info.get('vol_skew_final_bad') or 0)}",
+            ]
+        )
+    message = "\n".join(message_lines)
+    message_tcl = _tcl_braced(message)
+    script = f"""
+puts "MCP_ROLLBACK_ISOLATE_BEGIN solids={solid_ids}"
+catch {{
+    *createmark components 1 all
+    *hideentitybymark components 1
+}}
+catch {{
+    *createmark components 1 all
+    *maskentitymark components 1 0
+}}
+foreach sid {{{solid_ids}}} {{
+    catch {{
+        *createmark components 1 "by solids" $sid
+        *showentitybymark components 1
+    }}
+    catch {{
+        *createmark components 1 "by solids" $sid
+        *unmaskentitymark components 1 0
+    }}
+}}
+catch {{tk_messageBox -title "网格退回提醒" -icon warning -type ok -message {message_tcl}}}
+puts "MCP_ROLLBACK_ISOLATE_DONE solids={solid_ids}"
+""".lstrip()
+    return hm.execute_tcl_gui(
+        script,
+        host=host,
+        port=port,
+        timeout_seconds=timeout_seconds,
+        enforce_meshing_rules=False,
+    )
+
+
 def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     stamp = args.stamp or _now_stamp()
     RUNS_DIR.mkdir(exist_ok=True)
@@ -483,6 +625,45 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     if not classification.get("success"):
         raise RuntimeError("Classification failed.")
 
+    results = classification["results"]
+    existing_mesh = _detect_existing_mesh_by_solid(
+        results,
+        host=args.host,
+        port=args.port,
+        timeout_seconds=args.phase2_timeout,
+    )
+    skipped_existing_mesh = {
+        sid: item for sid, item in existing_mesh.items()
+        if item.get("has_existing_mesh")
+    }
+    for sid, item in skipped_existing_mesh.items():
+        if sid in results:
+            results[sid]["skip_meshing"] = True
+            results[sid]["skip_reason"] = "已有网格，自动跳过划分"
+            results[sid]["existing_element_count"] = item.get("element_count", 0)
+    active_results = {
+        sid: item for sid, item in results.items()
+        if not item.get("skip_meshing")
+    }
+    workflow["steps"]["existing_mesh_skip"] = {
+        "skipped_count": len(skipped_existing_mesh),
+        "skipped_solids": [
+            {
+                "solid_id": int(sid),
+                "component_name": results.get(sid, {}).get("component_name") or item.get("component_name", ""),
+                "element_count": item.get("element_count", 0),
+            }
+            for sid, item in sorted(skipped_existing_mesh.items(), key=lambda pair: int(pair[0]))
+        ],
+    }
+    workflow["steps"]["classification"]["skipped_existing_mesh_count"] = len(skipped_existing_mesh)
+    if skipped_existing_mesh:
+        skipped_text = ", ".join(
+            f"{sid}({item.get('element_count', 0)} elems)"
+            for sid, item in sorted(skipped_existing_mesh.items(), key=lambda pair: int(pair[0]))
+        )
+        _log(f"  - skipped existing-mesh solids: {skipped_text}")
+
     phase2 = hm.execute_tcl_gui(
         classification["phase2_finalize_script"],
         host=args.host,
@@ -495,10 +676,8 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     if not phase2.get("success"):
         raise RuntimeError("Phase 2 finalization failed. See workflow_phase2_response JSON.")
 
-    results = classification["results"]
-
     _log("[3/6] Run drag-hex solids")
-    drag_solids = _build_drag_solids(results)
+    drag_solids = _build_drag_solids(active_results)
     drag_step: dict[str, Any] = {"count": len(drag_solids), "success": True}
     drag_response: dict[str, Any] | None = None
     if drag_solids:
@@ -542,7 +721,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     workflow["steps"]["drag_hex"] = drag_step
 
     _log("[4/6] Run tetra batches")
-    tetra_batches = _build_tetra_batches(classification)
+    tetra_batches = _filter_tetra_batches_for_active_results(classification, active_results)
     plan_batches: list[dict[str, Any]] = []
     tetra_step: dict[str, Any] = {"batch_count": len(tetra_batches), "completed": [], "failed": []}
     for batch in tetra_batches:
@@ -631,7 +810,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     _log("[6/6] Parse repair summary")
     repair_summary = _parse_repair_summary(plan)
     part_parameters = _build_part_parameter_report(
-        results=results,
+        results=active_results,
         drag_solids=drag_solids,
         drag_response=drag_response,
         plan=plan,
@@ -646,13 +825,13 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "tetra_tet4_total": repair_summary["tetra_tet4_total"],
     }
     rollback_count = int(repair_summary["repair_aggregate"].get("tetra_deleted_keep_surface_shells_count") or 0)
+    rolled_back_solids: list[dict[str, Any]] = []
     if rollback_count:
         solid_name_by_id = {
             str(sid): name
             for batch in plan_batches
             for sid, name in (batch.get("solid_names") or {}).items()
         }
-        rolled_back_solids = []
         for sid, info in sorted(repair_summary["repair_by_solid"].items(), key=lambda pair: int(pair[0])):
             if int(info.get("tetra_deleted_keep_surface_shells") or 0) > 0:
                 rolled_back_solids.append(
@@ -716,6 +895,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "tetra_repair_vol_skew": args.tetra_repair_vol_skew,
         },
         "part_parameters": part_parameters,
+        "skipped_existing_mesh": workflow["steps"].get("existing_mesh_skip", {}),
         "generated_files": {
             "探测结果": str(probe_path),
             "中文报告": str(report_path),
@@ -724,6 +904,18 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     }
     report = hm.write_chinese_meshing_workflow_report(report_data, output_path=str(report_path))
     workflow["report_path"] = report.get("report_path")
+    if rolled_back_solids:
+        isolate_result = _isolate_rolled_back_solids(
+            rolled_back_solids,
+            repair_summary,
+            host=args.host,
+            port=args.port,
+            timeout_seconds=args.phase2_timeout,
+        )
+        workflow["steps"]["rollback_isolation"] = {
+            "success": isolate_result.get("success"),
+            "solids": rolled_back_solids,
+        }
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_summary_{stamp}.json", workflow)
     _write_json_if_enabled(args.write_json, RUNS_DIR / "workflow_latest_summary.json", workflow)
     _log(f"Chinese report: {report.get('report_path')}")

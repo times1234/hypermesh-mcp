@@ -3806,6 +3806,11 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     generated_files = report_data.get("generated_files", {}) if isinstance(report_data.get("generated_files"), dict) else {}
     parameters = report_data.get("parameters", {}) if isinstance(report_data.get("parameters"), dict) else {}
     part_parameters = report_data.get("part_parameters", []) if isinstance(report_data.get("part_parameters"), list) else []
+    skipped_existing_mesh = (
+        report_data.get("skipped_existing_mesh", {})
+        if isinstance(report_data.get("skipped_existing_mesh"), dict)
+        else {}
+    )
 
     lines: list[str] = []
     lines.append("HyperMesh 网格划分报告")
@@ -3828,6 +3833,14 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
         lines.append("分类明细：")
         for name, count in sorted(strategy_counts.items()):
             lines.append(f"  - {name}: {_mcp_fmt_int(count)}")
+    if skipped_existing_mesh:
+        skipped_solids = skipped_existing_mesh.get("skipped_solids", []) or []
+        lines.append(f"已有网格并跳过划分的实体数量：{_mcp_fmt_int(skipped_existing_mesh.get('skipped_count', len(skipped_solids)))}")
+        for item in skipped_solids:
+            lines.append(
+                f"  - solid {item.get('solid_id', '')} "
+                f"{item.get('component_name', '')}: 已有单元数量={_mcp_fmt_int(item.get('element_count', 0))}"
+            )
     lines.append("")
 
     lines.append("二、网格生成结果")

@@ -261,3 +261,38 @@ user explicitly asks.
 ```
 
 Adjust paths for your workstation.
+
+## Run Without an AI Agent
+
+`run_full_meshing_workflow.py` runs the same deterministic workflow that the MCP
+tools expose, but as a normal Python command. It still requires a visible
+HyperMesh session with the GUI listener Tcl sourced.
+
+Typical use:
+
+```powershell
+python run_full_meshing_workflow.py --output outputs/full_mesh.hm
+```
+
+Useful options:
+
+```powershell
+python run_full_meshing_workflow.py `
+  --host 127.0.0.1 `
+  --port 47881 `
+  --output outputs/full_mesh.hm `
+  --tetra-timeout 1800
+```
+
+The runner performs these steps:
+
+1. Probe all solids in the current GUI model.
+2. Classify solids from geometry facts.
+3. Execute Phase 2 rename/color finalization.
+4. Mesh drag-hex solids.
+5. Mesh tetra solids in generated batches through the async GUI path.
+6. Save once at the end and write JSON summaries into `runs/`.
+
+By default the runner records failed batches and continues so a full-model run
+can finish and be diagnosed afterward. Pass `--stop-on-error` to stop at the
+first failure.

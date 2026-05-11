@@ -4,6 +4,7 @@ import os
 import socket
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -851,6 +852,53 @@ def _gui_listener_script(host: str = "127.0.0.1", port: int = DEFAULT_GUI_PORT) 
 set ::mcp_hm_host "{host}"
 set ::mcp_hm_port {int(port)}
 
+proc ::mcp_hm_run_async {{job_id script log_path}} {{
+    set ::mcp_async_status($job_id) "running"
+    set f [open $log_path a]
+    puts $f "MCP_ASYNC_START job=$job_id"
+    close $f
+
+    if {{![info exists ::_mcp_base_puts]}} {{
+        rename puts ::_mcp_base_puts
+    }}
+    set old_capture ""
+    if {{[info exists ::mcp_capture]}} {{set old_capture $::mcp_capture}}
+    set ::mcp_capture ""
+    proc puts args {{
+        set len [llength $args]
+        if {{$len == 1}} {{
+            ::_mcp_base_puts [lindex $args 0]
+            append ::mcp_capture [lindex $args 0] "\\n"
+        }} elseif {{$len == 2 && ([lindex $args 0] eq "stdout")}} {{
+            ::_mcp_base_puts stdout [lindex $args 1]
+            append ::mcp_capture [lindex $args 1] "\\n"
+        }} else {{
+            eval [linsert $args 0 ::_mcp_base_puts]
+        }}
+    }}
+
+    set code [catch {{uplevel #0 $script}} result options]
+
+    rename puts ""
+    rename ::_mcp_base_puts puts
+
+    set f [open $log_path a]
+    if {{$code == 0 || $code == 2}} {{
+        set ::mcp_async_status($job_id) "ok"
+        puts $f "MCP_ASYNC_OK job=$job_id"
+    }} else {{
+        set ::mcp_async_status($job_id) "error"
+        puts $f "MCP_ASYNC_ERROR job=$job_id result=$result"
+        if {{[dict exists $options -errorinfo]}} {{
+            puts $f [dict get $options -errorinfo]
+        }}
+    }}
+    if {{$::mcp_capture ne ""}} {{puts $f $::mcp_capture}}
+    if {{$result ne ""}} {{puts $f $result}}
+    close $f
+    set ::mcp_capture $old_capture
+}}
+
 proc ::mcp_hm_accept {{chan addr client_port}} {{
     fconfigure $chan -blocking 1 -translation binary -encoding utf-8
     set script [read $chan]
@@ -937,6 +985,36 @@ def _run_hypermesh_gui_script(
         "port": int(port),
         "response": response,
     }
+
+
+def _run_hypermesh_gui_script_async(
+    *,
+    script: str,
+    job_id: str,
+    log_path: str,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    timeout_seconds: int = 10,
+) -> dict[str, Any]:
+    """Queue a Tcl script inside the GUI listener and return before it executes."""
+    wrapper = f"""
+set ::mcp_async_job_id "{job_id}"
+set ::mcp_async_log_path "{_quote_tcl_path(log_path)}"
+set ::mcp_async_script {{{script}}}
+set ::mcp_async_status($::mcp_async_job_id) "queued"
+set ::mcp_async_log($::mcp_async_job_id) $::mcp_async_log_path
+set _mcp_f [open $::mcp_async_log_path w]
+puts $_mcp_f "MCP_ASYNC_QUEUED job=$::mcp_async_job_id"
+close $_mcp_f
+after 1 [list ::mcp_hm_run_async $::mcp_async_job_id $::mcp_async_script $::mcp_async_log_path]
+puts "MCP_ASYNC_ACCEPTED job=$::mcp_async_job_id log=$::mcp_async_log_path"
+""".lstrip()
+    return _run_hypermesh_gui_script(
+        script=wrapper,
+        host=host,
+        port=port,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _run_hmbatch(
@@ -2057,7 +2135,7 @@ def generate_plain_tetra_tcl(
         "    if {[llength $new_ids] == 0} {set new_ids [mcp_shells_on_surfaces $target_surfs]}",
         "    return [llength $new_ids]",
         "}",
-        "proc mcp_collapse_bad_triangles {bad_ids} {",
+        "proc mcp_replace_bad_triangle_nodes {bad_ids} {",
         "    set changed 0",
         "    foreach eid $bad_ids {",
         "        if {[catch {hm_getvalue elems id=$eid dataname=nodes} nodes]} {continue}",
@@ -2068,11 +2146,11 @@ def generate_plain_tetra_tcl(
         "        set keep $n0; set move $n1; set dst $p0",
         "        if {$d12 < $d01 && $d12 <= $d20} {set keep $n1; set move $n2; set dst $p1}",
         "        if {$d20 < $d01 && $d20 < $d12} {set keep $n2; set move $n0; set dst $p2}",
-        "        set x [lindex $dst 0]; set y [lindex $dst 1]; set z [lindex $dst 2]",
-        "        set moved 0",
-        "        if {![catch {*nodemodify $move $x $y $z}]} {set moved 1}",
-        "        if {!$moved && ![catch {*nodesmodify $move $x $y $z}]} {set moved 1}",
-        "        if {!$moved} {continue}",
+        "        hm_answernext yes",
+        "        if {[catch {*replacenodes $move $keep 1 0} replace_err]} {",
+        "            puts \"MCP_PT_WARN replace_nodes_failed elem=$eid move=$move keep=$keep error=$replace_err\"",
+        "            continue",
+        "        }",
         "        incr changed",
         "    }",
         "    return $changed",
@@ -2083,6 +2161,15 @@ def generate_plain_tetra_tcl(
         "    foreach eid [hm_getmark elems 1] {",
         "        set c [hm_getvalue elems id=$eid dataname=config]",
         "        if {$c==204 || $c==205 || $c==210 || $c==547} {lappend out $eid}",
+        "    }",
+        "    return $out",
+        "}",
+        "proc mcp_shell_ids_in_component {component_name} {",
+        "    set out {}",
+        "    *createmark elems 1 \"by comp\" \"$component_name\"",
+        "    foreach eid [hm_getmark elems 1] {",
+        "        set c [hm_getvalue elems id=$eid dataname=config]",
+        "        if {$c==103 || $c==104 || $c==106 || $c==108} {lappend out $eid}",
         "    }",
         "    return $out",
         "}",
@@ -2186,7 +2273,7 @@ def generate_plain_tetra_tcl(
         '    set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold]',
         '    puts "MCP_PT_INFO solid=$target_solid aspect_bad_local=[llength $bad_aspect_ids]"',
         '    set repair_at 0',
-        '    while {[llength $bad_aspect_ids] > 0 && $repair_at < 3} {',
+        '    while {[llength $bad_aspect_ids] > 0 && $repair_at < 4} {',
         '        eval *createmark elems 1 $bad_aspect_ids',
         '        set before_repair_count [llength $bad_aspect_ids]',
         '        if {$repair_at == 0} {',
@@ -2199,6 +2286,11 @@ def generate_plain_tetra_tcl(
         '            puts "MCP_PT_INFO solid=$target_solid aspect_repair=local_remesh count=[llength $bad_aspect_ids]"',
         '            set local_new [mcp_local_remesh_bad_shells $bad_aspect_ids $all_surfs $cs $mn_size $max_size $max_dev $feat_angle $effective_growth]',
         '            puts "MCP_PT_INFO solid=$target_solid local_remesh_new_shells=$local_new"',
+        '            set shell_ids [mcp_shells_on_surfaces $all_surfs]',
+        '        } else {',
+        '            puts "MCP_PT_INFO solid=$target_solid aspect_repair=replace_nodes count=[llength $bad_aspect_ids]"',
+        '            set replaced [mcp_replace_bad_triangle_nodes $bad_aspect_ids]',
+        '            puts "MCP_PT_INFO solid=$target_solid replace_nodes_changed=$replaced"',
         '            set shell_ids [mcp_shells_on_surfaces $all_surfs]',
         '        }',
         '        set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold]',
@@ -2215,12 +2307,17 @@ def generate_plain_tetra_tcl(
         '        return',
         '    }',
         '    set before_tetmesh_elems [mcp_all_elems]',
-        '    eval *createmark elems 1 $shell_ids',
-        '    set tet_max [expr {max($cs * 1.90, $mn_size + 0.10)}]',
-        '    *createstringarray 2 "tet: 547 1.2 2 $tet_max 0.8 $mn_size 0" "pars: pre_cln=1 post_cln=1 shell_validation=1 use_optimizer=1 skip_aflr3=1 feature_angle=30 niter=30 fix_comp_bdr=1 fix_top_bdr=1 shell_swap=1 shell_remesh=1 upd_shell=1 shell_dev=0.0,0.0 vol_skew=\'0.70,0.70,0.70,1\'"',
-        '    set tet_rc [catch {*tetmesh elems 1 1 elems 0 -1 1 2} tet_err]',
+        '    *freesimulation',
+        '    *createstringarray 2 "pars: upd_shell fix_comp_bdr vol_skew=\'0.700000,0.800000,0.600000,1.000000,0.860000,0.990000\'" "tet: 67 1.3 -1 0 0.8 -1 -1"',
+        '    *createmark components 2 "$target_component"',
+        '    if {[hm_marklength components 2] == 0} {',
+        '        puts "MCP_PT_WARN solid=$target_solid tetmesh_failed=no_component_mark component=$target_component"',
+        '        set kept_surface_shell_count $shell_count',
+        '        continue',
+        '    }',
+        '    set tet_rc [catch {*tetmesh components 2 1 elements 0 -1 1 2} tet_err]',
         '    if {$tet_rc} {',
-        '        puts "MCP_PT_WARN solid=$target_solid tetmesh_failed=$tet_err surface_not_closed_or_tetmesh_rejected=1"',
+        '        puts "MCP_PT_WARN solid=$target_solid tetmesh_failed=$tet_err manual_component_tetmesh_rejected=1"',
         '        set failed_new_elems [mcp_list_subtract [mcp_all_elems] $before_tetmesh_elems]',
         '        mcp_delete_elems $failed_new_elems',
         '        set kept_surface_shell_count $shell_count',
@@ -2279,6 +2376,11 @@ def generate_plain_tetra_tcl(
         '        break',
         '    }',
         '    mcp_delete_elems $shell_ids',
+        '    set leftover_shells [mcp_shell_ids_in_component $target_component]',
+        '    if {[llength $leftover_shells] > 0} {',
+        '        puts "MCP_PT_INFO solid=$target_solid cleanup_leftover_component_shells=[llength $leftover_shells]"',
+        '        mcp_delete_elems $leftover_shells',
+        '    }',
         '    set ok 1',
         '}',
         '*createmark elems 1 "by comp" "$target_component"',
@@ -2307,7 +2409,7 @@ def generate_batched_plain_tetra_tcl(
     solids: list[dict[str, Any]],
     output_hm_path: str | None = None,
     pause_seconds_after_each_solid: float = 5.0,
-    checkpoint_every_n_solids: int = 1,
+    checkpoint_every_n_solids: int = 0,
     checkpoint_hm_path: str | None = None,
     default_element_size: float = 1.5,
     default_min_element_size: float = 0.5,
@@ -2403,12 +2505,15 @@ def generate_batched_plain_tetra_tcl(
         body_lines.extend([
             "incr mcp_tetra_completed",
             'puts "MCP_BT_PROGRESS completed=$mcp_tetra_completed total=$mcp_tetra_batch_count"',
-            'if {$mcp_tetra_checkpoint_path ne "" && $mcp_tetra_checkpoint_every > 0 && ($mcp_tetra_completed % $mcp_tetra_checkpoint_every) == 0} {',
-            '    puts "MCP_BT_CHECKPOINT completed=$mcp_tetra_completed path=$mcp_tetra_checkpoint_path"',
-            "    catch {*writefile $mcp_tetra_checkpoint_path 1}",
-            "}",
-            "if {$mcp_tetra_pause_ms > 0} {after $mcp_tetra_pause_ms}",
         ])
+        if checkpoint_hm_path and checkpoint_every_n_solids > 0:
+            body_lines.extend([
+                'if {$mcp_tetra_checkpoint_path ne "" && $mcp_tetra_checkpoint_every > 0 && ($mcp_tetra_completed % $mcp_tetra_checkpoint_every) == 0} {',
+                '    puts "MCP_BT_CHECKPOINT completed=$mcp_tetra_completed path=$mcp_tetra_checkpoint_path"',
+                "    catch {*writefile $mcp_tetra_checkpoint_path 1}",
+                "}",
+            ])
+        body_lines.append("if {$mcp_tetra_pause_ms > 0} {after $mcp_tetra_pause_ms}")
 
     if output_hm_path:
         body_lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
@@ -2705,7 +2810,7 @@ def generate_batched_drag_hex_tcl(
     retry_count: int = 2,
     matched_edge_groups: list[list[int]] | None = None,
     pause_seconds_after_each_solid: float = 1.0,
-    checkpoint_every_n_solids: int = 4,
+    checkpoint_every_n_solids: int = 0,
     checkpoint_hm_path: str | None = None,
     output_hm_path: str | None = None,
 ) -> dict[str, Any]:
@@ -2875,14 +2980,17 @@ def generate_batched_drag_hex_tcl(
         "    if {$hs&&[info exists source_shells]&&[llength $source_shells]>0} {eval *createmark elems 1 $source_shells; catch {*deletemark elems 1}}",
         "    catch {*endhistorystate \"MCP guarded drag hex batch s$sid\"}",
         "    incr completed_drag_solids",
-        "    if {$checkpoint_hm_path ne \"\" && $checkpoint_every_n_solids > 0 && ($completed_drag_solids % $checkpoint_every_n_solids) == 0} {",
-        "        puts \"MCP_DRAG_CHECKPOINT after_solids=$completed_drag_solids path=$checkpoint_hm_path\"",
-        "        catch {*writefile \"$checkpoint_hm_path\" 1}",
-        "    }",
         "    catch {update}",
         "    if {$pause_ms_after_each_solid > 0} {after $pause_ms_after_each_solid}",
         "}",
     ])
+    if checkpoint_hm_path and checkpoint_every_n_solids > 0:
+        lines[-3:-3] = [
+            "    if {$checkpoint_hm_path ne \"\" && $checkpoint_every_n_solids > 0 && ($completed_drag_solids % $checkpoint_every_n_solids) == 0} {",
+            "        puts \"MCP_DRAG_CHECKPOINT after_solids=$completed_drag_solids path=$checkpoint_hm_path\"",
+            "        catch {*writefile \"$checkpoint_hm_path\" 1}",
+            "    }",
+        ]
     if output_hm_path:
         lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
 
@@ -3419,6 +3527,145 @@ def execute_tcl_gui(
             ),
             "error": str(exc),
         }
+
+
+@mcp.tool()
+def execute_tcl_gui_async(
+    script: str,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    model_path: str | None = None,
+    output_hm_path: str | None = None,
+    log_path: str | None = None,
+    enqueue_timeout_seconds: int = 10,
+    enforce_meshing_rules: bool = True,
+) -> dict[str, Any]:
+    """Queue Tcl in the visible GUI listener and return immediately.
+
+    Use this for long HyperMesh operations such as tetra generation. The GUI
+    writes command output to log_path; poll with get_gui_async_job_status.
+    """
+    if not script.strip():
+        raise ValueError("script cannot be empty.")
+    if enforce_meshing_rules:
+        violation = _meshing_rule_violation(script)
+        if violation:
+            violation["execution_mode"] = "visible_gui_async"
+            return violation
+        violation = _phase2_finalization_violation(script)
+        if violation:
+            violation["execution_mode"] = "visible_gui_async"
+            return violation
+
+    prefix: list[str] = []
+    model = _normalize_path(model_path)
+    if model:
+        if not model.exists():
+            raise FileNotFoundError(f"Model file was not found: {model}")
+        prefix.append(f'*readfile "{_quote_tcl_path(model)}"')
+
+    suffix: list[str] = []
+    if output_hm_path:
+        suffix.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
+
+    gui_script = "\n".join(prefix + [script] + suffix)
+    if not gui_script.endswith("\n"):
+        gui_script += "\n"
+
+    job_id = f"job_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    log = _normalize_path(log_path) if log_path else (_ensure_runs_dir() / f"{job_id}.log")
+    log.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        result = _run_hypermesh_gui_script_async(
+            script=gui_script,
+            job_id=job_id,
+            log_path=str(log),
+            host=host,
+            port=port,
+            timeout_seconds=enqueue_timeout_seconds,
+        )
+        return {
+            "success": result.get("success", False),
+            "queued": result.get("success", False),
+            "job_id": job_id,
+            "log_path": str(log),
+            "host": host,
+            "port": int(port),
+            "enqueue_response": result.get("response", ""),
+            "next_step": "Call get_gui_async_job_status with this job_id/log_path.",
+        }
+    except OSError as exc:
+        return {
+            "success": False,
+            "queued": False,
+            "job_id": job_id,
+            "log_path": str(log),
+            "host": host,
+            "port": int(port),
+            "message": (
+                "Could not connect to the visible HyperMesh GUI listener. "
+                "Re-source the Tcl file returned by create_gui_listener_tcl."
+            ),
+            "error": str(exc),
+        }
+
+
+@mcp.tool()
+def get_gui_async_job_status(
+    job_id: str,
+    log_path: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_GUI_PORT,
+    tail_chars: int = 8000,
+) -> dict[str, Any]:
+    """Read async GUI job status and log tail."""
+    log = _normalize_path(log_path) if log_path else None
+    status_script = f"""
+set _mcp_job "{job_id}"
+set _mcp_status "unknown"
+set _mcp_log ""
+if {{[info exists ::mcp_async_status($_mcp_job)]}} {{set _mcp_status $::mcp_async_status($_mcp_job)}}
+if {{[info exists ::mcp_async_log($_mcp_job)]}} {{set _mcp_log $::mcp_async_log($_mcp_job)}}
+puts "MCP_ASYNC_STATUS job=$_mcp_job status=$_mcp_status log=$_mcp_log"
+""".lstrip()
+    gui_result = execute_tcl_gui(
+        script=status_script,
+        host=host,
+        port=port,
+        timeout_seconds=10,
+        enforce_meshing_rules=False,
+    )
+
+    log_text = ""
+    resolved_log = log
+    if not resolved_log and gui_result.get("response"):
+        import re
+        match = re.search(r"log=([^\r\n]+)", str(gui_result.get("response", "")))
+        if match:
+            resolved_log = _normalize_path(match.group(1).strip())
+    if resolved_log and resolved_log.exists():
+        text = resolved_log.read_text(encoding="utf-8", errors="replace")
+        log_text = text[-max(1, int(tail_chars)):]
+
+    status = "unknown"
+    if "MCP_ASYNC_OK" in log_text:
+        status = "ok"
+    elif "MCP_ASYNC_ERROR" in log_text:
+        status = "error"
+    elif "MCP_ASYNC_START" in log_text:
+        status = "running"
+    elif "MCP_ASYNC_QUEUED" in log_text:
+        status = "queued"
+
+    return {
+        "success": gui_result.get("success", False) or bool(log_text),
+        "job_id": job_id,
+        "status": status,
+        "log_path": str(resolved_log) if resolved_log else None,
+        "gui_status_response": gui_result.get("response", ""),
+        "log_tail": log_text,
+    }
 
 
 @mcp.tool()

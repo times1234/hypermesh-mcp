@@ -40,6 +40,10 @@ namespace eval ::hm_mcp_launcher {
     variable current_log ""
     variable current_stamp ""
     variable last_log_size 0
+    variable log_poll_ms 4000
+    variable pid_check_ms 8000
+    variable last_pid_check_ms 0
+    variable log_max_lines 1200
     variable status_text "状态：未运行"
 }
 
@@ -57,7 +61,6 @@ proc ::hm_mcp_launcher::last_nonempty_line {text} {
 proc ::hm_mcp_launcher::set_status {text} {
     variable status_text
     set status_text "状态：$text"
-    catch {update idletasks}
 }
 
 proc ::hm_mcp_launcher::panel_window {} {
@@ -73,24 +76,32 @@ proc ::hm_mcp_launcher::keep_panel_visible {} {
     catch {
         wm attributes $w -topmost 1
     }
-    if {$current_pid ne ""} {
-        after 1200 ::hm_mcp_launcher::keep_panel_visible
-    }
 }
 
 proc ::hm_mcp_launcher::append_log {text} {
+    variable log_max_lines
     set widget .hm_mcp_meshing_launcher.root.logbox.text
     if {[winfo exists $widget]} {
         $widget configure -state normal
         $widget insert end $text
+        set line_count [expr {int([$widget index end])}]
+        if {$line_count > $log_max_lines} {
+            set delete_to [expr {$line_count - $log_max_lines}]
+            $widget delete 1.0 "$delete_to.0"
+        }
         $widget see end
         $widget configure -state disabled
     }
 }
 
 proc ::hm_mcp_launcher::replace_log {text} {
+    variable log_max_lines
     set widget .hm_mcp_meshing_launcher.root.logbox.text
     if {[winfo exists $widget]} {
+        set lines [split $text "\n"]
+        if {[llength $lines] > $log_max_lines} {
+            set text [join [lrange $lines end-[expr {$log_max_lines - 1}] end] "\n"]
+        }
         $widget configure -state normal
         $widget delete 1.0 end
         $widget insert end $text
@@ -263,36 +274,71 @@ proc ::hm_mcp_launcher::pid_running {pid} {
     return 0
 }
 
+proc ::hm_mcp_launcher::read_new_log_data {} {
+    variable current_log
+    variable last_log_size
+
+    if {$current_log eq "" || ![file exists $current_log]} {
+        return ""
+    }
+
+    set size [file size $current_log]
+    if {$size < $last_log_size} {
+        set last_log_size 0
+        replace_log ""
+    }
+    if {$size <= $last_log_size} {
+        return ""
+    }
+
+    if {[catch {
+        set fh [open $current_log r]
+        fconfigure $fh -encoding utf-8
+        seek $fh $last_log_size start
+        set text [read $fh [expr {$size - $last_log_size}]]
+        close $fh
+    } read_err]} {
+        catch {close $fh}
+        return ""
+    }
+    set last_log_size $size
+    return $text
+}
+
 proc ::hm_mcp_launcher::poll_log {} {
     variable current_pid
     variable current_log
-    variable last_log_size
-    keep_panel_visible
+    variable log_poll_ms
+    variable pid_check_ms
+    variable last_pid_check_ms
 
-    if {$current_log ne "" && [file exists $current_log]} {
-        set size [file size $current_log]
-        if {$size != $last_log_size} {
-            set fh [open $current_log r]
-            fconfigure $fh -encoding utf-8
-            set text [read $fh]
-            close $fh
-            replace_log $text
-            set last_log_size $size
-        }
+    set new_text [read_new_log_data]
+    if {$new_text ne ""} {
+        append_log $new_text
     }
 
     if {$current_pid ne ""} {
-        if {[pid_running $current_pid]} {
-            after 1500 ::hm_mcp_launcher::poll_log
+        set now_ms [clock milliseconds]
+        if {$last_pid_check_ms == 0 || ($now_ms - $last_pid_check_ms) >= $pid_check_ms} {
+            set last_pid_check_ms $now_ms
+            set still_running [pid_running $current_pid]
+        } else {
+            set still_running 1
+        }
+        if {$still_running} {
+            after $log_poll_ms ::hm_mcp_launcher::poll_log
         } else {
             set current_pid ""
             keep_panel_visible
             if {$current_log ne "" && [file exists $current_log]} {
+                set final_text [read_new_log_data]
+                if {$final_text ne ""} {
+                    append_log $final_text
+                }
                 set fh [open $current_log r]
                 fconfigure $fh -encoding utf-8
                 set text [read $fh]
                 close $fh
-                replace_log $text
                 if {[string first "Success: True" $text] >= 0} {
                     set_status "完成划分"
                 } else {
@@ -312,6 +358,7 @@ proc ::hm_mcp_launcher::start_workflow {} {
     variable current_log
     variable current_stamp
     variable last_log_size
+    variable last_pid_check_ms
 
     if {$current_pid ne ""} {
         set_status "当前已有流程在运行"
@@ -323,6 +370,7 @@ proc ::hm_mcp_launcher::start_workflow {} {
     set current_stamp [make_stamp]
     set current_log [file normalize [file join $project_dir runs "panel_workflow_$current_stamp.log"]]
     set last_log_size 0
+    set last_pid_check_ms 0
     replace_log ""
     normalize_mesh_parameters
 

@@ -108,10 +108,10 @@ codex_mcp_config.example.json
 `runs` 和 `outputs` 不是源码，复制时可以带上，也可以不带。没有这两个文件夹时，
 脚本运行过程中会重新生成。
 
-### 在无网络电脑上安装依赖
+### 在无网络电脑上安装依赖（无网络电脑的python版本与有网络电脑一样则该步骤可跳过）
 
 先确认无网络电脑上已经安装 Python。建议目标电脑使用和当前电脑一致的
-Python 大版本和架构。
+Python 大版本和架构，当前文件夹内已经包含了依赖。
 
 当前 `wheels` 中包含 Windows 64 位、CPython 3.12 对应的依赖包，因此目标电脑
 推荐安装：
@@ -199,6 +199,8 @@ source "D:/tools/hypermesh-mcp-server/launch_meshing_workflow_panel.tcl"
 ```
 
 运行后会出现“HyperMesh 自动网格划分面板”。
+
+也可以通过运行脚本的方式运行
 
 ### 1.3 面板里可以修改什么
 

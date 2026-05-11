@@ -32,6 +32,13 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _write_json_if_enabled(enabled: bool, path: Path, payload: Any) -> str | None:
+    if not enabled:
+        return None
+    _write_json(path, payload)
+    return str(path)
+
+
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
 
@@ -216,6 +223,112 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _parse_drag_actual_parameters(response_text: str) -> dict[str, dict[str, Any]]:
+    actual: dict[str, dict[str, Any]] = {}
+    for line in str(response_text or "").splitlines():
+        match = re.search(
+            r"MCP_DRAG_SIZE solid=(\d+) .*?requested=([0-9.eE+-]+) .*?chosen=([0-9.eE+-]+) limits=([0-9.eE+-]+)\.\.([0-9.eE+-]+)",
+            line,
+        )
+        if match:
+            actual[match.group(1)] = {
+                "requested_element_size": float(match.group(2)),
+                "actual_chosen_element_size": float(match.group(3)),
+                "element_size_min": float(match.group(4)),
+                "element_size_max": float(match.group(5)),
+            }
+    return actual
+
+
+def _parse_tetra_actual_parameters(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    actual: dict[str, dict[str, Any]] = {}
+    for batch in plan.get("tetra_batches", []):
+        text = _read_text(Path(batch["log_path"]))
+        for line in text.splitlines():
+            match = re.search(
+                r"MCP_PT_START solid=(\d+) surf_count=(\d+) elem_size=([0-9.eE+-]+) "
+                r"min_size=([0-9.eE+-]+) max_dev=([0-9.eE+-]+) fit_tol_ratio=([0-9.eE+-]+) "
+                r"target_vol_skew=([0-9.eE+-]+)",
+                line,
+            )
+            if match:
+                actual[match.group(1)] = {
+                    "surf_count": int(match.group(2)),
+                    "actual_element_size": float(match.group(3)),
+                    "actual_min_element_size": float(match.group(4)),
+                    "max_deviation": float(match.group(5)),
+                    "fit_tolerance_ratio": float(match.group(6)),
+                    "target_vol_skew": float(match.group(7)),
+                }
+    return actual
+
+
+def _build_part_parameter_report(
+    *,
+    results: dict[str, dict[str, Any]],
+    drag_solids: list[dict[str, Any]],
+    drag_response: dict[str, Any] | None,
+    plan: dict[str, Any],
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    drag_actual = _parse_drag_actual_parameters(str((drag_response or {}).get("response", "")))
+    tetra_actual = _parse_tetra_actual_parameters(plan)
+    drag_ids = {int(item["solid_id"]) for item in drag_solids}
+
+    for solid in drag_solids:
+        sid = int(solid["solid_id"])
+        actual = drag_actual.get(str(sid), {})
+        items.append(
+            {
+                "solid_id": sid,
+                "component_name": solid.get("component_name", ""),
+                "strategy": "drag_hex",
+                "axis": solid.get("axis", ""),
+                "drag_distance": solid.get("drag_distance"),
+                "requested_element_size": actual.get("requested_element_size", args.drag_element_size),
+                "actual_element_size": actual.get("actual_chosen_element_size"),
+                "element_size_min": actual.get("element_size_min", args.drag_element_size_min),
+                "element_size_max": actual.get("element_size_max", args.drag_element_size_max),
+                "fit_tolerance_ratio": args.drag_fit_tolerance_ratio,
+                "retry_count": args.drag_retry_count,
+            }
+        )
+
+    for key, info in sorted(results.items(), key=lambda pair: int(pair[0])):
+        sid = int(key)
+        if sid in drag_ids:
+            continue
+        strategy = str(info.get("strategy", ""))
+        if "tetra" not in strategy:
+            continue
+        actual = tetra_actual.get(str(sid), {})
+        items.append(
+            {
+                "solid_id": sid,
+                "component_name": info.get("component_name", ""),
+                "strategy": strategy,
+                "surf_count": actual.get("surf_count", info.get("surf_count")),
+                "requested_element_size": info.get("element_size", args.tetra_element_size),
+                "actual_element_size": actual.get("actual_element_size"),
+                "element_size_min": args.tetra_element_size_min,
+                "element_size_max": args.tetra_element_size_max,
+                "requested_min_element_size": info.get("min_element_size", args.tetra_min_element_size),
+                "actual_min_element_size": actual.get("actual_min_element_size"),
+                "min_element_size_min": args.tetra_min_element_size_min,
+                "min_element_size_max": args.tetra_min_element_size_max,
+                "max_deviation": actual.get("max_deviation", args.tetra_max_deviation),
+                "feature_angle": args.tetra_feature_angle,
+                "growth_rate": args.tetra_growth_rate,
+                "fit_tolerance_ratio": actual.get("fit_tolerance_ratio", args.tetra_fit_tolerance_ratio),
+                "target_vol_skew": actual.get("target_vol_skew", args.tetra_target_vol_skew),
+                "repair_vol_skew": args.tetra_repair_vol_skew,
+            }
+        )
+
+    return items
+
+
 def _final_save_and_count(*, output_path: Path, host: str, port: int, timeout_seconds: int) -> dict[str, Any]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_tcl_path = str(output_path).replace("\\", "/")
@@ -258,7 +371,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     OUTPUTS_DIR.mkdir(exist_ok=True)
 
     output_path = Path(args.output).resolve() if args.output else OUTPUTS_DIR / f"full_mesh_{stamp}.hm"
-    summary_path = RUNS_DIR / f"workflow_summary_{stamp}.json"
+    report_path = RUNS_DIR / f"workflow_report_{stamp}.txt"
 
     workflow: dict[str, Any] = {
         "stamp": stamp,
@@ -284,20 +397,20 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "line_count": len(str(probe.get("probe_lines") or "").splitlines()),
         "debug_result": probe.get("_debug_result"),
     }
-    _write_json(RUNS_DIR / f"workflow_probe_response_{stamp}.json", probe)
+    _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_probe_response_{stamp}.json", probe)
     if not probe.get("success"):
-        raise RuntimeError("Geometry probe failed. See workflow_probe_response JSON.")
+        raise RuntimeError("Geometry probe failed. See probe output and console log.")
 
     _log("[2/6] Classify solids and execute Phase 2 finalization")
     classification = hm.classify_all_solids_from_probe(probe.get("probe_lines", ""))
-    _write_json(RUNS_DIR / f"workflow_classification_{stamp}.json", classification)
+    _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_classification_{stamp}.json", classification)
     workflow["steps"]["classification"] = {
         "success": classification.get("success"),
         "total_solids": classification.get("total_solids"),
         "strategy_counts": classification.get("strategy_counts"),
     }
     if not classification.get("success"):
-        raise RuntimeError("Classification failed. See workflow_classification JSON.")
+        raise RuntimeError("Classification failed.")
 
     phase2 = hm.execute_tcl_gui(
         classification["phase2_finalize_script"],
@@ -306,7 +419,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         timeout_seconds=args.phase2_timeout,
         enforce_meshing_rules=False,
     )
-    _write_json(RUNS_DIR / f"workflow_phase2_response_{stamp}.json", phase2)
+    _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_phase2_response_{stamp}.json", phase2)
     workflow["steps"]["phase2_finalize"] = phase2
     if not phase2.get("success"):
         raise RuntimeError("Phase 2 finalization failed. See workflow_phase2_response JSON.")
@@ -316,10 +429,13 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     _log("[3/6] Run drag-hex solids")
     drag_solids = _build_drag_solids(results)
     drag_step: dict[str, Any] = {"count": len(drag_solids), "success": True}
+    drag_response: dict[str, Any] | None = None
     if drag_solids:
         drag = hm.generate_batched_drag_hex_tcl(
             solids=drag_solids,
             element_size=args.drag_element_size,
+            element_size_min=args.drag_element_size_min,
+            element_size_max=args.drag_element_size_max,
             fit_tolerance_ratio=args.drag_fit_tolerance_ratio,
             retry_count=args.drag_retry_count,
             pause_seconds_after_each_solid=args.drag_pause_seconds,
@@ -336,12 +452,16 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             enforce_meshing_rules=False,
         )
         drag_response["elapsed_seconds"] = round(time.time() - start, 2)
-        _write_json(RUNS_DIR / f"workflow_drag_hex_response_{stamp}.json", drag_response)
+        drag_response_path = _write_json_if_enabled(
+            args.write_json,
+            RUNS_DIR / f"workflow_drag_hex_response_{stamp}.json",
+            drag_response,
+        )
         drag_step.update(
             {
                 "success": drag_response.get("success"),
                 "script_path": str(drag_script_path),
-                "response_path": str(RUNS_DIR / f"workflow_drag_hex_response_{stamp}.json"),
+                "response_path": drag_response_path,
             }
         )
         if not drag_response.get("success"):
@@ -362,6 +482,18 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             solids=solids,
             pause_seconds_after_each_solid=args.tetra_pause_seconds,
             checkpoint_every_n_solids=0,
+            default_element_size=args.tetra_element_size,
+            default_min_element_size=args.tetra_min_element_size,
+            max_deviation=args.tetra_max_deviation,
+            feature_angle=args.tetra_feature_angle,
+            growth_rate=args.tetra_growth_rate,
+            fit_tolerance_ratio=args.tetra_fit_tolerance_ratio,
+            target_vol_skew=args.tetra_target_vol_skew,
+            repair_vol_skew=args.tetra_repair_vol_skew,
+            element_size_min=args.tetra_element_size_min,
+            element_size_max=args.tetra_element_size_max,
+            min_element_size_min=args.tetra_min_element_size_min,
+            min_element_size_max=args.tetra_min_element_size_max,
             delete_existing_component_elements=True,
         )
         script_path = RUNS_DIR / f"workflow_tetra_batch_{batch_index:02d}_{stamp}.tcl"
@@ -386,7 +518,11 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             run_timeout_seconds=args.tetra_timeout,
             enforce_meshing_rules=False,
         )
-        _write_json(RUNS_DIR / f"workflow_tetra_batch_{batch_index:02d}_response_{stamp}.json", result)
+        tetra_response_path = _write_json_if_enabled(
+            args.write_json,
+            RUNS_DIR / f"workflow_tetra_batch_{batch_index:02d}_response_{stamp}.json",
+            result,
+        )
         if result["status"] == "ok":
             tetra_step["completed"].append(batch_index)
         else:
@@ -394,7 +530,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 "batch": batch_index,
                 "solid_ids": solid_ids,
                 "status": result["status"],
-                "response_path": str(RUNS_DIR / f"workflow_tetra_batch_{batch_index:02d}_response_{stamp}.json"),
+                "response_path": tetra_response_path,
             }
             tetra_step["failed"].append(failure)
             workflow["errors"].append({"step": "tetra", **failure})
@@ -408,7 +544,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "tetra_batches": plan_batches,
         "final_save_path": str(output_path),
     }
-    _write_json(RUNS_DIR / f"workflow_execution_plan_{stamp}.json", plan)
+    _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_execution_plan_{stamp}.json", plan)
 
     _log("[5/6] Final save and element count")
     final_save = _final_save_and_count(
@@ -417,14 +553,20 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         port=args.port,
         timeout_seconds=args.save_timeout,
     )
-    _write_json(RUNS_DIR / f"workflow_final_save_response_{stamp}.json", final_save)
+    _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_final_save_response_{stamp}.json", final_save)
     workflow["steps"]["final_save"] = final_save
 
     _log("[6/6] Parse repair summary")
     repair_summary = _parse_repair_summary(plan)
-    _write_json(RUNS_DIR / f"workflow_repair_summary_{stamp}.json", repair_summary)
+    part_parameters = _build_part_parameter_report(
+        results=results,
+        drag_solids=drag_solids,
+        drag_response=drag_response,
+        plan=plan,
+        args=args,
+    )
+    _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_repair_summary_{stamp}.json", repair_summary)
     workflow["steps"]["repair_summary"] = {
-        "path": str(RUNS_DIR / f"workflow_repair_summary_{stamp}.json"),
         **repair_summary["repair_aggregate"],
         "tetra_done_count": repair_summary["tetra_done_count"],
         "tetra_tet4_total": repair_summary["tetra_tet4_total"],
@@ -435,9 +577,47 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         and bool(final_save.get("output_exists"))
         and not workflow["errors"]
     )
-    _write_json(summary_path, workflow)
-    _write_json(RUNS_DIR / "workflow_latest_summary.json", workflow)
-    _log(f"Workflow summary: {summary_path}")
+    report_data = {
+        "stamp": stamp,
+        "success": workflow["success"],
+        "output_hm_path": str(output_path),
+        "classification": workflow["steps"]["classification"],
+        "drag_count": len(drag_solids),
+        "tetra": tetra_step,
+        "final_save": final_save,
+        "repair_summary": repair_summary,
+        "errors": workflow["errors"],
+        "parameters": {
+            "drag_element_size": args.drag_element_size,
+            "drag_element_size_min": args.drag_element_size_min,
+            "drag_element_size_max": args.drag_element_size_max,
+            "drag_fit_tolerance_ratio": args.drag_fit_tolerance_ratio,
+            "drag_retry_count": args.drag_retry_count,
+            "tetra_element_size": args.tetra_element_size,
+            "tetra_element_size_min": args.tetra_element_size_min,
+            "tetra_element_size_max": args.tetra_element_size_max,
+            "tetra_min_element_size": args.tetra_min_element_size,
+            "tetra_min_element_size_min": args.tetra_min_element_size_min,
+            "tetra_min_element_size_max": args.tetra_min_element_size_max,
+            "tetra_max_deviation": args.tetra_max_deviation,
+            "tetra_feature_angle": args.tetra_feature_angle,
+            "tetra_growth_rate": args.tetra_growth_rate,
+            "tetra_fit_tolerance_ratio": args.tetra_fit_tolerance_ratio,
+            "tetra_target_vol_skew": args.tetra_target_vol_skew,
+            "tetra_repair_vol_skew": args.tetra_repair_vol_skew,
+        },
+        "part_parameters": part_parameters,
+        "generated_files": {
+            "探测结果": str(probe_path),
+            "中文报告": str(report_path),
+            "最终模型": str(output_path),
+        },
+    }
+    report = hm.write_chinese_meshing_workflow_report(report_data, output_path=str(report_path))
+    workflow["report_path"] = report.get("report_path")
+    _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_summary_{stamp}.json", workflow)
+    _write_json_if_enabled(args.write_json, RUNS_DIR / "workflow_latest_summary.json", workflow)
+    _log(f"中文报告: {report.get('report_path')}")
     return workflow
 
 
@@ -458,10 +638,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-timeout", type=int, default=300)
     parser.add_argument("--async-enqueue-timeout", type=int, default=10)
     parser.add_argument("--drag-element-size", type=float, default=1.0)
+    parser.add_argument("--drag-element-size-min", type=float, default=0.5)
+    parser.add_argument("--drag-element-size-max", type=float, default=1.5)
     parser.add_argument("--drag-fit-tolerance-ratio", type=float, default=0.05)
     parser.add_argument("--drag-retry-count", type=int, default=2)
     parser.add_argument("--drag-pause-seconds", type=float, default=0.5)
+    parser.add_argument("--tetra-element-size", type=float, default=1.5)
+    parser.add_argument("--tetra-element-size-min", type=float, default=1.5)
+    parser.add_argument("--tetra-element-size-max", type=float, default=2.0)
+    parser.add_argument("--tetra-min-element-size", type=float, default=0.5)
+    parser.add_argument("--tetra-min-element-size-min", type=float, default=0.20)
+    parser.add_argument("--tetra-min-element-size-max", type=float, default=0.50)
+    parser.add_argument("--tetra-max-deviation", type=float, default=0.05)
+    parser.add_argument("--tetra-feature-angle", type=float, default=15.0)
+    parser.add_argument("--tetra-growth-rate", type=float, default=1.23)
+    parser.add_argument("--tetra-fit-tolerance-ratio", type=float, default=0.01)
+    parser.add_argument("--tetra-target-vol-skew", type=float, default=0.70)
+    parser.add_argument("--tetra-repair-vol-skew", type=float, default=0.99)
     parser.add_argument("--tetra-pause-seconds", type=float, default=1.0)
+    parser.add_argument("--write-json", action="store_true", help="Write detailed JSON debug files into runs/.")
     return parser
 
 
@@ -480,6 +675,7 @@ def main(argv: list[str] | None = None) -> int:
             if line.startswith("MCP_FINAL_COUNTS"):
                 _log(line)
     _log(f"Output: {summary.get('output_hm_path')}")
+    _log(f"Report: {summary.get('report_path')}")
     return 0 if summary.get("success") else 2
 
 

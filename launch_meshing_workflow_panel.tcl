@@ -1,0 +1,526 @@
+# -*- coding: utf-8 -*-
+#
+# HyperMesh offline meshing workflow launcher.
+#
+# Usage in HyperMesh Tcl command window:
+#   source "E:/mcp/hypermesh-mcp-server/launch_meshing_workflow_panel.tcl"
+
+namespace eval ::hm_mcp_launcher {
+    variable project_dir [file normalize [file dirname [info script]]]
+    variable python_exe "python"
+    variable host "127.0.0.1"
+    variable port 47881
+    variable output_path [file normalize [file join $project_dir outputs full_mesh_from_panel.hm]]
+    variable auto_listener 1
+    variable continue_on_error 1
+
+    variable drag_element_size_min 0.5
+    variable drag_element_size_max 1.5
+    variable drag_fit_tolerance_ratio 0.05
+    variable drag_retry_count 2
+
+    variable tetra_element_size_min 1.5
+    variable tetra_element_size_max 2.0
+    variable tetra_min_element_size_min 0.20
+    variable tetra_min_element_size_max 0.50
+    variable tetra_max_deviation 0.05
+    variable tetra_feature_angle 15.0
+    variable tetra_growth_rate 1.23
+    variable tetra_fit_tolerance_ratio 0.01
+    variable tetra_target_vol_skew 0.70
+    variable tetra_repair_vol_skew 0.99
+
+    variable probe_timeout 180
+    variable phase2_timeout 120
+    variable drag_timeout 900
+    variable tetra_timeout 1800
+    variable save_timeout 300
+
+    variable current_pid ""
+    variable current_log ""
+    variable current_stamp ""
+    variable last_log_size 0
+    variable status_text "状态：未运行"
+}
+
+proc ::hm_mcp_launcher::last_nonempty_line {text} {
+    set result ""
+    foreach line [split $text "\n"] {
+        set trimmed [string trim $line]
+        if {$trimmed ne ""} {
+            set result $trimmed
+        }
+    }
+    return $result
+}
+
+proc ::hm_mcp_launcher::set_status {text} {
+    variable status_text
+    set status_text "状态：$text"
+    catch {update idletasks}
+}
+
+proc ::hm_mcp_launcher::panel_window {} {
+    return .hm_mcp_meshing_launcher
+}
+
+proc ::hm_mcp_launcher::keep_panel_visible {} {
+    variable current_pid
+    set w [panel_window]
+    if {![winfo exists $w]} {
+        return
+    }
+    catch {
+        wm attributes $w -topmost 1
+    }
+    if {$current_pid ne ""} {
+        after 1200 ::hm_mcp_launcher::keep_panel_visible
+    }
+}
+
+proc ::hm_mcp_launcher::append_log {text} {
+    set widget .hm_mcp_meshing_launcher.root.logbox.text
+    if {[winfo exists $widget]} {
+        $widget configure -state normal
+        $widget insert end $text
+        $widget see end
+        $widget configure -state disabled
+    }
+}
+
+proc ::hm_mcp_launcher::replace_log {text} {
+    set widget .hm_mcp_meshing_launcher.root.logbox.text
+    if {[winfo exists $widget]} {
+        $widget configure -state normal
+        $widget delete 1.0 end
+        $widget insert end $text
+        $widget see end
+        $widget configure -state disabled
+    }
+}
+
+proc ::hm_mcp_launcher::ensure_directories {} {
+    variable project_dir
+    file mkdir [file join $project_dir runs]
+    file mkdir [file join $project_dir outputs]
+}
+
+proc ::hm_mcp_launcher::ensure_listener {} {
+    variable project_dir
+    variable python_exe
+    variable port
+
+    set old_pwd [pwd]
+    set pycode [format {import hypermesh_mcp_server as hm; print(hm.create_gui_listener_tcl(port=%d)['script_path'])} $port]
+    if {[catch {
+        cd $project_dir
+        set output [exec $python_exe -c $pycode]
+    } err opts]} {
+        catch {cd $old_pwd}
+        return -options $opts $err
+    }
+    catch {cd $old_pwd}
+
+    set listener_path [last_nonempty_line $output]
+    if {$listener_path eq ""} {
+        error "Python 没有返回 listener Tcl 路径。"
+    }
+    set listener_path [file normalize $listener_path]
+    if {![file exists $listener_path]} {
+        error "listener Tcl 不存在：$listener_path"
+    }
+    source $listener_path
+    return $listener_path
+}
+
+proc ::hm_mcp_launcher::make_stamp {} {
+    return [clock format [clock seconds] -format "%Y%m%d_%H%M%S"]
+}
+
+proc ::hm_mcp_launcher::clamp_number {value low high fallback} {
+    if {[catch {set number [expr {double($value)}]}]} {
+        return $fallback
+    }
+    if {$number < $low} {
+        return $low
+    }
+    if {$number > $high} {
+        return $high
+    }
+    return $number
+}
+
+proc ::hm_mcp_launcher::normalize_pair {min_var max_var fallback_min fallback_max} {
+    upvar 1 $min_var min_value
+    upvar 1 $max_var max_value
+    set min_value [clamp_number $min_value 0.000001 1000000 $fallback_min]
+    set max_value [clamp_number $max_value 0.000001 1000000 $fallback_max]
+    if {$min_value > $max_value} {
+        set tmp $min_value
+        set min_value $max_value
+        set max_value $tmp
+    }
+}
+
+proc ::hm_mcp_launcher::normalize_mesh_parameters {} {
+    variable drag_element_size_min
+    variable drag_element_size_max
+    variable tetra_element_size_min
+    variable tetra_element_size_max
+    variable tetra_min_element_size_min
+    variable tetra_min_element_size_max
+
+    normalize_pair drag_element_size_min drag_element_size_max 0.5 1.5
+    normalize_pair tetra_element_size_min tetra_element_size_max 1.5 2.0
+    normalize_pair tetra_min_element_size_min tetra_min_element_size_max 0.20 0.50
+    append_log "尺寸限制：drag=$drag_element_size_min..$drag_element_size_max, tetra目标=$tetra_element_size_min..$tetra_element_size_max, tetra最小=$tetra_min_element_size_min..$tetra_min_element_size_max\n"
+}
+
+proc ::hm_mcp_launcher::build_command {} {
+    variable project_dir
+    variable python_exe
+    variable host
+    variable port
+    variable output_path
+    variable continue_on_error
+    variable drag_element_size_min
+    variable drag_element_size_max
+    variable drag_fit_tolerance_ratio
+    variable drag_retry_count
+    variable tetra_element_size_min
+    variable tetra_element_size_max
+    variable tetra_min_element_size_min
+    variable tetra_min_element_size_max
+    variable tetra_max_deviation
+    variable tetra_feature_angle
+    variable tetra_growth_rate
+    variable tetra_fit_tolerance_ratio
+    variable tetra_target_vol_skew
+    variable tetra_repair_vol_skew
+    variable probe_timeout
+    variable phase2_timeout
+    variable drag_timeout
+    variable tetra_timeout
+    variable save_timeout
+    variable current_stamp
+
+    set runner [file join $project_dir run_full_meshing_workflow.py]
+    set cmd [list $python_exe $runner \
+        --host $host \
+        --port $port \
+        --output $output_path \
+        --stamp $current_stamp \
+        --probe-timeout $probe_timeout \
+        --phase2-timeout $phase2_timeout \
+        --drag-timeout $drag_timeout \
+        --tetra-timeout $tetra_timeout \
+        --save-timeout $save_timeout \
+        --drag-element-size $drag_element_size_max \
+        --drag-element-size-min $drag_element_size_min \
+        --drag-element-size-max $drag_element_size_max \
+        --drag-fit-tolerance-ratio $drag_fit_tolerance_ratio \
+        --drag-retry-count $drag_retry_count \
+        --tetra-element-size $tetra_element_size_max \
+        --tetra-element-size-min $tetra_element_size_min \
+        --tetra-element-size-max $tetra_element_size_max \
+        --tetra-min-element-size $tetra_min_element_size_max \
+        --tetra-min-element-size-min $tetra_min_element_size_min \
+        --tetra-min-element-size-max $tetra_min_element_size_max \
+        --tetra-max-deviation $tetra_max_deviation \
+        --tetra-feature-angle $tetra_feature_angle \
+        --tetra-growth-rate $tetra_growth_rate \
+        --tetra-fit-tolerance-ratio $tetra_fit_tolerance_ratio \
+        --tetra-target-vol-skew $tetra_target_vol_skew \
+        --tetra-repair-vol-skew $tetra_repair_vol_skew]
+    if {$continue_on_error} {
+        lappend cmd --continue-on-error
+    } else {
+        lappend cmd --stop-on-error
+    }
+    return $cmd
+}
+
+proc ::hm_mcp_launcher::pid_running {pid} {
+    if {$pid eq ""} {
+        return 0
+    }
+    if {[catch {set out [exec tasklist /FI "PID eq $pid" /NH]}]} {
+        return 0
+    }
+    if {[string first $pid $out] >= 0} {
+        return 1
+    }
+    return 0
+}
+
+proc ::hm_mcp_launcher::poll_log {} {
+    variable current_pid
+    variable current_log
+    variable last_log_size
+    keep_panel_visible
+
+    if {$current_log ne "" && [file exists $current_log]} {
+        set size [file size $current_log]
+        if {$size != $last_log_size} {
+            set fh [open $current_log r]
+            fconfigure $fh -encoding utf-8
+            set text [read $fh]
+            close $fh
+            replace_log $text
+            set last_log_size $size
+        }
+    }
+
+    if {$current_pid ne ""} {
+        if {[pid_running $current_pid]} {
+            after 1500 ::hm_mcp_launcher::poll_log
+        } else {
+            set current_pid ""
+            keep_panel_visible
+            if {$current_log ne "" && [file exists $current_log]} {
+                set fh [open $current_log r]
+                fconfigure $fh -encoding utf-8
+                set text [read $fh]
+                close $fh
+                replace_log $text
+                if {[string first "Success: True" $text] >= 0} {
+                    set_status "完成划分"
+                } else {
+                    set_status "流程结束，但存在失败或警告，请查看日志"
+                }
+            } else {
+                set_status "流程结束，但未找到日志"
+            }
+        }
+    }
+}
+
+proc ::hm_mcp_launcher::start_workflow {} {
+    variable project_dir
+    variable auto_listener
+    variable current_pid
+    variable current_log
+    variable current_stamp
+    variable last_log_size
+
+    if {$current_pid ne ""} {
+        set_status "当前已有流程在运行"
+        append_log "\n当前已有后台流程在运行，先停止或等待它结束。\n"
+        return
+    }
+
+    ensure_directories
+    set current_stamp [make_stamp]
+    set current_log [file normalize [file join $project_dir runs "panel_workflow_$current_stamp.log"]]
+    set last_log_size 0
+    replace_log ""
+    normalize_mesh_parameters
+
+    if {$auto_listener} {
+        set_status "正在建立 HyperMesh 连接"
+        append_log "正在建立 HyperMesh 连接...\n"
+        if {[catch {set listener_path [ensure_listener]} err]} {
+            set_status "连接失败"
+            append_log "自动建立连接失败：$err\n\n可以手动 source listener Tcl 后，再取消自动连接重新点击开始划分。\n"
+            return
+        }
+        append_log "连接成功：$listener_path\n"
+    }
+
+    set cmd [build_command]
+    set old_pwd [pwd]
+    set_status "正在启动后台划分流程"
+    append_log "正在启动后台划分流程...\n日志文件：$current_log\n\n"
+    if {[catch {
+        cd $project_dir
+        set pids [exec {*}$cmd > $current_log 2>@1 &]
+    } err opts]} {
+        catch {cd $old_pwd}
+        set_status "启动失败"
+        append_log "无法启动离线划分流程：$err\n"
+        return
+    }
+    catch {cd $old_pwd}
+
+    set current_pid [lindex $pids 0]
+    set_status "运行中，PID=$current_pid"
+    append_log "已开始运行，PID=$current_pid。\n\n"
+    keep_panel_visible
+    after 1000 ::hm_mcp_launcher::poll_log
+}
+
+proc ::hm_mcp_launcher::stop_workflow {} {
+    variable current_pid
+    variable current_log
+
+    if {$current_pid eq ""} {
+        set_status "当前没有运行中的流程"
+        append_log "\n当前没有由这个面板启动的后台 Python 流程。\n"
+        keep_panel_visible
+        return
+    }
+
+    set pid $current_pid
+    set current_pid ""
+    set_status "正在停止 PID=$pid"
+    append_log "\n正在停止后台 Python 流程 PID=$pid ...\n"
+    if {[catch {exec taskkill /PID $pid /T /F} err]} {
+        set_status "停止命令已执行，请检查日志"
+        append_log "停止命令返回：$err\n如果 HyperMesh 已经开始执行一段很长的 Tcl，可能会完成当前命令后才停下来。\n日志：$current_log\n"
+    } else {
+        set_status "已停止后台 Python 流程"
+        append_log "后台 Python 流程已停止。如果 HyperMesh 正在执行已提交的 Tcl，可能还会短暂继续当前命令。\n"
+    }
+    keep_panel_visible
+}
+
+proc ::hm_mcp_launcher::browse_output_path {} {
+    variable output_path
+    set picked [tk_getSaveFile -title "选择最终 HM 文件" -defaultextension ".hm" -filetypes {{"HyperMesh files" {.hm}} {"All files" {*}}}]
+    if {$picked ne ""} {
+        set output_path [file normalize $picked]
+    }
+}
+
+proc ::hm_mcp_launcher::add_row {parent row label variable hint} {
+    ttk::label $parent.l$row -text $label -anchor w -style HMLabel.TLabel
+    ttk::entry $parent.e$row -textvariable $variable -width 16 -style HM.TEntry
+    grid $parent.l$row -row $row -column 0 -sticky ew -padx {0 10} -pady 4
+    grid $parent.e$row -row $row -column 1 -sticky ew -pady 4
+    if {$hint ne ""} {
+        ttk::label $parent.h$row -text $hint -anchor w -style HMHunt.TLabel
+        grid $parent.h$row -row $row -column 2 -sticky ew -padx {8 0} -pady 4
+    }
+}
+
+proc ::hm_mcp_launcher::build_ui {} {
+    if {[catch {package require Tk} err]} {
+        puts "无法加载 Tk，不能显示弹窗：$err"
+        return
+    }
+
+    catch {package require Ttk}
+    catch {
+        set current_theme [ttk::style theme use]
+        if {![regexp {^hw} $current_theme]} {
+            foreach candidate [ttk::style theme names] {
+                if {[regexp {^hw} $candidate]} {
+                    ttk::style theme use $candidate
+                    break
+                }
+            }
+        }
+    }
+    set w .hm_mcp_meshing_launcher
+    if {[winfo exists $w]} {
+        destroy $w
+    }
+
+    toplevel $w
+    wm title $w "HyperMesh 自动网格划分"
+    wm minsize $w 980 680
+    wm geometry $w 1080x1260+80+40
+    catch {wm attributes $w -topmost 1}
+
+    catch {
+        ttk::style configure HMRoot.TFrame -background "#edf1f7"
+        ttk::style configure HMCard.TFrame -background "#ffffff" -relief flat
+        ttk::style configure HMTitle.TLabel -background "#edf1f7" -foreground "#172033" -font {"Microsoft YaHei UI" 16 bold}
+        ttk::style configure HMSub.TLabel -background "#edf1f7" -foreground "#5c6675" -font {"Microsoft YaHei UI" 10}
+        ttk::style configure HMSection.TLabelframe -background "#ffffff" -foreground "#172033" -font {"Microsoft YaHei UI" 13 bold}
+        ttk::style configure HMSection.TLabelframe.Label -background "#ffffff" -foreground "#172033" -font {"Microsoft YaHei UI" 13 bold}
+        ttk::style configure HMLabel.TLabel -background "#ffffff" -foreground "#1e293b" -font {"Microsoft YaHei UI" 12}
+        ttk::style configure HMHunt.TLabel -background "#ffffff" -foreground "#697386" -font {"Microsoft YaHei UI" 9}
+        ttk::style configure HMStatus.TLabel -background "#dbeafe" -foreground "#17324d" -font {"Microsoft YaHei UI" 12 bold} -padding {10 6}
+        ttk::style configure HM.TEntry -font {"Microsoft YaHei UI" 12} -padding 5
+        ttk::style configure HM.TButton -font {"Microsoft YaHei UI" 12 bold} -padding {14 7}
+        ttk::style configure HMStop.TButton -font {"Microsoft YaHei UI" 12 bold} -padding {14 7}
+        ttk::style configure HMCheck.TCheckbutton -background "#ffffff" -foreground "#1e293b" -font {"Microsoft YaHei UI" 11}
+    }
+
+    ttk::frame $w.root -padding 16 -style HMRoot.TFrame
+    grid $w.root -row 0 -column 0 -sticky nsew
+    grid rowconfigure $w 0 -weight 1
+    grid columnconfigure $w 0 -weight 1
+    grid columnconfigure $w.root 0 -weight 1
+    grid rowconfigure $w.root 5 -weight 1
+
+    ttk::label $w.root.title -text "HyperMesh 自动网格划分面板" -style HMTitle.TLabel
+    ttk::label $w.root.sub -text "导入模型后，点击开始划分即可执行完整流程；运行日志会实时显示在下方。" -style HMSub.TLabel
+    grid $w.root.title -row 0 -column 0 -sticky ew
+    grid $w.root.sub -row 1 -column 0 -sticky ew -pady {2 8}
+
+    ttk::label $w.root.status -textvariable ::hm_mcp_launcher::status_text -style HMStatus.TLabel -anchor w
+    grid $w.root.status -row 2 -column 0 -sticky ew -pady {0 10}
+
+    ttk::frame $w.root.main -style HMRoot.TFrame
+    grid $w.root.main -row 3 -column 0 -sticky ew -pady {0 10}
+    grid columnconfigure $w.root.main 0 -weight 1
+    grid columnconfigure $w.root.main 1 -weight 1
+
+    ttk::labelframe $w.root.main.left -text "项目和尺寸限制" -padding 12 -style HMSection.TLabelframe
+    grid $w.root.main.left -row 0 -column 0 -sticky nsew -padx {0 8}
+    grid columnconfigure $w.root.main.left 1 -weight 1
+    add_row $w.root.main.left 0 "项目目录" ::hm_mcp_launcher::project_dir ""
+    ttk::label $w.root.main.left.l1 -text "输出 HM 文件" -anchor w -style HMLabel.TLabel
+    ttk::entry $w.root.main.left.e1 -textvariable ::hm_mcp_launcher::output_path -style HM.TEntry
+    ttk::button $w.root.main.left.b1 -text "浏览" -style HM.TButton -command ::hm_mcp_launcher::browse_output_path
+    grid $w.root.main.left.l1 -row 1 -column 0 -sticky ew -padx {0 12} -pady 5
+    grid $w.root.main.left.e1 -row 1 -column 1 -sticky ew -pady 5
+    grid $w.root.main.left.b1 -row 1 -column 2 -sticky ew -padx {8 0} -pady 5
+    ttk::separator $w.root.main.left.sep1 -orient horizontal
+    grid $w.root.main.left.sep1 -row 2 -column 0 -columnspan 3 -sticky ew -pady 7
+    add_row $w.root.main.left 3 "drag 尺寸下限" ::hm_mcp_launcher::drag_element_size_min "自动尺寸下限"
+    add_row $w.root.main.left 4 "drag 尺寸上限" ::hm_mcp_launcher::drag_element_size_max "自动尺寸上限"
+    add_row $w.root.main.left 5 "tetra目标下限" ::hm_mcp_launcher::tetra_element_size_min "目标尺寸下限"
+    add_row $w.root.main.left 6 "tetra目标上限" ::hm_mcp_launcher::tetra_element_size_max "目标尺寸上限"
+    add_row $w.root.main.left 7 "tetra最小下限" ::hm_mcp_launcher::tetra_min_element_size_min "最小尺寸下限"
+    add_row $w.root.main.left 8 "tetra最小上限" ::hm_mcp_launcher::tetra_min_element_size_max "最小尺寸上限"
+    ttk::checkbutton $w.root.main.left.auto -text "开始前自动建立/刷新 HyperMesh 连接" -variable ::hm_mcp_launcher::auto_listener -style HMCheck.TCheckbutton
+    grid $w.root.main.left.auto -row 9 -column 0 -columnspan 3 -sticky w -pady {7 0}
+
+    ttk::labelframe $w.root.main.right -text "质量和修复参数" -padding 12 -style HMSection.TLabelframe
+    grid $w.root.main.right -row 0 -column 1 -sticky nsew -padx {8 0}
+    grid columnconfigure $w.root.main.right 1 -weight 1
+    add_row $w.root.main.right 0 "drag 贴合比例" ::hm_mcp_launcher::drag_fit_tolerance_ratio "越小越严格"
+    add_row $w.root.main.right 1 "drag 重试次数" ::hm_mcp_launcher::drag_retry_count ""
+    add_row $w.root.main.right 2 "tetra 最大偏差" ::hm_mcp_launcher::tetra_max_deviation ""
+    add_row $w.root.main.right 3 "tetra 特征角" ::hm_mcp_launcher::tetra_feature_angle ""
+    add_row $w.root.main.right 4 "tetra 增长率" ::hm_mcp_launcher::tetra_growth_rate ""
+    add_row $w.root.main.right 5 "tetra 贴合比例" ::hm_mcp_launcher::tetra_fit_tolerance_ratio ""
+    add_row $w.root.main.right 6 "目标 vol skew" ::hm_mcp_launcher::tetra_target_vol_skew ""
+    add_row $w.root.main.right 7 "修复 vol skew" ::hm_mcp_launcher::tetra_repair_vol_skew ""
+
+    ttk::labelframe $w.root.logbox -text "运行日志" -padding 12 -style HMSection.TLabelframe
+    grid $w.root.logbox -row 5 -column 0 -sticky nsew -pady {0 10}
+    grid rowconfigure $w.root.logbox 0 -weight 1
+    grid columnconfigure $w.root.logbox 0 -weight 1
+    text $w.root.logbox.text -height 8 -wrap none -state disabled -font {"Consolas" 11} -background "#101828" -foreground "#e5e7eb" -insertbackground "#e5e7eb" -relief flat -borderwidth 0
+    ttk::scrollbar $w.root.logbox.ys -orient vertical -command "$w.root.logbox.text yview"
+    ttk::scrollbar $w.root.logbox.xs -orient horizontal -command "$w.root.logbox.text xview"
+    $w.root.logbox.text configure -yscrollcommand "$w.root.logbox.ys set" -xscrollcommand "$w.root.logbox.xs set"
+    grid $w.root.logbox.text -row 0 -column 0 -sticky nsew
+    grid $w.root.logbox.ys -row 0 -column 1 -sticky ns
+    grid $w.root.logbox.xs -row 1 -column 0 -sticky ew
+
+    ttk::frame $w.root.actions -style HMRoot.TFrame
+    grid $w.root.actions -row 6 -column 0 -sticky ew
+    ttk::button $w.root.actions.connect -text "仅建立连接" -style HM.TButton -command {
+        ::hm_mcp_launcher::set_status "正在建立 HyperMesh 连接"
+        ::hm_mcp_launcher::append_log "正在建立 HyperMesh 连接...\n"
+        if {[catch {set p [::hm_mcp_launcher::ensure_listener]} e]} {
+            ::hm_mcp_launcher::set_status "连接失败"
+            ::hm_mcp_launcher::append_log "连接失败：$e\n"
+        } else {
+            ::hm_mcp_launcher::set_status "连接成功"
+            ::hm_mcp_launcher::append_log "连接成功：$p\n"
+        }
+    }
+    ttk::button $w.root.actions.run -text "开始划分" -style HM.TButton -command ::hm_mcp_launcher::start_workflow
+    ttk::button $w.root.actions.stop -text "停止当前流程" -style HMStop.TButton -command ::hm_mcp_launcher::stop_workflow
+    grid $w.root.actions.connect -row 0 -column 0 -padx {0 12}
+    grid $w.root.actions.run -row 0 -column 1 -padx 12
+    grid $w.root.actions.stop -row 0 -column 2 -padx 12
+}
+
+::hm_mcp_launcher::build_ui

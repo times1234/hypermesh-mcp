@@ -1960,6 +1960,10 @@ def generate_plain_tetra_tcl(
     fit_tolerance_ratio: float = 0.01,
     target_vol_skew: float = 0.70,
     repair_vol_skew: float = 0.99,
+    element_size_min: float = 1.5,
+    element_size_max: float = 2.0,
+    min_element_size_min: float = 0.20,
+    min_element_size_max: float = 0.50,
     delete_existing_component_elements: bool = True,
 ) -> dict[str, Any]:
     """Generate Tcl for surface-deviation R-trias plus tetra meshing on one solid."""
@@ -1977,11 +1981,15 @@ def generate_plain_tetra_tcl(
         raise ValueError("target_vol_skew must be in (0, 1].")
     if not (0 < repair_vol_skew <= 1):
         raise ValueError("repair_vol_skew must be in (0, 1].")
+    if element_size_min <= 0 or element_size_max <= 0 or element_size_min > element_size_max:
+        raise ValueError("element_size_min/max must be positive and min <= max.")
+    if min_element_size_min <= 0 or min_element_size_max <= 0 or min_element_size_min > min_element_size_max:
+        raise ValueError("min_element_size_min/max must be positive and min <= max.")
     if not component_name.strip():
         raise ValueError("component_name cannot be empty.")
     comp = _tcl_escape_name(component_name)
-    clamped_min = max(0.20, min(float(min_element_size), 0.50))
-    clamped_size = max(1.5, min(float(element_size), 2.0))
+    clamped_min = max(float(min_element_size_min), min(float(min_element_size), float(min_element_size_max)))
+    clamped_size = max(float(element_size_min), min(float(element_size), float(element_size_max)))
     lines = [
         "# HyperMesh MCP generated tetra script: surface deviation R-trias -> smooth-pyramid tetra",
         f"# MCP_RECOMMENDED_TIMEOUT_SECONDS={_estimate_tetra_timeout_seconds(surf_count=max_shell_elements_before_tetmesh, min_element_size=clamped_min, batch_size=1)}",
@@ -1989,6 +1997,10 @@ def generate_plain_tetra_tcl(
         f"set target_component {{{comp}}}",
         f"set requested_elem_size {clamped_size}",
         f"set requested_min_size {clamped_min}",
+        f"set elem_size_min {float(element_size_min)}",
+        f"set elem_size_max {float(element_size_max)}",
+        f"set min_size_min {float(min_element_size_min)}",
+        f"set min_size_max {float(min_element_size_max)}",
         f"set max_dev {float(max_deviation)}",
         f"set feat_angle {float(feature_angle)}",
         f"set growth {float(growth_rate)}",
@@ -2193,19 +2205,20 @@ def generate_plain_tetra_tcl(
         'set max_dim [lindex $dims_sorted 2]',
         'set solid_bb [list [lindex $sbb 0] [lindex $sbb 1] [lindex $sbb 2] [lindex $sbb 3] [lindex $sbb 4] [lindex $sbb 5]]',
         'set solid_diag [expr {sqrt(pow($sdx,2)+pow($sdy,2)+pow($sdz,2))}]',
-        'set auto_elem_size [expr {min(2.0, max(1.5, $mid_dim/4.0))}]',
-        'set elem_size [expr {min(2.0, max(1.5, min($requested_elem_size, $auto_elem_size)))}]',
-        'set complexity_min [expr {0.50 - min(0.30, max(0.0, ($surf_count - 20) / 100.0 * 0.30))}]',
-        'set dim_min [expr {max(0.20, min(0.50, $min_dim/8.0))}]',
-        'set base_min_size [expr {max(0.20, min(0.50, min($requested_min_size, min($complexity_min, $dim_min))))}]',
+        'set auto_elem_size [expr {min($elem_size_max, max($elem_size_min, $mid_dim/4.0))}]',
+        'set elem_size [expr {min($elem_size_max, max($elem_size_min, min($requested_elem_size, $auto_elem_size)))}]',
+        'set min_size_span [expr {$min_size_max - $min_size_min}]',
+        'set complexity_min [expr {$min_size_max - min($min_size_span, max(0.0, ($surf_count - 20) / 100.0 * $min_size_span))}]',
+        'set dim_min [expr {max($min_size_min, min($min_size_max, $min_dim/8.0))}]',
+        'set base_min_size [expr {max($min_size_min, min($min_size_max, min($requested_min_size, min($complexity_min, $dim_min))))}]',
         'puts "MCP_PT_START solid=$target_solid surf_count=$surf_count elem_size=$elem_size min_size=$base_min_size max_dev=$max_dev fit_tol_ratio=$fit_tol_ratio target_vol_skew=$target_vol_skew"',
         'if {!$allow_surface_mesh} {',
         '    puts "MCP_PT_STOP solid=$target_solid surface_mesh_disabled_for_high_risk_geometry before_surface_mesh"',
         '    return',
         '}',
         'for {set at 0} {$at < $retry_count && !$ok} {incr at} {',
-        '    set cs [expr {max(1.5, $elem_size * pow(0.90, $at))}]',
-        '    set mn_size [expr {max(0.20, $base_min_size * pow(0.80, $at))}]',
+        '    set cs [expr {max($elem_size_min, $elem_size * pow(0.90, $at))}]',
+        '    set mn_size [expr {max($min_size_min, $base_min_size * pow(0.80, $at))}]',
         '    set effective_growth [expr {min($growth, $surface_growth_limit)}]',
         '    set max_size [expr {max($cs * 1.35, $mn_size + 0.05)}]',
         '    set max_size [expr {min($max_size, max($mn_size + 0.05, $mn_size * $surface_max_to_min_ratio))}]',
@@ -2419,6 +2432,10 @@ def generate_batched_plain_tetra_tcl(
     fit_tolerance_ratio: float = 0.01,
     target_vol_skew: float = 0.70,
     repair_vol_skew: float = 0.99,
+    element_size_min: float = 1.5,
+    element_size_max: float = 2.0,
+    min_element_size_min: float = 0.20,
+    min_element_size_max: float = 0.50,
     delete_existing_component_elements: bool = True,
 ) -> dict[str, Any]:
     """Generate one compact Tcl script for a small batch of plain tetra solids."""
@@ -2489,6 +2506,10 @@ def generate_batched_plain_tetra_tcl(
             fit_tolerance_ratio=fit_tolerance_ratio,
             target_vol_skew=target_vol_skew,
             repair_vol_skew=repair_vol_skew,
+            element_size_min=element_size_min,
+            element_size_max=element_size_max,
+            min_element_size_min=min_element_size_min,
+            min_element_size_max=min_element_size_max,
             delete_existing_component_elements=delete_existing_component_elements,
         )
         one_lines = _unwrap_generated_tcl(script_obj["script"]).splitlines()
@@ -2808,6 +2829,8 @@ def generate_batched_drag_hex_tcl(
     element_size: float = 1.5,
     fit_tolerance_ratio: float = 0.05,
     retry_count: int = 2,
+    element_size_min: float = 0.5,
+    element_size_max: float = 1.5,
     matched_edge_groups: list[list[int]] | None = None,
     pause_seconds_after_each_solid: float = 1.0,
     checkpoint_every_n_solids: int = 0,
@@ -2824,6 +2847,8 @@ def generate_batched_drag_hex_tcl(
         raise ValueError("solids list cannot be empty.")
     if element_size <= 0:
         raise ValueError("element_size must be > 0.")
+    if element_size_min <= 0 or element_size_max <= 0 or element_size_min > element_size_max:
+        raise ValueError("element_size_min/max must be positive and min <= max.")
     if retry_count < 0:
         raise ValueError("retry_count cannot be negative.")
     if pause_seconds_after_each_solid < 0:
@@ -2851,6 +2876,8 @@ def generate_batched_drag_hex_tcl(
     lines: list[str] = [
         "# HyperMesh MCP generated batched drag-hex script",
         f"set elem_size {float(element_size)}",
+        f"set elem_size_min {float(element_size_min)}",
+        f"set elem_size_max {float(element_size_max)}",
         f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
         f"set retry_count {int(retry_count)}",
         f"set pause_ms_after_each_solid {int(float(pause_seconds_after_each_solid) * 1000)}",
@@ -2894,8 +2921,8 @@ def generate_batched_drag_hex_tcl(
         "    set source_major [lindex $size_dims 2]",
         "    set thickness_size [expr {$dd/4.0}]",
         "    set source_size [expr {min($source_minor/3.0, $source_major/8.0)}]",
-        "    set cs [expr {max(0.5, min(1.5, min($elem_size, $thickness_size, $source_size)))}]",
-        '    puts "MCP_DRAG_SIZE solid=$sid thickness=$dd source_minor=$source_minor source_major=$source_major requested=$elem_size thickness_size=$thickness_size source_size=$source_size chosen=$cs limits=0.5..1.5"',
+        "    set cs [expr {max($elem_size_min, min($elem_size_max, min($elem_size, $thickness_size, $source_size)))}]",
+        '    puts "MCP_DRAG_SIZE solid=$sid thickness=$dd source_minor=$source_minor source_major=$source_major requested=$elem_size thickness_size=$thickness_size source_size=$source_size chosen=$cs limits=$elem_size_min..$elem_size_max"',
         "    set hs 0; set at 0",
         "    while {$at<=$retry_count&&!$hs} {",
         "        *createmark surfaces 1 $surf",
@@ -2922,7 +2949,7 @@ def generate_batched_drag_hex_tcl(
         '        if {[llength $source_shells] == 0} {',
         '            puts "MCP_DRAG_FAIL stage=source_shell_empty solid=$sid surf=$surf"',
         '            set cs [expr {$cs*0.8}]',
-        '            if {$cs<0.5} {set cs 0.5}',
+        '            if {$cs<$elem_size_min} {set cs $elem_size_min}',
         '            incr at',
         '            continue',
         '        }',
@@ -2951,7 +2978,7 @@ def generate_batched_drag_hex_tcl(
         "            eval *createmark elems 1 $source_shells",
         "            catch {*deletemark elems 1}",
         "            set cs [expr {$cs*0.8}]",
-        "            if {$cs<0.5} {set cs 0.5}",
+        "            if {$cs<$elem_size_min} {set cs $elem_size_min}",
         "            incr at",
         "            continue",
         "        }",
@@ -2963,7 +2990,7 @@ def generate_batched_drag_hex_tcl(
         "            eval *createmark elems 1 $source_shells",
         "            catch {*deletemark elems 1}",
         "            set cs [expr {$cs*0.8}]",
-        "            if {$cs<0.5} {set cs 0.5}",
+        "            if {$cs<$elem_size_min} {set cs $elem_size_min}",
         "            incr at",
         "            continue",
         "        }",
@@ -2971,7 +2998,7 @@ def generate_batched_drag_hex_tcl(
         "        if {[llength $ne]>0&&$hc==[llength $ne]&&$fo} { set hs 1 } else {",
         "            if {[llength $ne]>0} {eval *createmark elems 1 $ne; catch {*deletemark elems 1}}",
         "            eval *createmark elems 1 $source_shells; catch {*deletemark elems 1}",
-        "            set cs [expr {$cs*0.8}]; if {$cs<0.5} {set cs 0.5}",
+        "            set cs [expr {$cs*0.8}]; if {$cs<$elem_size_min} {set cs $elem_size_min}",
         "        }; incr at",
         "    }",
         "    if {!$hs} {",
@@ -3682,6 +3709,268 @@ def make_recorded_tcl_wrapper(
     for old, new in (replacements or {}).items():
         script = script.replace(str(old), str(new))
     return {"success": True, "script": script}
+
+
+def _mcp_fmt_int(value: Any) -> str:
+    try:
+        return f"{int(value):,}"
+    except Exception:
+        return str(value)
+
+
+def _mcp_parse_final_counts(response: str | None) -> dict[str, int]:
+    import re
+
+    text = str(response or "")
+    matches = re.findall(
+        r"MCP_FINAL_COUNTS\s+elems=(\d+)\s+shells=(\d+)\s+tet4=(\d+)\s+hex8=(\d+)\s+other=(\d+)",
+        text,
+    )
+    if not matches:
+        return {"elems": 0, "shells": 0, "tet4": 0, "hex8": 0, "other": 0}
+    elems, shells, tet4, hex8, other = matches[-1]
+    return {
+        "elems": int(elems),
+        "shells": int(shells),
+        "tet4": int(tet4),
+        "hex8": int(hex8),
+        "other": int(other),
+    }
+
+
+def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
+    """Build a Chinese plain-text meshing report shared by MCP and offline runner."""
+    stamp = report_data.get("stamp", "")
+    output_hm_path = report_data.get("output_hm_path", "")
+    success = bool(report_data.get("success", False))
+    classification = report_data.get("classification", {}) if isinstance(report_data.get("classification"), dict) else {}
+    strategy_counts = classification.get("strategy_counts", {}) if isinstance(classification.get("strategy_counts"), dict) else {}
+    total_solids = int(classification.get("total_solids") or report_data.get("total_solids") or 0)
+    drag_count = int(strategy_counts.get("drag_hex") or report_data.get("drag_count") or 0)
+    tetra_count = (
+        int(strategy_counts.get("tetra_plain") or 0)
+        + int(strategy_counts.get("tetra_surface_deviation_rtrias") or 0)
+        + int(strategy_counts.get("surface_tetra") or 0)
+    )
+    if tetra_count == 0:
+        tetra_count = int(report_data.get("tetra_count") or 0)
+    other_count = max(0, total_solids - drag_count - tetra_count)
+
+    tetra_step = report_data.get("tetra", {}) if isinstance(report_data.get("tetra"), dict) else {}
+    final_save = report_data.get("final_save", {}) if isinstance(report_data.get("final_save"), dict) else {}
+    final_counts = report_data.get("final_counts")
+    if not isinstance(final_counts, dict):
+        final_counts = _mcp_parse_final_counts(str(final_save.get("response", "")))
+
+    repair_summary = report_data.get("repair_summary", {}) if isinstance(report_data.get("repair_summary"), dict) else {}
+    repair_agg = repair_summary.get("repair_aggregate", {}) if isinstance(repair_summary.get("repair_aggregate"), dict) else {}
+    repair_by_solid = repair_summary.get("repair_by_solid", {}) if isinstance(repair_summary.get("repair_by_solid"), dict) else {}
+    errors = report_data.get("errors", []) if isinstance(report_data.get("errors", []), list) else []
+    generated_files = report_data.get("generated_files", {}) if isinstance(report_data.get("generated_files"), dict) else {}
+    parameters = report_data.get("parameters", {}) if isinstance(report_data.get("parameters"), dict) else {}
+    part_parameters = report_data.get("part_parameters", []) if isinstance(report_data.get("part_parameters"), list) else []
+
+    lines: list[str] = []
+    lines.append("HyperMesh 网格划分报告")
+    lines.append("=" * 28)
+    if stamp:
+        lines.append(f"运行时间戳：{stamp}")
+    lines.append(f"流程结果：{'成功' if success else '存在失败或警告'}")
+    if output_hm_path:
+        lines.append(f"最终模型：{output_hm_path}")
+    lines.append("")
+
+    lines.append("一、模型识别和分类")
+    lines.append("-" * 28)
+    lines.append(f"检测到的实体数量：{_mcp_fmt_int(total_solids)}")
+    lines.append(f"分类为 drag 六面体的实体数量：{_mcp_fmt_int(drag_count)}")
+    lines.append(f"分类为 tetra 四面体的实体数量：{_mcp_fmt_int(tetra_count)}")
+    if other_count:
+        lines.append(f"其他策略实体数量：{_mcp_fmt_int(other_count)}")
+    if strategy_counts:
+        lines.append("分类明细：")
+        for name, count in sorted(strategy_counts.items()):
+            lines.append(f"  - {name}: {_mcp_fmt_int(count)}")
+    lines.append("")
+
+    lines.append("二、网格生成结果")
+    lines.append("-" * 28)
+    lines.append(f"drag 六面体实体数量：{_mcp_fmt_int(drag_count)}")
+    lines.append(f"tetra 批次数量：{_mcp_fmt_int(tetra_step.get('batch_count', 0))}")
+    lines.append(f"tetra 成功批次：{_mcp_fmt_int(len(tetra_step.get('completed', []) or []))}")
+    lines.append(f"tetra 失败批次：{_mcp_fmt_int(len(tetra_step.get('failed', []) or []))}")
+    lines.append(f"tetra 成功实体数量：{_mcp_fmt_int(repair_summary.get('tetra_done_count', 0))}")
+    lines.append(f"tet4 单元数量：{_mcp_fmt_int(repair_summary.get('tetra_tet4_total', final_counts.get('tet4', 0)))}")
+    lines.append("")
+
+    if parameters:
+        lines.append("三、运行参数")
+        lines.append("-" * 28)
+        parameter_labels = (
+            ("drag_element_size", "drag 六面体网格尺寸"),
+            ("drag_element_size_min", "drag 六面体网格尺寸下限"),
+            ("drag_element_size_max", "drag 六面体网格尺寸上限"),
+            ("drag_fit_tolerance_ratio", "drag 贴合容差比例"),
+            ("drag_retry_count", "drag 重试次数"),
+            ("tetra_element_size", "tetra 四面体网格尺寸"),
+            ("tetra_element_size_min", "tetra 四面体目标尺寸下限"),
+            ("tetra_element_size_max", "tetra 四面体目标尺寸上限"),
+            ("tetra_min_element_size", "tetra 最小网格尺寸"),
+            ("tetra_min_element_size_min", "tetra 最小网格尺寸下限"),
+            ("tetra_min_element_size_max", "tetra 最小网格尺寸上限"),
+            ("tetra_max_deviation", "tetra 最大偏差"),
+            ("tetra_feature_angle", "tetra 特征角"),
+            ("tetra_growth_rate", "tetra 增长率"),
+            ("tetra_fit_tolerance_ratio", "tetra 贴合容差比例"),
+            ("tetra_target_vol_skew", "tetra 生成目标 vol skew"),
+            ("tetra_repair_vol_skew", "tetra 修复后 vol skew 上限"),
+        )
+        for key, label in parameter_labels:
+            if key in parameters:
+                lines.append(f"{label}：{parameters.get(key)}")
+        lines.append("")
+
+    if part_parameters:
+        lines.append("四、按部件划分参数明细")
+        lines.append("-" * 28)
+        for item in sorted(part_parameters, key=lambda value: int(value.get("solid_id", 0) or 0)):
+            sid = item.get("solid_id", "")
+            comp = item.get("component_name", "")
+            strategy = item.get("strategy", "")
+            lines.append(f"solid {sid} | component={comp} | strategy={strategy}")
+            if str(strategy).startswith("drag"):
+                lines.append(
+                    "  - 尺寸："
+                    f"requested={item.get('requested_element_size', '未记录')}, "
+                    f"actual={item.get('actual_element_size', '未记录')}, "
+                    f"limit={item.get('element_size_min', '未记录')}..{item.get('element_size_max', '未记录')}"
+                )
+                lines.append(
+                    "  - drag 参数："
+                    f"axis={item.get('axis', '未记录')}, "
+                    f"distance={item.get('drag_distance', '未记录')}, "
+                    f"fit_tolerance_ratio={item.get('fit_tolerance_ratio', '未记录')}, "
+                    f"retry_count={item.get('retry_count', '未记录')}"
+                )
+            else:
+                lines.append(
+                    "  - 目标尺寸："
+                    f"requested={item.get('requested_element_size', '未记录')}, "
+                    f"actual={item.get('actual_element_size', '未记录')}, "
+                    f"limit={item.get('element_size_min', '未记录')}..{item.get('element_size_max', '未记录')}"
+                )
+                lines.append(
+                    "  - 最小尺寸："
+                    f"requested={item.get('requested_min_element_size', '未记录')}, "
+                    f"actual={item.get('actual_min_element_size', '未记录')}, "
+                    f"limit={item.get('min_element_size_min', '未记录')}..{item.get('min_element_size_max', '未记录')}"
+                )
+                lines.append(
+                    "  - tetra 参数："
+                    f"surf_count={item.get('surf_count', '未记录')}, "
+                    f"max_deviation={item.get('max_deviation', '未记录')}, "
+                    f"feature_angle={item.get('feature_angle', '未记录')}, "
+                    f"growth_rate={item.get('growth_rate', '未记录')}, "
+                    f"fit_tolerance_ratio={item.get('fit_tolerance_ratio', '未记录')}, "
+                    f"target_vol_skew={item.get('target_vol_skew', '未记录')}, "
+                    f"repair_vol_skew={item.get('repair_vol_skew', '未记录')}"
+                )
+        lines.append("")
+
+    lines.append("五、最终质量统计")
+    lines.append("-" * 28)
+    lines.append(f"总单元数量：{_mcp_fmt_int(final_counts.get('elems', 0))}")
+    lines.append(f"残留 shell 面单元数量：{_mcp_fmt_int(final_counts.get('shells', 0))}")
+    lines.append(f"tet4 四面体数量：{_mcp_fmt_int(final_counts.get('tet4', 0))}")
+    lines.append(f"hex8 六面体数量：{_mcp_fmt_int(final_counts.get('hex8', 0))}")
+    lines.append(f"其他单元数量：{_mcp_fmt_int(final_counts.get('other', 0))}")
+    lines.append(f"最终保存状态：{'成功' if final_save.get('success') else '失败或未确认'}")
+    lines.append("")
+
+    lines.append("六、2D 面网格修复统计")
+    lines.append("-" * 28)
+    lines.append(f"初始 aspect 不合格三角形数量：{_mcp_fmt_int(repair_agg.get('initial_bad', 0))}")
+    lines.append(f"triangle_cleanup 修复数量：{_mcp_fmt_int(repair_agg.get('triangle_cleanup_repaired', 0))}")
+    lines.append(f"smooth_5 修复数量：{_mcp_fmt_int(repair_agg.get('smooth_5_repaired', 0))}")
+    lines.append(f"local_remesh 修复数量：{_mcp_fmt_int(repair_agg.get('local_remesh_repaired', 0))}")
+    lines.append(f"replace_nodes 修复数量：{_mcp_fmt_int(repair_agg.get('replace_nodes_repaired', 0))}")
+    lines.append(f"replace_nodes 实际执行次数：{_mcp_fmt_int(repair_agg.get('replace_nodes_changed', 0))}")
+    lines.append(f"local_remesh 新生成 shell 数量：{_mcp_fmt_int(repair_agg.get('local_remesh_new_shells', 0))}")
+    lines.append(f"最终剩余 aspect 不合格三角形数量：{_mcp_fmt_int(repair_agg.get('final_bad', 0))}")
+    lines.append("")
+
+    lines.append("七、按实体修复过程")
+    lines.append("-" * 28)
+    active_repairs = {
+        sid: info for sid, info in repair_by_solid.items()
+        if int(info.get("initial_bad") or 0) > 0 or int(info.get("final_bad") or 0) > 0
+    }
+    if not active_repairs:
+        lines.append("没有检测到需要记录的 2D aspect 修复过程。")
+    else:
+        for sid in sorted(active_repairs, key=lambda value: int(value)):
+            info = active_repairs[sid]
+            lines.append(
+                f"solid {sid}: 初始不合格={_mcp_fmt_int(info.get('initial_bad', 0))}, "
+                f"最终不合格={_mcp_fmt_int(info.get('final_bad', 0))}"
+            )
+            for step, label in (
+                ("triangle_cleanup", "triangle_cleanup"),
+                ("smooth_5", "smooth_5"),
+                ("local_remesh", "local_remesh"),
+                ("replace_nodes", "replace_nodes"),
+            ):
+                value = info.get(step)
+                if isinstance(value, dict):
+                    lines.append(
+                        f"  - {label}: before={_mcp_fmt_int(value.get('before', value.get('before_count', 0)))}, "
+                        f"after={_mcp_fmt_int(value.get('after', '未记录'))}, "
+                        f"repaired={_mcp_fmt_int(value.get('repaired', 0))}"
+                    )
+            if info.get("replace_nodes_changed") is not None:
+                lines.append(f"  - replace_nodes_changed={_mcp_fmt_int(info.get('replace_nodes_changed'))}")
+            if info.get("local_remesh_new_shells") is not None:
+                lines.append(f"  - local_remesh_new_shells={_mcp_fmt_int(info.get('local_remesh_new_shells'))}")
+    lines.append("")
+
+    lines.append("八、失败和异常记录")
+    lines.append("-" * 28)
+    if not errors:
+        lines.append("没有记录到失败批次。")
+    else:
+        for item in errors:
+            lines.append(f"- step={item.get('step', 'unknown')} batch={item.get('batch', '')} status={item.get('status', '')} solids={item.get('solid_ids', '')}")
+    lines.append("")
+
+    if generated_files:
+        lines.append("九、相关文件")
+        lines.append("-" * 28)
+        for name, path in generated_files.items():
+            if path:
+                lines.append(f"{name}：{path}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+@mcp.tool()
+def write_chinese_meshing_workflow_report(
+    report_data: dict[str, Any],
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Write one Chinese TXT report for a meshing workflow run."""
+    text = build_chinese_meshing_workflow_report(report_data)
+    if output_path:
+        path = _normalize_path(output_path)
+    else:
+        path = _ensure_runs_dir() / f"meshing_report_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return {
+        "success": True,
+        "report_path": str(path),
+        "report_text": text,
+    }
 
 
 @mcp.tool()

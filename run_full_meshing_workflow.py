@@ -18,6 +18,12 @@ from typing import Any
 import hypermesh_mcp_server as hm
 
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
 ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / "runs"
 OUTPUTS_DIR = ROOT / "outputs"
@@ -145,6 +151,19 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         text = _read_text(Path(batch["log_path"]))
         current_step: dict[str, str] = {}
         for line in text.splitlines():
+            match = re.search(r"MCP_PT_FAIL solid=(\d+) .*delete_tetra_keep_surface_shells=1", line)
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["tetra_deleted_keep_surface_shells"] = 1
+                continue
+
+            match = re.search(r"MCP_PT_QUALITY_FAIL solid=(\d+) bad_volume_elements=(\d+) kept_surface_shells=1", line)
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["tetra_deleted_keep_surface_shells"] = 1
+                repair.setdefault(sid, {})["bad_volume_elements_when_rolled_back"] = int(match.group(2))
+                continue
+
             match = re.search(r"MCP_PT_INFO solid=(\d+) aspect_bad_local=(\d+)", line)
             if match:
                 sid, bad = match.group(1), int(match.group(2))
@@ -180,9 +199,37 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
                 repair.setdefault(match.group(1), {})["local_remesh_new_shells"] = int(match.group(2))
                 continue
 
+            match = re.search(r"MCP_PT_INFO solid=(\d+) vol_skew_bad_initial=(\d+) threshold=([0-9.eE+-]+)", line)
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["vol_skew_initial_bad"] = int(match.group(2))
+                repair.setdefault(sid, {})["vol_skew_threshold"] = float(match.group(3))
+                continue
+
+            match = re.search(r"MCP_PT_INFO solid=(\d+) vol_skew_repair=([A-Za-z0-9_]+) count=(\d+)", line)
+            if match:
+                sid, step, count = match.group(1), match.group(2), int(match.group(3))
+                current_step[f"{sid}:vol"] = step
+                repair.setdefault(sid, {}).setdefault("vol_skew_repairs", {})[step] = {"before_count": count}
+                continue
+
+            match = re.search(r"MCP_PT_INFO solid=(\d+) vol_skew_repair_after before=(\d+) after=(\d+) threshold=([0-9.eE+-]+)", line)
+            if match:
+                sid = match.group(1)
+                before, after = int(match.group(2)), int(match.group(3))
+                step = current_step.get(f"{sid}:vol", "unknown")
+                repair.setdefault(sid, {}).setdefault("vol_skew_repairs", {})[step] = {
+                    "before": before,
+                    "after": after,
+                    "repaired": max(0, before - after),
+                }
+                repair.setdefault(sid, {})["vol_skew_final_bad"] = after
+                repair.setdefault(sid, {})["vol_skew_threshold"] = float(match.group(4))
+                continue
+
             match = re.search(
                 r"MCP_PT_DONE solid=(\d+) ok=(\d+) total=(\d+) tet4=(\d+).*"
-                r"unfixed_aspect=(\d+).*unrepaired_vol_skew_over_0.99=(\d+)",
+                r"unfixed_aspect=(\d+).*unrepaired_vol_skew_over_([0-9.eE+-]+)=(\d+)",
                 line,
             )
             if match:
@@ -191,8 +238,11 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
                     "total": int(match.group(3)),
                     "tet4": int(match.group(4)),
                     "unfixed_aspect": int(match.group(5)),
-                    "unrepaired_vol_skew_over_0.99": int(match.group(6)),
+                    "unrepaired_vol_skew_threshold": float(match.group(6)),
+                    "unrepaired_vol_skew": int(match.group(7)),
                 }
+                repair.setdefault(match.group(1), {})["vol_skew_final_bad"] = int(match.group(7))
+                repair.setdefault(match.group(1), {})["vol_skew_threshold"] = float(match.group(6))
 
     aggregate = {
         "initial_bad": 0,
@@ -203,21 +253,41 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "final_bad": 0,
         "replace_nodes_changed": 0,
         "local_remesh_new_shells": 0,
+        "vol_skew_initial_bad": 0,
+        "vol_skew_final_bad": 0,
+        "vol_skew_solid_mesh_optimization_repaired": 0,
+        "vol_skew_smooth_3_repaired": 0,
+        "vol_skew_smooth_8_repaired": 0,
+        "vol_skew_smooth_15_repaired": 0,
+        "tetra_deleted_keep_surface_shells_count": 0,
+        "bad_volume_elements_when_rolled_back": 0,
     }
     for item in repair.values():
         aggregate["initial_bad"] += int(item.get("initial_bad") or 0)
         aggregate["final_bad"] += int(item.get("final_bad") or 0)
         aggregate["replace_nodes_changed"] += int(item.get("replace_nodes_changed") or 0)
         aggregate["local_remesh_new_shells"] += int(item.get("local_remesh_new_shells") or 0)
+        aggregate["vol_skew_initial_bad"] += int(item.get("vol_skew_initial_bad") or 0)
+        aggregate["vol_skew_final_bad"] += int(item.get("vol_skew_final_bad") or 0)
+        aggregate["tetra_deleted_keep_surface_shells_count"] += int(item.get("tetra_deleted_keep_surface_shells") or 0)
+        aggregate["bad_volume_elements_when_rolled_back"] += int(item.get("bad_volume_elements_when_rolled_back") or 0)
         for step in ("triangle_cleanup", "smooth_5", "local_remesh", "replace_nodes"):
             value = item.get(step)
             if isinstance(value, dict):
                 aggregate[f"{step}_repaired"] += int(value.get("repaired") or 0)
+        vol_repairs = item.get("vol_skew_repairs", {})
+        if isinstance(vol_repairs, dict):
+            for step in ("solid_mesh_optimization", "smooth_3", "smooth_8", "smooth_15"):
+                value = vol_repairs.get(step)
+                if isinstance(value, dict):
+                    aggregate[f"vol_skew_{step}_repaired"] += int(value.get("repaired") or 0)
 
     return {
         "repair_by_solid": repair,
         "repair_aggregate": aggregate,
-        "tetra_done_count": len(tetra_done),
+        "tetra_attempted_count": len(tetra_done),
+        "tetra_done_count": sum(1 for item in tetra_done.values() if item.get("ok") == 1 and item.get("tet4", 0) > 0),
+        "tetra_failed_count": sum(1 for item in tetra_done.values() if item.get("ok") != 1 or item.get("tet4", 0) <= 0),
         "tetra_tet4_total": sum(item["tet4"] for item in tetra_done.values()),
         "tetra_done": tetra_done,
     }
@@ -381,6 +451,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "continue_on_error": args.continue_on_error,
         "steps": {},
         "errors": [],
+        "warnings": [],
     }
 
     _log(f"[1/6] Probe current HyperMesh model: {stamp}")
@@ -503,6 +574,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "batch": batch_index,
                 "solid_ids": solid_ids,
+                "solid_names": {str(solid["solid_id"]): solid.get("component_name", "") for solid in solids},
                 "script_path": str(script_path),
                 "log_path": str(log_path),
                 "reason": batch.get("reason", ""),
@@ -568,9 +640,46 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_repair_summary_{stamp}.json", repair_summary)
     workflow["steps"]["repair_summary"] = {
         **repair_summary["repair_aggregate"],
+        "tetra_attempted_count": repair_summary["tetra_attempted_count"],
         "tetra_done_count": repair_summary["tetra_done_count"],
+        "tetra_failed_count": repair_summary["tetra_failed_count"],
         "tetra_tet4_total": repair_summary["tetra_tet4_total"],
     }
+    rollback_count = int(repair_summary["repair_aggregate"].get("tetra_deleted_keep_surface_shells_count") or 0)
+    if rollback_count:
+        solid_name_by_id = {
+            str(sid): name
+            for batch in plan_batches
+            for sid, name in (batch.get("solid_names") or {}).items()
+        }
+        rolled_back_solids = []
+        for sid, info in sorted(repair_summary["repair_by_solid"].items(), key=lambda pair: int(pair[0])):
+            if int(info.get("tetra_deleted_keep_surface_shells") or 0) > 0:
+                rolled_back_solids.append(
+                    {
+                        "solid_id": int(sid),
+                        "component_name": solid_name_by_id.get(str(sid), ""),
+                        "bad_volume_elements": int(info.get("bad_volume_elements_when_rolled_back") or 0),
+                    }
+                )
+        rollback_error = {
+            "step": "tetra_quality",
+            "status": "rolled_back_to_surface_mesh",
+            "solid_count": rollback_count,
+            "bad_volume_elements": repair_summary["repair_aggregate"].get("bad_volume_elements_when_rolled_back", 0),
+            "solids": rolled_back_solids,
+        }
+        workflow["errors"].append(rollback_error)
+        solid_text = "，".join(
+            f"solid {item['solid_id']}({item['component_name'] or '未命名'})"
+            for item in rolled_back_solids
+        )
+        workflow["warnings"].append(
+            "警告：3D tetra 质量修复后仍有不合格体单元；"
+            f"{rollback_count} 个实体已删除 tetra 体网格并退回为仅保留 2D 面网格。"
+            f"失败实体：{solid_text or '未记录'}。"
+            "详细信息见中文 TXT 报告。"
+        )
 
     workflow["success"] = (
         bool(final_save.get("success"))
@@ -617,7 +726,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     workflow["report_path"] = report.get("report_path")
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_summary_{stamp}.json", workflow)
     _write_json_if_enabled(args.write_json, RUNS_DIR / "workflow_latest_summary.json", workflow)
-    _log(f"中文报告: {report.get('report_path')}")
+    _log(f"Chinese report: {report.get('report_path')}")
     return workflow
 
 
@@ -676,6 +785,11 @@ def main(argv: list[str] | None = None) -> int:
                 _log(line)
     _log(f"Output: {summary.get('output_hm_path')}")
     _log(f"Report: {summary.get('report_path')}")
+    warnings = summary.get("warnings") or []
+    if warnings:
+        _log("")
+        for warning in warnings:
+            _log(str(warning))
     return 0 if summary.get("success") else 2
 
 

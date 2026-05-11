@@ -209,14 +209,23 @@ GENERIC_MESHING_RULES = {
 }
 
 # Strategy 闁?HyperMesh color id mapping (verified with HM 2020 *colormark)
+# Avoid color id 1 because it renders as black in common HyperMesh themes and
+# makes black mesh edges almost invisible.
 FINALIZE_STRATEGY_COLORS = {
-    "drag_hex": 1,
+    "drag_hex": 8,
     "spin_hex": 7,
     "gear_aware_tetra": 3,
     "tetra_plain": 4,
     "surface_tetra": 4,
     "unknown": 4,
 }
+FINALIZE_UNIQUE_COLOR_IDS = [
+    8, 7, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16,
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
+    53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64,
+]
 
 TETRA_COMPLEX_SURFACE_COUNT = 50
 TETRA_VERY_COMPLEX_SURFACE_COUNT = 120
@@ -1367,12 +1376,14 @@ def generate_component_colors_tcl(classification_results: dict | None = None):
     target_results = _classification_results_from_input(classification_results)
 
     # Keep the original Phase 2 behavior: assign one visible unique color per
-    # renamed component, cycling through HyperMesh color ids.
+    # renamed component, cycling through HyperMesh color ids while skipping
+    # black so black mesh edges remain visible.
     color_idx = 0
+    color_ids = FINALIZE_UNIQUE_COLOR_IDS or [2]
     for sid_str, info in target_results.items():
         name = info.get("component_name", "")
         if name:
-            color = (color_idx % 64) + 1
+            color = color_ids[color_idx % len(color_ids)]
             lines.append(f'*createmark components 1 "{name}"')
             lines.append(f"catch {{*colormark components 1 {color}}}")
             color_idx += 1
@@ -2034,6 +2045,13 @@ def generate_plain_tetra_tcl(
         "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
         "    return $out",
         "}",
+        "proc mcp_list_intersect {a b} {",
+        "    array set seen {}",
+        "    foreach x $b {set seen($x) 1}",
+        "    set out {}",
+        "    foreach x $a {if {[info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
         "proc mcp_delete_elems {ids} {",
         "    if {[llength $ids] == 0} {return}",
         "    eval *createmark elems 1 $ids",
@@ -2175,6 +2193,22 @@ def generate_plain_tetra_tcl(
         "        if {$c==204 || $c==205 || $c==210 || $c==547} {lappend out $eid}",
         "    }",
         "    return $out",
+        "}",
+        "proc mcp_bad_vol_skew_ids {elems threshold} {",
+        "    if {[llength $elems] == 0} {return {}}",
+        "    catch {*clearmark elems 2}",
+        "    eval *createmark elems 1 $elems",
+        "    set rc [catch {*elementtestvolumeareaskew elems 1 $threshold 2 4 0 \"\"} err]",
+        "    set failed {}",
+        "    if {!$rc} {set failed [hm_getmark elems 2]} else {puts \"MCP_PT_WARN volumearea_skew_mark2_test_failed=$err\"}",
+        "    if {[llength $failed] == 0} {",
+        "        catch {*clearmark elems 2}",
+        "        catch {*marktousermark elems 2}",
+        "        eval *createmark elems 1 $elems",
+        "        set rc2 [catch {*elementtestvolumeareaskew elems 1 $threshold 0 4 0 \"\"} err2]",
+        "        if {!$rc2} {set failed [mcp_list_intersect [hm_getusermark elems] $elems]} else {puts \"MCP_PT_WARN volumearea_skew_usermark_test_failed=$err2\"}",
+        "    }",
+        "    return $failed",
         "}",
         "proc mcp_shell_ids_in_component {component_name} {",
         "    set out {}",
@@ -2339,24 +2373,30 @@ def generate_plain_tetra_tcl(
         '    set comp_elems [mcp_tetra_ids_in_component $target_component]',
         '    if {[llength $comp_elems] == 0} { puts "MCP_PT_WARN solid=$target_solid no_tetra_after_tetmesh_keep_surface_mesh=1"; set kept_surface_shell_count $shell_count; continue }',
         '    puts "MCP_PT_INFO solid=$target_solid tetmesh_generation_vol_skew_target=$target_vol_skew"',
-        '    eval *createmark elems 1 $comp_elems',
-        '    set repair_rc [catch {*elementtestvolumetricskew elems 1 $repair_vol_skew 1 0 ""} repair_err]',
-        '    if {$repair_rc && $repair_err ne "0"} {',
-        '        puts "MCP_PT_WARN solid=$target_solid vol_skew_test_failed=$repair_err"',
+        '    set bad_vol_ids [mcp_bad_vol_skew_ids $comp_elems $repair_vol_skew]',
+        '    if {[llength $bad_vol_ids] < 0} {',
+        '        puts "MCP_PT_WARN solid=$target_solid vol_skew_test_failed=unknown"',
         '    } else {',
-        '        set bad_vol_ids [hm_getmark elems 1]',
         '        if {[llength $bad_vol_ids] == [llength $comp_elems]} {',
-        '            puts "MCP_PT_WARN solid=$target_solid vol_skew_test_unfiltered count=[llength $bad_vol_ids] preserving_volume_mesh=1"',
-        '            set bad_vol_ids {}',
+        '            puts "MCP_PT_WARN solid=$target_solid vol_skew_test_all_component_tetras_flagged count=[llength $bad_vol_ids] continue_repair=1"',
         '        }',
+        '        puts "MCP_PT_INFO solid=$target_solid vol_skew_bad_initial=[llength $bad_vol_ids] threshold=$repair_vol_skew"',
         '        set vol_repair_at 0',
         '        while {[llength $bad_vol_ids] > 0 && $vol_repair_at < 4} {',
         '            eval *createmark elems 1 $bad_vol_ids',
+        '            set before_vol_repair_count [llength $bad_vol_ids]',
         '            if {$vol_repair_at == 0} {',
         '                puts "MCP_PT_INFO solid=$target_solid vol_skew_repair=solid_mesh_optimization count=[llength $bad_vol_ids] threshold=$repair_vol_skew"',
+        '                puts "MCP_PT_INFO solid=$target_solid solid_mesh_optimization_input=all_component_tetras count=[llength $comp_elems]"',
+        '                *clearmark elements 1',
         '                *clearmark elements 2',
+        '                catch {*elementchecksettings -1 0 0 1 0 0 0 1 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0}',
         '                *createstringarray 2 "tet: 256 1.2 2 0.0 0.8 0.0 0" "pars: fix_comp_bdr= 1 fix_top_bdr= 0 shell_swap=0 shell_remesh=0 use_optimizer=1 skip_aflr3=1 feature_angle=35.0 niter=3 upd_shell=0 vol_skew=\'0.99,0.60,0.10,1.0\'"',
-        '                catch {*tetmesh elements 1 6 elements 2 1 1 2} opt_err',
+        '                eval *createmark elements 1 $comp_elems',
+        '                *createmark elements 2',
+        '                set opt_rc [catch {*tetmesh elements 1 6 elements 2 1 1 2} opt_err]',
+        '                if {$opt_rc} {puts "MCP_PT_WARN solid=$target_solid solid_mesh_optimization_failed=$opt_err"}',
+        '                catch {*elementchecksettings -1 0 0 1 0 0 0 1 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0}',
         '            } elseif {$vol_repair_at == 1} {',
         '                puts "MCP_PT_INFO solid=$target_solid vol_skew_repair=smooth_3 count=[llength $bad_vol_ids]"',
         '                catch {*smooth elems 1 3}',
@@ -2368,14 +2408,11 @@ def generate_plain_tetra_tcl(
         '                catch {*smooth elems 1 15}',
         '            }',
         '            set comp_elems [mcp_tetra_ids_in_component $target_component]',
-        '            eval *createmark elems 1 $comp_elems',
-        '            set repair_rc [catch {*elementtestvolumetricskew elems 1 $repair_vol_skew 1 0 ""} repair_err]',
-        '            if {$repair_rc && $repair_err ne "0"} {',
-        '                set bad_vol_ids {}',
-        '            } else {',
-        '                set bad_vol_ids [hm_getmark elems 1]',
-        '                if {[llength $bad_vol_ids] == [llength $comp_elems]} {set bad_vol_ids {}}',
+        '            set bad_vol_ids [mcp_bad_vol_skew_ids $comp_elems $repair_vol_skew]',
+        '            if {[llength $bad_vol_ids] == [llength $comp_elems]} {',
+        '                puts "MCP_PT_WARN solid=$target_solid vol_skew_retest_all_component_tetras_flagged count=[llength $bad_vol_ids] continue_repair=1"',
         '            }',
+        '            puts "MCP_PT_INFO solid=$target_solid vol_skew_repair_after before=$before_vol_repair_count after=[llength $bad_vol_ids] threshold=$repair_vol_skew"',
         '            incr vol_repair_at',
         '        }',
         '        set unrepaired_vol_skew_report [llength $bad_vol_ids]',
@@ -3799,7 +3836,11 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     lines.append(f"tetra 批次数量：{_mcp_fmt_int(tetra_step.get('batch_count', 0))}")
     lines.append(f"tetra 成功批次：{_mcp_fmt_int(len(tetra_step.get('completed', []) or []))}")
     lines.append(f"tetra 失败批次：{_mcp_fmt_int(len(tetra_step.get('failed', []) or []))}")
+    if repair_summary.get("tetra_attempted_count") is not None:
+        lines.append(f"tetra 尝试实体数量：{_mcp_fmt_int(repair_summary.get('tetra_attempted_count', 0))}")
     lines.append(f"tetra 成功实体数量：{_mcp_fmt_int(repair_summary.get('tetra_done_count', 0))}")
+    if repair_summary.get("tetra_failed_count") is not None:
+        lines.append(f"tetra 失败或退回实体数量：{_mcp_fmt_int(repair_summary.get('tetra_failed_count', 0))}")
     lines.append(f"tet4 单元数量：{_mcp_fmt_int(repair_summary.get('tetra_tet4_total', final_counts.get('tet4', 0)))}")
     lines.append("")
 
@@ -3899,11 +3940,28 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     lines.append(f"最终剩余 aspect 不合格三角形数量：{_mcp_fmt_int(repair_agg.get('final_bad', 0))}")
     lines.append("")
 
-    lines.append("七、按实体修复过程")
+    lines.append("七、3D 体网格修复统计")
+    lines.append("-" * 28)
+    lines.append(f"初始 vol skew 不合格体单元数量：{_mcp_fmt_int(repair_agg.get('vol_skew_initial_bad', 0))}")
+    lines.append(f"solid_mesh_optimization 修复数量：{_mcp_fmt_int(repair_agg.get('vol_skew_solid_mesh_optimization_repaired', 0))}")
+    lines.append(f"smooth_3 修复数量：{_mcp_fmt_int(repair_agg.get('vol_skew_smooth_3_repaired', 0))}")
+    lines.append(f"smooth_8 修复数量：{_mcp_fmt_int(repair_agg.get('vol_skew_smooth_8_repaired', 0))}")
+    lines.append(f"smooth_15 修复数量：{_mcp_fmt_int(repair_agg.get('vol_skew_smooth_15_repaired', 0))}")
+    lines.append(f"最终剩余 vol skew 不合格体单元数量：{_mcp_fmt_int(repair_agg.get('vol_skew_final_bad', 0))}")
+    lines.append(f"因 3D 质量失败退回面网格的实体数量：{_mcp_fmt_int(repair_agg.get('tetra_deleted_keep_surface_shells_count', 0))}")
+    lines.append(f"退回前仍不合格体单元数量：{_mcp_fmt_int(repair_agg.get('bad_volume_elements_when_rolled_back', 0))}")
+    lines.append("")
+
+    lines.append("八、按实体修复过程")
     lines.append("-" * 28)
     active_repairs = {
         sid: info for sid, info in repair_by_solid.items()
-        if int(info.get("initial_bad") or 0) > 0 or int(info.get("final_bad") or 0) > 0
+        if (
+            int(info.get("initial_bad") or 0) > 0
+            or int(info.get("final_bad") or 0) > 0
+            or int(info.get("vol_skew_initial_bad") or 0) > 0
+            or int(info.get("vol_skew_final_bad") or 0) > 0
+        )
     }
     if not active_repairs:
         lines.append("没有检测到需要记录的 2D aspect 修复过程。")
@@ -3931,19 +3989,49 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                 lines.append(f"  - replace_nodes_changed={_mcp_fmt_int(info.get('replace_nodes_changed'))}")
             if info.get("local_remesh_new_shells") is not None:
                 lines.append(f"  - local_remesh_new_shells={_mcp_fmt_int(info.get('local_remesh_new_shells'))}")
+            if info.get("vol_skew_initial_bad") is not None or info.get("vol_skew_final_bad") is not None:
+                lines.append(
+                    f"  - 3D vol skew: 初始不合格={_mcp_fmt_int(info.get('vol_skew_initial_bad', 0))}, "
+                    f"最终不合格={_mcp_fmt_int(info.get('vol_skew_final_bad', 0))}, "
+                    f"threshold={info.get('vol_skew_threshold', '未记录')}"
+                )
+            vol_repairs = info.get("vol_skew_repairs", {})
+            if isinstance(vol_repairs, dict):
+                for step in ("solid_mesh_optimization", "smooth_3", "smooth_8", "smooth_15"):
+                    value = vol_repairs.get(step)
+                    if isinstance(value, dict):
+                        lines.append(
+                            f"  - 3D {step}: before={_mcp_fmt_int(value.get('before', value.get('before_count', 0)))}, "
+                            f"after={_mcp_fmt_int(value.get('after', '未记录'))}, "
+                            f"repaired={_mcp_fmt_int(value.get('repaired', 0))}"
+                        )
+            if int(info.get("tetra_deleted_keep_surface_shells") or 0) > 0:
+                lines.append("  - 结果：3D 质量修复后仍有不合格体单元，已删除 tetra 体网格并保留 2D 面网格。")
+                if info.get("bad_volume_elements_when_rolled_back") is not None:
+                    lines.append(
+                        "  - 退回前仍不合格体单元数量="
+                        f"{_mcp_fmt_int(info.get('bad_volume_elements_when_rolled_back'))}"
+                    )
     lines.append("")
 
-    lines.append("八、失败和异常记录")
+    lines.append("九、失败和异常记录")
     lines.append("-" * 28)
     if not errors:
         lines.append("没有记录到失败批次。")
     else:
         for item in errors:
-            lines.append(f"- step={item.get('step', 'unknown')} batch={item.get('batch', '')} status={item.get('status', '')} solids={item.get('solid_ids', '')}")
+            if item.get("status") == "rolled_back_to_surface_mesh":
+                lines.append(
+                    "- tetra 质量失败："
+                    f"{_mcp_fmt_int(item.get('solid_count', 0))} 个实体已退回到 2D 面网格；"
+                    f"退回前不合格体单元数={_mcp_fmt_int(item.get('bad_volume_elements', 0))}"
+                )
+            else:
+                lines.append(f"- step={item.get('step', 'unknown')} batch={item.get('batch', '')} status={item.get('status', '')} solids={item.get('solid_ids', '')}")
     lines.append("")
 
     if generated_files:
-        lines.append("九、相关文件")
+        lines.append("十、相关文件")
         lines.append("-" * 28)
         for name, path in generated_files.items():
             if path:

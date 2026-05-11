@@ -133,6 +133,16 @@ proc ::hm_mcp_launcher::ensure_listener {} {
     return $listener_path
 }
 
+proc ::hm_mcp_launcher::manual_connection_help_text {} {
+    variable project_dir
+    variable port
+    set panel_path [file normalize [info script]]
+    set ps_dir [file nativename $project_dir]
+    set panel_tcl [string map {"\\" "/"} $panel_path]
+    set py_cmd [format {python -c "import hypermesh_mcp_server as hm; print(hm.create_gui_listener_tcl(port=%d)['script_path'])"} $port]
+    return "\n手动建立连接方法：\n1. 在 PowerShell 中运行：\n   cd \"$ps_dir\"\n   $py_cmd\n\n2. 复制 PowerShell 输出的 Tcl 文件路径。\n\n3. 在 HyperMesh 的 Tcl 命令窗口中运行，注意把路径替换成上一步实际输出的路径：\n   source \"E:/mcp/hypermesh-mcp-server/runs/hypermesh_mcp_xxxxxx.tcl\"\n\n4. 如果只是重新打开本面板，也可以在 HyperMesh 中运行：\n   source \"$panel_tcl\"\n\n5. 连接成功后，回到本面板取消勾选“开始前自动建立/刷新 HyperMesh 连接”，再点击“开始划分”。\n"
+}
+
 proc ::hm_mcp_launcher::make_stamp {} {
     return [clock format [clock seconds] -format "%Y%m%d_%H%M%S"]
 }
@@ -321,7 +331,8 @@ proc ::hm_mcp_launcher::start_workflow {} {
         append_log "正在建立 HyperMesh 连接...\n"
         if {[catch {set listener_path [ensure_listener]} err]} {
             set_status "连接失败"
-            append_log "自动建立连接失败：$err\n\n可以手动 source listener Tcl 后，再取消自动连接重新点击开始划分。\n"
+            append_log "自动建立连接失败：$err\n"
+            append_log [manual_connection_help_text]
             return
         }
         append_log "连接成功：$listener_path\n"
@@ -511,6 +522,7 @@ proc ::hm_mcp_launcher::build_ui {} {
         if {[catch {set p [::hm_mcp_launcher::ensure_listener]} e]} {
             ::hm_mcp_launcher::set_status "连接失败"
             ::hm_mcp_launcher::append_log "连接失败：$e\n"
+            ::hm_mcp_launcher::append_log [::hm_mcp_launcher::manual_connection_help_text]
         } else {
             ::hm_mcp_launcher::set_status "连接成功"
             ::hm_mcp_launcher::append_log "连接成功：$p\n"

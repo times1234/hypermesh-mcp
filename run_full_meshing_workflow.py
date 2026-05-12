@@ -294,6 +294,17 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
                 repair[sid]["final_bad"] = after
                 continue
 
+            match = re.search(r"MCP_PT_INFO solid=(\d+) aspect_repair_smart_skip=([A-Za-z0-9_]+) reason=([A-Za-z0-9_]+)", line)
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {}).setdefault("smart_repair_skips", []).append(
+                    {
+                        "skip": match.group(2),
+                        "reason": match.group(3),
+                    }
+                )
+                continue
+
             match = re.search(r"MCP_PT_INFO solid=(\d+) replace_nodes_changed=(\d+)", line)
             if match:
                 repair.setdefault(match.group(1), {})["replace_nodes_changed"] = int(match.group(2))
@@ -359,6 +370,7 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "replace_nodes_changed": 0,
         "replace_nodes_fast_path_count": 0,
         "replace_nodes_fast_path_sliver_count": 0,
+        "smart_repair_skip_count": 0,
         "local_remesh_new_shells": 0,
         "vol_skew_initial_bad": 0,
         "vol_skew_final_bad": 0,
@@ -379,6 +391,9 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         if isinstance(fast_path, dict):
             aggregate["replace_nodes_fast_path_count"] += 1
             aggregate["replace_nodes_fast_path_sliver_count"] += int(fast_path.get("sliver_count") or 0)
+        smart_skips = item.get("smart_repair_skips")
+        if isinstance(smart_skips, list):
+            aggregate["smart_repair_skip_count"] += len(smart_skips)
         aggregate["local_remesh_new_shells"] += int(item.get("local_remesh_new_shells") or 0)
         aggregate["vol_skew_initial_bad"] += int(item.get("vol_skew_initial_bad") or 0)
         aggregate["vol_skew_final_bad"] += int(item.get("vol_skew_final_bad") or 0)

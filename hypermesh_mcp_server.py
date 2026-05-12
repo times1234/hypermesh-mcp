@@ -867,6 +867,24 @@ proc ::mcp_hm_run_async {{job_id script log_path}} {{
     set f [open $log_path a]
     puts $f "MCP_ASYNC_START job=$job_id"
     close $f
+    set ::mcp_async_log_path $log_path
+
+    proc ::mcp_hm_async_log {{text}} {{
+        if {{![info exists ::mcp_async_log_path] || $::mcp_async_log_path eq ""}} {{return}}
+        if {{[catch {{
+            set lf [open $::mcp_async_log_path a]
+            puts $lf $text
+            close $lf
+        }}]}} {{
+            catch {{close $lf}}
+        }}
+    }}
+
+    proc ::mcp_hm_async_console_summary {{text}} {{
+        if {{[string match "MCP_CONSOLE *" $text] || [string match "MCP_ASYNC_*" $text]}} {{
+            ::_mcp_base_puts $text
+        }}
+    }}
 
     if {{![info exists ::_mcp_base_puts]}} {{
         rename puts ::_mcp_base_puts
@@ -877,11 +895,13 @@ proc ::mcp_hm_run_async {{job_id script log_path}} {{
     proc puts args {{
         set len [llength $args]
         if {{$len == 1}} {{
-            ::_mcp_base_puts [lindex $args 0]
-            append ::mcp_capture [lindex $args 0] "\\n"
+            set msg [lindex $args 0]
+            ::mcp_hm_async_log $msg
+            ::mcp_hm_async_console_summary $msg
         }} elseif {{$len == 2 && ([lindex $args 0] eq "stdout")}} {{
-            ::_mcp_base_puts stdout [lindex $args 1]
-            append ::mcp_capture [lindex $args 1] "\\n"
+            set msg [lindex $args 1]
+            ::mcp_hm_async_log $msg
+            ::mcp_hm_async_console_summary $msg
         }} else {{
             eval [linsert $args 0 ::_mcp_base_puts]
         }}
@@ -907,6 +927,7 @@ proc ::mcp_hm_run_async {{job_id script log_path}} {{
     if {{$result ne ""}} {{puts $f $result}}
     close $f
     set ::mcp_capture $old_capture
+    set ::mcp_async_log_path ""
 }}
 
 proc ::mcp_hm_accept {{chan addr client_port}} {{
@@ -2263,6 +2284,7 @@ def generate_plain_tetra_tcl(
         'set dim_min [expr {max($min_size_min, min($min_size_max, $min_dim/8.0))}]',
         'set base_min_size [expr {max($min_size_min, min($min_size_max, min($requested_min_size, min($complexity_min, $dim_min))))}]',
         'puts "MCP_PT_START solid=$target_solid surf_count=$surf_count elem_size=$elem_size min_size=$base_min_size max_dev=$max_dev fit_tol_ratio=$fit_tol_ratio target_vol_skew=$target_vol_skew"',
+        'puts "MCP_CONSOLE solid=$target_solid stage=2d_start surf_count=$surf_count elem_size=$elem_size min_size=$base_min_size"',
         'if {!$allow_surface_mesh} {',
         '    puts "MCP_PT_STOP solid=$target_solid surface_mesh_disabled_for_high_risk_geometry before_surface_mesh"',
         '    return',
@@ -2336,13 +2358,16 @@ def generate_plain_tetra_tcl(
         '    set bad_aspect_ids {}',
         '    set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold]',
         '    puts "MCP_PT_INFO solid=$target_solid aspect_bad_local=[llength $bad_aspect_ids]"',
+        '    set initial_aspect_bad_count [llength $bad_aspect_ids]',
         '    set repair_at 0',
+        '    set repair_path_label "standard"',
         '    set sliver_fast_count 0',
         '    if {[llength $bad_aspect_ids] > 0} {',
         '        set sliver_min_edge_limit [expr {max(0.0001, $mn_size * 0.50)}]',
         '        set sliver_fast_count [mcp_sliver_bad_shell_count $bad_aspect_ids $sliver_min_edge_limit 25.0]',
         '        if {$sliver_fast_count > 0 && $sliver_fast_count >= int(ceil([llength $bad_aspect_ids] * 0.50))} {',
         '            puts "MCP_PT_INFO solid=$target_solid aspect_repair_fast_path=replace_nodes reason=sliver_short_edge sliver_count=$sliver_fast_count total=[llength $bad_aspect_ids] min_edge_limit=$sliver_min_edge_limit"',
+        '            set repair_path_label "sliver_replace_fast_path"',
         '            set repair_at 3',
         '        }',
         '    }',
@@ -2367,15 +2392,30 @@ def generate_plain_tetra_tcl(
         '            set shell_ids [mcp_shells_on_surfaces $all_surfs]',
         '        }',
         '        set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold]',
-        '        puts "MCP_PT_INFO solid=$target_solid aspect_repair_after before=$before_repair_count after=[llength $bad_aspect_ids] threshold=$surface_aspect_threshold"',
-        '        incr repair_at',
+        '        set after_repair_count [llength $bad_aspect_ids]',
+        '        puts "MCP_PT_INFO solid=$target_solid aspect_repair_after before=$before_repair_count after=$after_repair_count threshold=$surface_aspect_threshold"',
+        '        set next_repair_at [expr {$repair_at + 1}]',
+        '        if {$after_repair_count == 0} {',
+        '            set next_repair_at 4',
+        '        } elseif {$repair_at == 0 && $after_repair_count >= $before_repair_count} {',
+        '            puts "MCP_PT_INFO solid=$target_solid aspect_repair_smart_skip=smooth_5 reason=triangle_cleanup_no_improvement before=$before_repair_count after=$after_repair_count"',
+        '            set repair_path_label "smart_skip_to_local_remesh"',
+        '            set next_repair_at 2',
+        '        } elseif {$repair_at == 2 && $after_repair_count >= $before_repair_count} {',
+        '            puts "MCP_PT_INFO solid=$target_solid aspect_repair_smart_skip=remaining_to_replace_nodes reason=local_remesh_no_improvement before=$before_repair_count after=$after_repair_count"',
+        '            set repair_path_label "smart_replace_after_local_remesh"',
+        '            set next_repair_at 3',
+        '        }',
+        '        set repair_at $next_repair_at',
         '    }',
         '    set unfixed_aspect_report [llength $bad_aspect_ids]',
+        '    puts "MCP_CONSOLE solid=$target_solid stage=2d_result initial_bad=$initial_aspect_bad_count final_bad=$unfixed_aspect_report repair_path=$repair_path_label shell_count=$shell_count"',
         '    if {$unfixed_aspect_report > 0} {',
         '        puts "MCP_PT_WARN solid=$target_solid aspect_unfixed=$unfixed_aspect_report continue_to_tetmesh_keep_surface_mesh=1"',
         '    }',
         '    if {$shell_count > $crash_guard_shell_limit && $unfixed_aspect_report > 0} {',
         '        puts "MCP_PT_STOP solid=$target_solid crash_guard_skip_tetmesh shell_count=$shell_count limit=$crash_guard_shell_limit unfixed_aspect=$unfixed_aspect_report keep_repaired_surface_mesh=1"',
+        '        puts "MCP_CONSOLE solid=$target_solid stage=3d_skip reason=crash_guard shell_count=$shell_count limit=$crash_guard_shell_limit unfixed_aspect=$unfixed_aspect_report"',
         '        set kept_surface_shell_count $shell_count',
         '        set ok 0',
         '        break',
@@ -2386,6 +2426,7 @@ def generate_plain_tetra_tcl(
         '        return',
         '    }',
         '    set before_tetmesh_elems [mcp_all_elems]',
+        '    puts "MCP_CONSOLE solid=$target_solid stage=3d_start shell_count=$shell_count target_vol_skew=$target_vol_skew"',
         '    *freesimulation',
         '    *createstringarray 2 "pars: upd_shell fix_comp_bdr vol_skew=\'0.700000,0.800000,0.600000,1.000000,0.860000,0.990000\'" "tet: 67 1.3 -1 0 0.8 -1 -1"',
         '    *createmark components 2 "$target_component"',
@@ -2477,6 +2518,7 @@ def generate_plain_tetra_tcl(
         'if {!$ok && $final_bad_vol_count > 0} { puts "MCP_PT_QUALITY_FAIL solid=$final_bad_solid bad_volume_elements=$final_bad_vol_count kept_surface_shells=1" }',
         'if {!$ok && $final_bad_vol_count == 0} { puts "MCP_PT_FAIL solid=$target_solid no_accepted_tetra_after_retries kept_surface_shells=$kept_surface_shell_count" }',
         'puts "MCP_PT_DONE solid=$target_solid ok=$ok total=$final_count tet4=$t4 tet10=$t10 unfixed_aspect=$unfixed_aspect_report tetmesh_generation_vol_skew_target=$target_vol_skew unrepaired_vol_skew_over_$repair_vol_skew=$unrepaired_vol_skew_report"',
+        'puts "MCP_CONSOLE solid=$target_solid stage=3d_result ok=$ok tet4=$t4 tet10=$t10 unfixed_aspect=$unfixed_aspect_report bad_vol=$unrepaired_vol_skew_report"',
     ]
     if output_hm_path:
         lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
@@ -3983,6 +4025,7 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     lines.append(f"replace_nodes 实际执行次数：{_mcp_fmt_int(repair_agg.get('replace_nodes_changed', 0))}")
     lines.append(f"replace_nodes 快速通道触发实体数量：{_mcp_fmt_int(repair_agg.get('replace_nodes_fast_path_count', 0))}")
     lines.append(f"replace_nodes 快速通道识别 sliver 数量：{_mcp_fmt_int(repair_agg.get('replace_nodes_fast_path_sliver_count', 0))}")
+    lines.append(f"智能跳过低收益修复步骤次数：{_mcp_fmt_int(repair_agg.get('smart_repair_skip_count', 0))}")
     lines.append(f"local_remesh 新生成 shell 数量：{_mcp_fmt_int(repair_agg.get('local_remesh_new_shells', 0))}")
     lines.append(f"最终剩余 aspect 不合格三角形数量：{_mcp_fmt_int(repair_agg.get('final_bad', 0))}")
     lines.append("")
@@ -4042,6 +4085,11 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     f"  - replace_nodes 快速通道：sliver={_mcp_fmt_int(value.get('sliver_count', 0))}, "
                     f"bad_total={_mcp_fmt_int(value.get('total', 0))}"
                 )
+            if isinstance(info.get("smart_repair_skips"), list):
+                for value in info.get("smart_repair_skips"):
+                    lines.append(
+                        f"  - 智能跳过：{value.get('skip', '')}, reason={value.get('reason', '')}"
+                    )
             if info.get("local_remesh_new_shells") is not None:
                 lines.append(f"  - local_remesh_new_shells={_mcp_fmt_int(info.get('local_remesh_new_shells'))}")
             if info.get("vol_skew_initial_bad") is not None or info.get("vol_skew_final_bad") is not None:

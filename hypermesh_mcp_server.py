@@ -2123,6 +2123,21 @@ def generate_plain_tetra_tcl(
         "    }",
         "    return $out",
         "}",
+        "proc mcp_sliver_bad_shell_count {ids min_edge_limit aspect_fast_threshold} {",
+        "    set count 0",
+        "    foreach eid $ids {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=nodes} nodes]} {continue}",
+        "        if {[llength $nodes] != 3} {continue}",
+        "        set p0 [mcp_node_xyz [lindex $nodes 0]]; set p1 [mcp_node_xyz [lindex $nodes 1]]; set p2 [mcp_node_xyz [lindex $nodes 2]]",
+        "        set d01 [mcp_dist3 $p0 $p1]; set d12 [mcp_dist3 $p1 $p2]; set d20 [mcp_dist3 $p2 $p0]",
+        "        set min_edge [expr {min($d01, min($d12, $d20))}]",
+        "        set max_edge [expr {max($d01, max($d12, $d20))}]",
+        "        if {$min_edge <= 0.000001} {incr count; continue}",
+        "        set edge_aspect [expr {$max_edge / $min_edge}]",
+        "        if {$min_edge < $min_edge_limit || $edge_aspect >= $aspect_fast_threshold} {incr count}",
+        "    }",
+        "    return $count",
+        "}",
         "proc mcp_shells_on_surfaces {surfs} {",
         "    set out {}",
         "    foreach sid $surfs {",
@@ -2322,6 +2337,15 @@ def generate_plain_tetra_tcl(
         '    set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold]',
         '    puts "MCP_PT_INFO solid=$target_solid aspect_bad_local=[llength $bad_aspect_ids]"',
         '    set repair_at 0',
+        '    set sliver_fast_count 0',
+        '    if {[llength $bad_aspect_ids] > 0} {',
+        '        set sliver_min_edge_limit [expr {max(0.0001, $mn_size * 0.50)}]',
+        '        set sliver_fast_count [mcp_sliver_bad_shell_count $bad_aspect_ids $sliver_min_edge_limit 25.0]',
+        '        if {$sliver_fast_count > 0 && $sliver_fast_count >= int(ceil([llength $bad_aspect_ids] * 0.50))} {',
+        '            puts "MCP_PT_INFO solid=$target_solid aspect_repair_fast_path=replace_nodes reason=sliver_short_edge sliver_count=$sliver_fast_count total=[llength $bad_aspect_ids] min_edge_limit=$sliver_min_edge_limit"',
+        '            set repair_at 3',
+        '        }',
+        '    }',
         '    while {[llength $bad_aspect_ids] > 0 && $repair_at < 4} {',
         '        eval *createmark elems 1 $bad_aspect_ids',
         '        set before_repair_count [llength $bad_aspect_ids]',
@@ -3957,6 +3981,8 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     lines.append(f"local_remesh 修复数量：{_mcp_fmt_int(repair_agg.get('local_remesh_repaired', 0))}")
     lines.append(f"replace_nodes 修复数量：{_mcp_fmt_int(repair_agg.get('replace_nodes_repaired', 0))}")
     lines.append(f"replace_nodes 实际执行次数：{_mcp_fmt_int(repair_agg.get('replace_nodes_changed', 0))}")
+    lines.append(f"replace_nodes 快速通道触发实体数量：{_mcp_fmt_int(repair_agg.get('replace_nodes_fast_path_count', 0))}")
+    lines.append(f"replace_nodes 快速通道识别 sliver 数量：{_mcp_fmt_int(repair_agg.get('replace_nodes_fast_path_sliver_count', 0))}")
     lines.append(f"local_remesh 新生成 shell 数量：{_mcp_fmt_int(repair_agg.get('local_remesh_new_shells', 0))}")
     lines.append(f"最终剩余 aspect 不合格三角形数量：{_mcp_fmt_int(repair_agg.get('final_bad', 0))}")
     lines.append("")
@@ -4010,6 +4036,12 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     )
             if info.get("replace_nodes_changed") is not None:
                 lines.append(f"  - replace_nodes_changed={_mcp_fmt_int(info.get('replace_nodes_changed'))}")
+            if isinstance(info.get("replace_nodes_fast_path"), dict):
+                value = info.get("replace_nodes_fast_path")
+                lines.append(
+                    f"  - replace_nodes 快速通道：sliver={_mcp_fmt_int(value.get('sliver_count', 0))}, "
+                    f"bad_total={_mcp_fmt_int(value.get('total', 0))}"
+                )
             if info.get("local_remesh_new_shells") is not None:
                 lines.append(f"  - local_remesh_new_shells={_mcp_fmt_int(info.get('local_remesh_new_shells'))}")
             if info.get("vol_skew_initial_bad") is not None or info.get("vol_skew_final_bad") is not None:

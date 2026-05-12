@@ -260,6 +260,98 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
                 repair.setdefault(sid, {})["tetra_not_attempted_reason"] = "crash_guard_skip_tetmesh"
                 continue
 
+            match = re.search(
+                r"MCP_PT_STOP solid=(\d+) extreme_aspect_skip_tetmesh shell_count=(\d+) "
+                r"final_aspect_bad=(\d+) extreme_aspect=(\d+) threshold=([0-9.eE+-]+) keep_repaired_surface_mesh=1",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["extreme_aspect_keep_surface_mesh"] = 1
+                repair.setdefault(sid, {})["extreme_aspect_shell_count"] = int(match.group(2))
+                repair[sid]["final_bad"] = int(match.group(3))
+                repair[sid]["surface_aspect_over_100_count"] = int(match.group(4))
+                repair[sid]["surface_aspect_over_100_threshold"] = float(match.group(5))
+                repair.setdefault(sid, {})["vol_skew_initial_bad"] = 0
+                repair.setdefault(sid, {})["vol_skew_final_bad"] = 0
+                repair.setdefault(sid, {})["tetra_not_attempted_reason"] = "extreme_aspect_skip_tetmesh"
+                continue
+
+            match = re.search(
+                r"MCP_PT_STOP solid=(\d+) surface_fit_degraded_after_repair "
+                r"before=([0-9.eE+-]+) after=([0-9.eE+-]+) fit_tol=([0-9.eE+-]+) "
+                r"ratio=([0-9.eE+-]+) limit=([0-9.eE+-]+) action=keep_surface_no_tetra "
+                r"shell_count=(\d+) final_aspect_bad=(\d+) keep_repaired_surface_mesh=1",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["surface_fit_degraded_keep_surface_mesh"] = 1
+                repair[sid]["surface_fit_before"] = float(match.group(2))
+                repair[sid]["surface_fit_after"] = float(match.group(3))
+                repair[sid]["surface_fit_tolerance"] = float(match.group(4))
+                repair[sid]["surface_fit_ratio"] = float(match.group(5))
+                repair[sid]["surface_fit_ratio_limit"] = float(match.group(6))
+                repair[sid]["surface_fit_shell_count"] = int(match.group(7))
+                repair[sid]["final_bad"] = int(match.group(8))
+                repair.setdefault(sid, {})["vol_skew_initial_bad"] = 0
+                repair.setdefault(sid, {})["vol_skew_final_bad"] = 0
+                repair.setdefault(sid, {})["tetra_not_attempted_reason"] = "surface_fit_degraded_after_repair"
+                continue
+
+            match = re.search(
+                r"MCP_PT_INFO solid=(\d+) repaired_surface_mesh_ready shell_count=(\d+) "
+                r"final_aspect_bad=(\d+)(?: normal_aspect_bad=(\d+))?(?: extreme_aspect_over_100=(\d+))?",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["pre_tetra_surface_shell_count"] = int(match.group(2))
+                repair.setdefault(sid, {})["final_bad"] = int(match.group(3))
+                repair[sid]["final_bad"] = int(match.group(3))
+                if match.group(5) is not None:
+                    repair[sid]["surface_aspect_over_100_count"] = int(match.group(5))
+                    repair.setdefault(sid, {})["surface_aspect_over_100_threshold"] = float(
+                        getattr(hm, "TETRA_FATAL_SURFACE_ASPECT", 2000.0)
+                    )
+                continue
+
+            match = re.search(
+                r"MCP_PT_INFO solid=(\d+) rollback_surface_quality shell_count=(\d+) "
+                r"normal_aspect_bad=(\d+) extreme_aspect_over_100=(\d+) total_aspect_bad=(\d+)",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["rollback_surface_shell_count"] = int(match.group(2))
+                repair.setdefault(sid, {})["final_bad"] = int(match.group(5))
+                repair[sid]["final_bad"] = int(match.group(5))
+                repair[sid]["surface_aspect_over_100_count"] = int(match.group(4))
+                repair[sid]["surface_aspect_over_100_threshold"] = float(
+                    getattr(hm, "TETRA_FATAL_SURFACE_ASPECT", 2000.0)
+                )
+                continue
+
+            match = re.search(
+                r"MCP_PT_WARN solid=(\d+) surface_aspect_over_100_unrepaired "
+                r"count=(\d+) threshold=([0-9.eE+-]+) shell_count=(\d+)",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["surface_aspect_over_100_initial_count"] = int(match.group(2))
+                repair.setdefault(sid, {})["surface_aspect_over_100_count"] = int(match.group(2))
+                repair.setdefault(sid, {})["surface_aspect_over_100_threshold"] = float(match.group(3))
+                repair.setdefault(sid, {})["surface_aspect_over_100_shell_count"] = int(match.group(4))
+                continue
+
+            match = re.search(r"MCP_PT_INFO solid=(\d+) rollback_keep_surface_mesh=1 shell_count=(\d+)", line)
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["rollback_kept_surface_mesh"] = 1
+                repair.setdefault(sid, {})["rollback_surface_shell_count"] = int(match.group(2))
+                continue
+
             match = re.search(r"MCP_PT_INFO solid=(\d+) aspect_bad_local=(\d+)", line)
             if match:
                 sid, bad = match.group(1), int(match.group(2))
@@ -308,6 +400,11 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
             match = re.search(r"MCP_PT_INFO solid=(\d+) replace_nodes_changed=(\d+)", line)
             if match:
                 repair.setdefault(match.group(1), {})["replace_nodes_changed"] = int(match.group(2))
+                continue
+
+            match = re.search(r"MCP_PT_INFO solid=(\d+) replace_nodes_extra_changed=(\d+)", line)
+            if match:
+                repair.setdefault(match.group(1), {})["replace_nodes_extra_changed"] = int(match.group(2))
                 continue
 
             match = re.search(r"MCP_PT_INFO solid=(\d+) local_remesh_new_shells=(\d+)", line)
@@ -366,12 +463,19 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "smooth_5_repaired": 0,
         "local_remesh_repaired": 0,
         "replace_nodes_repaired": 0,
+        "replace_nodes_extra_repaired": 0,
+        "fit_degrade_final_no_replace_repaired": 0,
         "final_bad": 0,
         "replace_nodes_changed": 0,
+        "replace_nodes_extra_changed": 0,
         "replace_nodes_fast_path_count": 0,
         "replace_nodes_fast_path_sliver_count": 0,
         "smart_repair_skip_count": 0,
         "local_remesh_new_shells": 0,
+        "surface_aspect_over_100_initial_count": 0,
+        "surface_aspect_over_100_count": 0,
+        "surface_aspect_over_100_initial_solid_count": 0,
+        "surface_aspect_over_100_solid_count": 0,
         "vol_skew_initial_bad": 0,
         "vol_skew_final_bad": 0,
         "vol_skew_solid_mesh_optimization_repaired": 0,
@@ -380,13 +484,19 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "vol_skew_smooth_15_repaired": 0,
         "tetra_deleted_keep_surface_shells_count": 0,
         "bad_volume_elements_when_rolled_back": 0,
+        "rollback_kept_surface_mesh_count": 0,
         "crash_guard_keep_surface_mesh_count": 0,
         "crash_guard_unfixed_aspect_count": 0,
+        "extreme_aspect_keep_surface_mesh_count": 0,
+        "extreme_aspect_unfixed_aspect_count": 0,
+        "surface_fit_degraded_keep_surface_mesh_count": 0,
+        "surface_fit_degraded_unfixed_aspect_count": 0,
     }
     for item in repair.values():
         aggregate["initial_bad"] += int(item.get("initial_bad") or 0)
         aggregate["final_bad"] += int(item.get("final_bad") or 0)
         aggregate["replace_nodes_changed"] += int(item.get("replace_nodes_changed") or 0)
+        aggregate["replace_nodes_extra_changed"] += int(item.get("replace_nodes_extra_changed") or 0)
         fast_path = item.get("replace_nodes_fast_path")
         if isinstance(fast_path, dict):
             aggregate["replace_nodes_fast_path_count"] += 1
@@ -395,14 +505,38 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         if isinstance(smart_skips, list):
             aggregate["smart_repair_skip_count"] += len(smart_skips)
         aggregate["local_remesh_new_shells"] += int(item.get("local_remesh_new_shells") or 0)
+        initial_extreme_aspect = int(item.get("surface_aspect_over_100_initial_count") or 0)
+        extreme_aspect = int(item.get("surface_aspect_over_100_count") or 0)
+        aggregate["surface_aspect_over_100_initial_count"] += initial_extreme_aspect
+        aggregate["surface_aspect_over_100_count"] += extreme_aspect
+        if initial_extreme_aspect > 0:
+            aggregate["surface_aspect_over_100_initial_solid_count"] += 1
+        if extreme_aspect > 0:
+            aggregate["surface_aspect_over_100_solid_count"] += 1
         aggregate["vol_skew_initial_bad"] += int(item.get("vol_skew_initial_bad") or 0)
         aggregate["vol_skew_final_bad"] += int(item.get("vol_skew_final_bad") or 0)
         aggregate["tetra_deleted_keep_surface_shells_count"] += int(item.get("tetra_deleted_keep_surface_shells") or 0)
         aggregate["bad_volume_elements_when_rolled_back"] += int(item.get("bad_volume_elements_when_rolled_back") or 0)
+        aggregate["rollback_kept_surface_mesh_count"] += int(item.get("rollback_kept_surface_mesh") or 0)
         aggregate["crash_guard_keep_surface_mesh_count"] += int(item.get("crash_guard_keep_surface_mesh") or 0)
         if int(item.get("crash_guard_keep_surface_mesh") or 0) > 0:
             aggregate["crash_guard_unfixed_aspect_count"] += int(item.get("final_bad") or 0)
-        for step in ("triangle_cleanup", "smooth_5", "local_remesh", "replace_nodes"):
+        aggregate["extreme_aspect_keep_surface_mesh_count"] += int(item.get("extreme_aspect_keep_surface_mesh") or 0)
+        if int(item.get("extreme_aspect_keep_surface_mesh") or 0) > 0:
+            aggregate["extreme_aspect_unfixed_aspect_count"] += int(item.get("final_bad") or 0)
+        aggregate["surface_fit_degraded_keep_surface_mesh_count"] += int(
+            item.get("surface_fit_degraded_keep_surface_mesh") or 0
+        )
+        if int(item.get("surface_fit_degraded_keep_surface_mesh") or 0) > 0:
+            aggregate["surface_fit_degraded_unfixed_aspect_count"] += int(item.get("final_bad") or 0)
+        for step in (
+            "triangle_cleanup",
+            "smooth_5",
+            "local_remesh",
+            "replace_nodes",
+            "replace_nodes_extra",
+            "fit_degrade_final_no_replace",
+        ):
             value = item.get(step)
             if isinstance(value, dict):
                 aggregate[f"{step}_repaired"] += int(value.get("repaired") or 0)
@@ -578,28 +712,126 @@ def _isolate_rolled_back_solids(
         return {"success": True, "skipped": True}
 
     solid_ids = " ".join(str(item["solid_id"]) for item in rolled_back_solids)
-    message_lines = ["退回到 2D 面网格的部件："]
     repair_by_solid = repair_summary.get("repair_by_solid", {})
-    for item in rolled_back_solids:
+
+    def _solid_line(item: dict[str, Any], extra_lines: list[str]) -> list[str]:
         sid = str(item["solid_id"])
         info = repair_by_solid.get(sid, {})
         name = item.get("component_name") or "未命名"
-        message_lines.extend(
-            [
-                "",
-                f"solid {sid}（{name}）",
-                f"2D 最开始不合格单元数量：{int(info.get('initial_bad') or 0)}",
-                f"2D 修复后不合格单元数量：{int(info.get('final_bad') or 0)}",
-                f"3D 最开始不合格单元数量：{int(info.get('vol_skew_initial_bad') or 0)}",
-                f"3D 修复后不合格单元数量：{int(info.get('vol_skew_final_bad') or 0)}",
-            ]
+        return ["", f"solid {sid}（{name}）", *extra_lines]
+
+    crash_guard_items = [item for item in rolled_back_solids if int(item.get("crash_guard") or 0) > 0]
+    extreme_items = [
+        item
+        for item in rolled_back_solids
+        if int(repair_by_solid.get(str(item["solid_id"]), {}).get("extreme_aspect_keep_surface_mesh") or 0) > 0
+    ]
+    fit_degraded_items = [
+        item
+        for item in rolled_back_solids
+        if int(
+            repair_by_solid.get(str(item["solid_id"]), {}).get("surface_fit_degraded_keep_surface_mesh") or 0
         )
-        if int(info.get("crash_guard_keep_surface_mesh") or 0) > 0:
-            message_lines.append(
-                "3D 状态：未进入 tetra，shell 数量 "
-                f"{int(info.get('crash_guard_shell_count') or 0)} 超过防崩阈值 "
-                f"{int(info.get('crash_guard_limit') or 0)}，已保留修复后的 2D 面网格。"
+        > 0
+    ]
+    tetra_quality_items = [
+        item
+        for item in rolled_back_solids
+        if int(item.get("crash_guard") or 0) <= 0
+        and int(repair_by_solid.get(str(item["solid_id"]), {}).get("extreme_aspect_keep_surface_mesh") or 0) <= 0
+        and int(
+            repair_by_solid.get(str(item["solid_id"]), {}).get("surface_fit_degraded_keep_surface_mesh") or 0
+        )
+        <= 0
+    ]
+
+    message_lines = ["网格退回提醒"]
+
+    message_lines.extend(["", "一、防崩阈值退回"])
+    if not crash_guard_items:
+        message_lines.append("无")
+    for item in crash_guard_items:
+        sid = str(item["solid_id"])
+        info = repair_by_solid.get(sid, {})
+        total_2d_bad = int(info.get("final_bad") or 0)
+        extreme_2d_bad = int(info.get("surface_aspect_over_100_count") or 0)
+        threshold = info.get("surface_aspect_over_100_threshold", getattr(hm, "TETRA_FATAL_SURFACE_ASPECT", 2000.0))
+        shell_count = int(info.get("crash_guard_shell_count") or info.get("pre_tetra_surface_shell_count") or 0)
+        message_lines.extend(
+            _solid_line(
+                item,
+                [
+                    f"修复后 2D 不合格数量（aspect > 10）：{total_2d_bad}",
+                    f"其中极端不合格数量（aspect > {threshold}）：{extreme_2d_bad}",
+                    f"2D 总网格数：{shell_count}",
+                    f"防崩阈值：{int(info.get('crash_guard_limit') or 0)}",
+                ],
             )
+        )
+
+    message_lines.extend(["", "二、极端 2D aspect 退回"])
+    if not extreme_items:
+        message_lines.append("无")
+    for item in extreme_items:
+        sid = str(item["solid_id"])
+        info = repair_by_solid.get(sid, {})
+        total_2d_bad = int(info.get("final_bad") or 0)
+        extreme_2d_bad = int(info.get("surface_aspect_over_100_count") or 0)
+        threshold = info.get("surface_aspect_over_100_threshold", getattr(hm, "TETRA_FATAL_SURFACE_ASPECT", 2000.0))
+        shell_count = int(info.get("extreme_aspect_shell_count") or info.get("pre_tetra_surface_shell_count") or 0)
+        message_lines.extend(
+            _solid_line(
+                item,
+                [
+                    f"修复后 2D 不合格数量（aspect > 10）：{total_2d_bad}",
+                    f"其中极端不合格数量（aspect > {threshold}）：{extreme_2d_bad}",
+                    f"2D 总网格数：{shell_count}",
+                ],
+            )
+        )
+
+    message_lines.extend(["", "三、2D 修复后贴合度下降退回"])
+    if not fit_degraded_items:
+        message_lines.append("无")
+    for item in fit_degraded_items:
+        sid = str(item["solid_id"])
+        info = repair_by_solid.get(sid, {})
+        total_2d_bad = int(info.get("final_bad") or 0)
+        shell_count = int(info.get("surface_fit_shell_count") or info.get("pre_tetra_surface_shell_count") or 0)
+        message_lines.extend(
+            _solid_line(
+                item,
+                [
+                    f"修复后 2D 不合格数量（aspect > 10）：{total_2d_bad}",
+                    f"2D 总网格数：{shell_count}",
+                    f"贴合度修复前最大偏差：{info.get('surface_fit_before', 0)}",
+                    f"贴合度修复后最大偏差：{info.get('surface_fit_after', 0)}",
+                    f"贴合容差：{info.get('surface_fit_tolerance', 0)}",
+                    f"下降倍率：{info.get('surface_fit_ratio', 0)}",
+                ],
+            )
+        )
+
+    message_lines.extend(["", "四、tetra 质量修复后仍不合格退回"])
+    if not tetra_quality_items:
+        message_lines.append("无")
+    for item in tetra_quality_items:
+        sid = str(item["solid_id"])
+        info = repair_by_solid.get(sid, {})
+        total_2d_bad = int(info.get("final_bad") or 0)
+        shell_count = int(info.get("rollback_surface_shell_count") or info.get("pre_tetra_surface_shell_count") or 0)
+        message_lines.extend(
+            _solid_line(
+                item,
+                [
+                    f"3D 修复前不合格数量：{int(info.get('vol_skew_initial_bad') or 0)}",
+                    f"3D 修复后不合格数量：{int(info.get('vol_skew_final_bad') or 0)}",
+                    f"当前保留 2D 不合格数量（aspect > 10）：{total_2d_bad}",
+                    f"当前保留 2D 总网格数：{shell_count}",
+                ],
+            )
+        )
+
     message = "\n".join(message_lines)
     message_tcl = _tcl_braced(message)
     script = f"""
@@ -883,20 +1115,51 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     }
     rollback_count = int(repair_summary["repair_aggregate"].get("tetra_deleted_keep_surface_shells_count") or 0)
     crash_guard_count = int(repair_summary["repair_aggregate"].get("crash_guard_keep_surface_mesh_count") or 0)
+    extreme_aspect_guard_count = int(
+        repair_summary["repair_aggregate"].get("extreme_aspect_keep_surface_mesh_count") or 0
+    )
+    surface_fit_degraded_count = int(
+        repair_summary["repair_aggregate"].get("surface_fit_degraded_keep_surface_mesh_count") or 0
+    )
+    initial_extreme_aspect_count = int(
+        repair_summary["repair_aggregate"].get("surface_aspect_over_100_initial_count") or 0
+    )
+    extreme_aspect_count = int(repair_summary["repair_aggregate"].get("surface_aspect_over_100_count") or 0)
     rolled_back_solids: list[dict[str, Any]] = []
     solid_name_by_id = {
         str(sid): name
         for batch in plan_batches
         for sid, name in (batch.get("solid_names") or {}).items()
     }
+    if initial_extreme_aspect_count or extreme_aspect_count:
+        extreme_solids = [
+            f"solid {sid}({solid_name_by_id.get(str(sid), '') or '未命名'})"
+            for sid, info in sorted(repair_summary["repair_by_solid"].items(), key=lambda pair: int(pair[0]))
+            if int(info.get("surface_aspect_over_100_initial_count") or 0) > 0
+            or int(info.get("surface_aspect_over_100_count") or 0) > 0
+        ]
+        workflow["warnings"].append(
+            "严重 2D aspect 警告：检测到 "
+            f"初始 {initial_extreme_aspect_count} 个、当前保留 {extreme_aspect_count} 个 "
+            f"aspect>{getattr(hm, 'TETRA_FATAL_SURFACE_ASPECT', 2000.0)} 的面单元；"
+            "这些极端单元未作为自动 2D 修复目标，"
+            f"涉及实体：{', '.join(extreme_solids) or '未记录'}。详细信息见中文 TXT 报告。"
+        )
     for sid, info in sorted(repair_summary["repair_by_solid"].items(), key=lambda pair: int(pair[0])):
-        if int(info.get("tetra_deleted_keep_surface_shells") or 0) > 0 or int(info.get("crash_guard_keep_surface_mesh") or 0) > 0:
+        if (
+            int(info.get("tetra_deleted_keep_surface_shells") or 0) > 0
+            or int(info.get("crash_guard_keep_surface_mesh") or 0) > 0
+            or int(info.get("extreme_aspect_keep_surface_mesh") or 0) > 0
+            or int(info.get("surface_fit_degraded_keep_surface_mesh") or 0) > 0
+        ):
             rolled_back_solids.append(
                 {
                     "solid_id": int(sid),
                     "component_name": solid_name_by_id.get(str(sid), ""),
                     "bad_volume_elements": int(info.get("bad_volume_elements_when_rolled_back") or 0),
                     "crash_guard": int(info.get("crash_guard_keep_surface_mesh") or 0),
+                    "extreme_aspect_guard": int(info.get("extreme_aspect_keep_surface_mesh") or 0),
+                    "surface_fit_degraded": int(info.get("surface_fit_degraded_keep_surface_mesh") or 0),
                     "crash_guard_shell_count": int(info.get("crash_guard_shell_count") or 0),
                     "crash_guard_limit": int(info.get("crash_guard_limit") or 0),
                 }
@@ -907,7 +1170,12 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "status": "rolled_back_to_surface_mesh",
             "solid_count": rollback_count,
             "bad_volume_elements": repair_summary["repair_aggregate"].get("bad_volume_elements_when_rolled_back", 0),
-            "solids": [item for item in rolled_back_solids if not item.get("crash_guard")],
+            "solids": [
+                item for item in rolled_back_solids
+                if not item.get("crash_guard")
+                and not item.get("extreme_aspect_guard")
+                and not item.get("surface_fit_degraded")
+            ],
         }
         workflow["errors"].append(rollback_error)
     if crash_guard_count:
@@ -919,6 +1187,26 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "solids": [item for item in rolled_back_solids if item.get("crash_guard")],
         }
         workflow["errors"].append(guard_error)
+    if extreme_aspect_guard_count:
+        extreme_error = {
+            "step": "tetra_quality",
+            "status": "extreme_aspect_keep_surface_mesh",
+            "solid_count": extreme_aspect_guard_count,
+            "unfixed_aspect": repair_summary["repair_aggregate"].get("extreme_aspect_unfixed_aspect_count", 0),
+            "solids": [item for item in rolled_back_solids if item.get("extreme_aspect_guard")],
+        }
+        workflow["errors"].append(extreme_error)
+    if surface_fit_degraded_count:
+        fit_error = {
+            "step": "tetra_quality",
+            "status": "surface_fit_degraded_keep_surface_mesh",
+            "solid_count": surface_fit_degraded_count,
+            "unfixed_aspect": repair_summary["repair_aggregate"].get(
+                "surface_fit_degraded_unfixed_aspect_count", 0
+            ),
+            "solids": [item for item in rolled_back_solids if item.get("surface_fit_degraded")],
+        }
+        workflow["errors"].append(fit_error)
     if rolled_back_solids:
         solid_text = "，".join(
             f"solid {item['solid_id']}({item['component_name'] or '未命名'})"
@@ -930,7 +1218,17 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 f"触发实体：{solid_text or '未记录'}。"
                 "详细信息见中文 TXT 报告。"
             )
-        elif rollback_count:
+        if extreme_aspect_guard_count:
+            workflow["warnings"].append(
+                "警告：部分实体修复后仍有极端 2D aspect 单元，未进入 3D tetra，"
+                "已保留修复后的 2D 面网格。详细信息见中文 TXT 报告。"
+            )
+        if surface_fit_degraded_count:
+            workflow["warnings"].append(
+                "警告：部分实体 2D 修复后贴合度明显下降，已追加一次不含 replace_nodes 的保守修复；"
+                "仍不满足贴合度要求，未进入 3D tetra。详细信息见中文 TXT 报告。"
+            )
+        if rollback_count:
             workflow["warnings"].append(
                 "警告：3D tetra 质量修复后仍有不合格体单元；"
                 f"{rollback_count} 个实体已删除 tetra 体网格并退回为仅保留 2D 面网格。"

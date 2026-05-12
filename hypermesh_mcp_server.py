@@ -92,6 +92,7 @@ GENERIC_MESHING_RULES = {
         ],
         "required_checks": [
             "2D surface mesh aspect cleanup before tetramesh",
+            "2D shells with aspect > 2000 are treated as extreme geometry warnings: exclude them from automatic 2D repair, repair the remaining bad shells, and report them prominently",
             "for high surface counts, reduce min_element_size rather than increasing nominal element_size",
             "abort and report if surface shell count is above the crash-safety limit before tetramesh",
             "per-component tetramesh; do not mix several solids into one component",
@@ -236,6 +237,7 @@ TETRA_COMPLEX_MAX_SHELL_ELEMENTS = 2500
 TETRA_VERY_COMPLEX_MAX_SHELL_ELEMENTS = 1500
 TETRA_CRASH_GUARD_SHELL_ELEMENTS = 150000
 TETRA_DIRECT_TETMESH_SURFACE_COUNT_LIMIT = 50
+TETRA_FATAL_SURFACE_ASPECT = 2000.0
 
 # Generated-script boundary markers used by _meshing_rule_violation
 MCP_SCRIPT_BEGIN = "# MCP_SCRIPT_BEGIN"
@@ -934,8 +936,9 @@ proc ::mcp_hm_accept {{chan addr client_port}} {{
     fconfigure $chan -blocking 1 -translation binary -encoding utf-8
     set script [read $chan]
     if {{[string trim $script] eq ""}} {{
-        puts $chan "ERROR\\nempty Tcl script"
-        close $chan
+        catch {{puts $chan "ERROR\\nempty Tcl script"}}
+        catch {{flush $chan}}
+        catch {{close $chan}}
         return
     }}
 
@@ -961,23 +964,30 @@ proc ::mcp_hm_accept {{chan addr client_port}} {{
     rename puts ""
     rename ::_mcp_orig_puts puts
 
-    if {{$code == 0 || $code == 2}} {{
-        puts $chan "OK"
-        if {{$::mcp_capture ne ""}} {{
-            puts $chan $::mcp_capture
-        }}
-        if {{$result ne ""}} {{
+    if {{[catch {{
+        if {{$code == 0 || $code == 2}} {{
+            puts $chan "OK"
+            if {{$::mcp_capture ne ""}} {{
+                puts $chan $::mcp_capture
+            }}
+            if {{$result ne ""}} {{
+                puts $chan $result
+            }}
+        }} else {{
+            puts $chan "ERROR"
             puts $chan $result
+            if {{[dict exists $options -errorinfo]}} {{
+                puts $chan [dict get $options -errorinfo]
+            }}
         }}
-    }} else {{
-        puts $chan "ERROR"
-        puts $chan $result
-        if {{[dict exists $options -errorinfo]}} {{
-            puts $chan [dict get $options -errorinfo]
-        }}
+        flush $chan
+    }} reply_err]}} {{
+        # The Python side may legitimately time out or disconnect after a long
+        # HyperMesh operation. Do not surface socket write/flush failures as GUI
+        # Tcl error popups; the workflow logs already carry the real status.
+        catch {{puts "MCP_SOCKET_WARN client=$addr:$client_port write_failed=$reply_err"}}
     }}
-    flush $chan
-    close $chan
+    catch {{close $chan}}
 }}
 
 if {{[info exists ::mcp_hm_server]}} {{
@@ -2046,17 +2056,25 @@ def generate_plain_tetra_tcl(
         f"set repair_vol_skew {float(repair_vol_skew)}",
         f"set delete_existing_component_elements {1 if delete_existing_component_elements else 0}",
         "set surface_aspect_threshold 10.0",
+        f"set fatal_surface_aspect_threshold {float(TETRA_FATAL_SURFACE_ASPECT)}",
         "set surface_growth_limit 1.23",
         "set surface_max_to_min_ratio 6.0",
-        "set retry_count 4",
+        "set retry_count 2",
         "set ok 0",
         "set unfixed_aspect_report 0",
         "set unrepaired_vol_skew_report 0",
+        "set extreme_surface_aspect_count 0",
         "set final_bad_solid 0",
         "set final_bad_vol_count 0",
         "set kept_surface_shell_count 0",
         "set last_param_key \"\"",
         "set target_vol_skew_report -1",
+        "set repair_fit_degrade_ratio 2.0",
+        "set surface_fit_degraded_keep_surface 0",
+        "set surface_fit_degraded_before 0.0",
+        "set surface_fit_degraded_after 0.0",
+        "set surface_fit_degraded_tol 0.0",
+        "set surface_fit_degraded_ratio 0.0",
         "proc mcp_all_elems {} {",
         '    *createmark elems 1 "all"',
         "    return [hm_getmark elems 1]",
@@ -2137,6 +2155,15 @@ def generate_plain_tetra_tcl(
         "    return [expr {$max_edge / $min_edge}]",
         "}",
         "proc mcp_bad_shell_aspect_ids {ids threshold} {",
+        "    if {[llength $ids] == 0} {return {}}",
+        "    catch {*clearmark elements 2}",
+        "    eval *createmark elements 1 $ids",
+        "    set rc [catch {*elementtestaspect elements 1 $threshold 2 2 0 \"  2D Aspect Ratio  \"} err]",
+        "    if {!$rc} {",
+        "        set failed [mcp_list_intersect [hm_getmark elements 2] $ids]",
+        "        return $failed",
+        "    }",
+        "    puts \"MCP_PT_WARN surface_aspect_native_test_failed=$err fallback=coordinate_aspect\"",
         "    set out {}",
         "    foreach eid $ids {",
         "        set aspect [mcp_shell_aspect $eid]",
@@ -2185,8 +2212,17 @@ def generate_plain_tetra_tcl(
         "    }",
         "    return [lsort -unique -integer $out]",
         "}",
-        "proc mcp_local_remesh_bad_shells {bad_ids fallback_surfs elem_size min_size max_size max_dev feat_angle growth} {",
+        "proc mcp_local_remesh_bad_shells {bad_ids protected_ids fallback_surfs elem_size min_size max_size max_dev feat_angle growth} {",
         "    set target_surfs [mcp_surfaces_from_elems $bad_ids $fallback_surfs]",
+        "    set protected_surfs [mcp_surfaces_from_elems $protected_ids $fallback_surfs]",
+        "    if {[llength $protected_surfs] > 0} {",
+        "        set before_filter_count [llength $target_surfs]",
+        "        set target_surfs [mcp_list_subtract $target_surfs $protected_surfs]",
+        "        set skipped_count [expr {$before_filter_count - [llength $target_surfs]}]",
+        "        if {$skipped_count > 0} {",
+        "            puts \"MCP_PT_WARN local_remesh_skipped_surfaces_with_extreme_aspect=$skipped_count protected_extreme_elements=[llength $protected_ids]\"",
+        "        }",
+        "    }",
         "    if {[llength $target_surfs] == 0} {return 0}",
         "    set before [mcp_all_elems]",
         "    foreach sid $target_surfs {",
@@ -2352,11 +2388,21 @@ def generate_plain_tetra_tcl(
         '        mcp_delete_elems $shell_ids',
         '        continue',
         '    }',
+        '    set pre_repair_fit_tol $fit_tol',
+        '    set pre_repair_fit_max_diff $fit_max_diff',
+        '    set pre_repair_fit_max_index $fit_max_index',
+        '    puts "MCP_PT_INFO solid=$target_solid surface_fit_before_repair max_diff=$pre_repair_fit_max_diff fit_tol=$pre_repair_fit_tol max_index=$pre_repair_fit_max_index attempt=$at"',
         '    if {$shell_count > $max_shell_before_tetmesh} {',
         '        puts "MCP_PT_WARN solid=$target_solid shell_count=$shell_count exceeds_guard=$max_shell_before_tetmesh continuing_to_tetmesh"',
         '    }',
+        '    set fatal_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $fatal_surface_aspect_threshold]',
+        '    set fatal_aspect_count [llength $fatal_aspect_ids]',
+        '    if {$fatal_aspect_count > 0} {',
+        '        puts "MCP_PT_WARN solid=$target_solid surface_aspect_over_100_unrepaired count=$fatal_aspect_count threshold=$fatal_surface_aspect_threshold shell_count=$shell_count continue_repair_other_shells=1"',
+        '        set extreme_surface_aspect_count $fatal_aspect_count',
+        '    }',
         '    set bad_aspect_ids {}',
-        '    set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold]',
+        '    set bad_aspect_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold] $fatal_aspect_ids]',
         '    puts "MCP_PT_INFO solid=$target_solid aspect_bad_local=[llength $bad_aspect_ids]"',
         '    set initial_aspect_bad_count [llength $bad_aspect_ids]',
         '    set repair_at 0',
@@ -2382,7 +2428,7 @@ def generate_plain_tetra_tcl(
         '            catch {*smooth elems 1 5}',
         '        } elseif {$repair_at == 2} {',
         '            puts "MCP_PT_INFO solid=$target_solid aspect_repair=local_remesh count=[llength $bad_aspect_ids]"',
-        '            set local_new [mcp_local_remesh_bad_shells $bad_aspect_ids $all_surfs $cs $mn_size $max_size $max_dev $feat_angle $effective_growth]',
+        '            set local_new [mcp_local_remesh_bad_shells $bad_aspect_ids $fatal_aspect_ids $all_surfs $cs $mn_size $max_size $max_dev $feat_angle $effective_growth]',
         '            puts "MCP_PT_INFO solid=$target_solid local_remesh_new_shells=$local_new"',
         '            set shell_ids [mcp_shells_on_surfaces $all_surfs]',
         '        } else {',
@@ -2391,7 +2437,8 @@ def generate_plain_tetra_tcl(
         '            puts "MCP_PT_INFO solid=$target_solid replace_nodes_changed=$replaced"',
         '            set shell_ids [mcp_shells_on_surfaces $all_surfs]',
         '        }',
-        '        set bad_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold]',
+        '        set fatal_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $fatal_surface_aspect_threshold]',
+        '        set bad_aspect_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold] $fatal_aspect_ids]',
         '        set after_repair_count [llength $bad_aspect_ids]',
         '        puts "MCP_PT_INFO solid=$target_solid aspect_repair_after before=$before_repair_count after=$after_repair_count threshold=$surface_aspect_threshold"',
         '        set next_repair_at [expr {$repair_at + 1}]',
@@ -2408,14 +2455,101 @@ def generate_plain_tetra_tcl(
         '        }',
         '        set repair_at $next_repair_at',
         '    }',
-        '    set unfixed_aspect_report [llength $bad_aspect_ids]',
+        '    if {[llength $bad_aspect_ids] > 0} {',
+        '        eval *createmark elems 1 $bad_aspect_ids',
+        '        set before_repair_count [llength $bad_aspect_ids]',
+        '        puts "MCP_PT_INFO solid=$target_solid aspect_repair=replace_nodes_extra count=[llength $bad_aspect_ids]"',
+        '        set replaced [mcp_replace_bad_triangle_nodes $bad_aspect_ids]',
+        '        puts "MCP_PT_INFO solid=$target_solid replace_nodes_extra_changed=$replaced"',
+        '        set shell_ids [mcp_shells_on_surfaces $all_surfs]',
+        '        set fatal_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $fatal_surface_aspect_threshold]',
+        '        set bad_aspect_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold] $fatal_aspect_ids]',
+        '        set after_repair_count [llength $bad_aspect_ids]',
+        '        puts "MCP_PT_INFO solid=$target_solid aspect_repair_after before=$before_repair_count after=$after_repair_count threshold=$surface_aspect_threshold"',
+        '        set repair_path_label "${repair_path_label}_extra_replace"',
+        '    }',
+        '    set shell_ids [mcp_shells_on_surfaces $all_surfs]',
+        '    set shell_count [llength $shell_ids]',
+        '    eval *createmark elems 2 $shell_ids',
+        '    set post_shell_bb [hm_getboundingbox elems 2 0 0 0]',
+        '    set post_repair_fit_max_diff 0.0',
+        '    set post_repair_fit_max_index -1',
+        '    for {set i 0} {$i < 6} {incr i} {',
+        '        set fit_diff [expr {abs([lindex $post_shell_bb $i] - [lindex $solid_bb $i])}]',
+        '        if {$fit_diff > $post_repair_fit_max_diff} {set post_repair_fit_max_diff $fit_diff; set post_repair_fit_max_index $i}',
+        '    }',
+        '    set repair_fit_ratio [expr {$post_repair_fit_max_diff / max($pre_repair_fit_max_diff, 1.0e-9)}]',
+        '    puts "MCP_PT_INFO solid=$target_solid surface_fit_after_repair max_diff=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol max_index=$post_repair_fit_max_index before_max_diff=$pre_repair_fit_max_diff ratio=$repair_fit_ratio attempt=$at"',
+        '    if {$post_repair_fit_max_diff > $pre_repair_fit_tol && $repair_fit_ratio >= $repair_fit_degrade_ratio} {',
+        '        set next_attempt [expr {$at + 1}]',
+        '        if {$next_attempt < $retry_count} {',
+        '            puts "MCP_PT_WARN solid=$target_solid surface_fit_degraded_after_repair before=$pre_repair_fit_max_diff after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio limit=$repair_fit_degrade_ratio attempt=$at action=retry_surface_mesh"',
+        '            mcp_delete_elems $shell_ids',
+        '            continue',
+        '        }',
+        '        puts "MCP_PT_WARN solid=$target_solid surface_fit_degraded_after_repair before=$pre_repair_fit_max_diff after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio limit=$repair_fit_degrade_ratio attempt=$at action=final_no_replace_repair"',
+        '        set fit_retry_bad_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold] [mcp_bad_shell_aspect_ids $shell_ids $fatal_surface_aspect_threshold]]',
+        '        if {[llength $fit_retry_bad_ids] > 0} {',
+        '            eval *createmark elems 1 $fit_retry_bad_ids',
+        '            set before_repair_count [llength $fit_retry_bad_ids]',
+        '            puts "MCP_PT_INFO solid=$target_solid aspect_repair=fit_degrade_final_no_replace count=$before_repair_count"',
+        '            catch {*triangle_clean_up elems 1 "aspect=6.0 height=0.3"}',
+        '            catch {*smooth elems 1 5}',
+        '            set shell_ids [mcp_shells_on_surfaces $all_surfs]',
+        '            set fatal_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $fatal_surface_aspect_threshold]',
+        '            set fit_retry_after_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold] $fatal_aspect_ids]',
+        '            puts "MCP_PT_INFO solid=$target_solid aspect_repair_after before=$before_repair_count after=[llength $fit_retry_after_ids] threshold=$surface_aspect_threshold"',
+        '            set repair_path_label "${repair_path_label}_fit_no_replace"',
+        '        }',
+        '        set shell_ids [mcp_shells_on_surfaces $all_surfs]',
+        '        set shell_count [llength $shell_ids]',
+        '        eval *createmark elems 2 $shell_ids',
+        '        set post_shell_bb [hm_getboundingbox elems 2 0 0 0]',
+        '        set post_repair_fit_max_diff 0.0',
+        '        set post_repair_fit_max_index -1',
+        '        for {set i 0} {$i < 6} {incr i} {',
+        '            set fit_diff [expr {abs([lindex $post_shell_bb $i] - [lindex $solid_bb $i])}]',
+        '            if {$fit_diff > $post_repair_fit_max_diff} {set post_repair_fit_max_diff $fit_diff; set post_repair_fit_max_index $i}',
+        '        }',
+        '        set repair_fit_ratio [expr {$post_repair_fit_max_diff / max($pre_repair_fit_max_diff, 1.0e-9)}]',
+        '        puts "MCP_PT_INFO solid=$target_solid surface_fit_after_final_no_replace_repair max_diff=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol max_index=$post_repair_fit_max_index before_max_diff=$pre_repair_fit_max_diff ratio=$repair_fit_ratio attempt=$at"',
+        '        if {$post_repair_fit_max_diff > $pre_repair_fit_tol && $repair_fit_ratio >= $repair_fit_degrade_ratio} {',
+        '            set surface_fit_degraded_keep_surface 1',
+        '            set surface_fit_degraded_before $pre_repair_fit_max_diff',
+        '            set surface_fit_degraded_after $post_repair_fit_max_diff',
+        '            set surface_fit_degraded_tol $pre_repair_fit_tol',
+        '            set surface_fit_degraded_ratio $repair_fit_ratio',
+        '        } else {',
+        '            puts "MCP_PT_INFO solid=$target_solid surface_fit_degrade_recovered_after_final_no_replace before=$pre_repair_fit_max_diff after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio attempt=$at"',
+        '        }',
+        '    }',
+        '    set fatal_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $fatal_surface_aspect_threshold]',
+        '    set extreme_surface_aspect_count [llength $fatal_aspect_ids]',
+        '    set bad_aspect_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold] $fatal_aspect_ids]',
+        '    set normal_aspect_bad_count [llength $bad_aspect_ids]',
+        '    set unfixed_aspect_report [expr {$normal_aspect_bad_count + $extreme_surface_aspect_count}]',
+        '    puts "MCP_PT_INFO solid=$target_solid repaired_surface_mesh_ready shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report normal_aspect_bad=$normal_aspect_bad_count extreme_aspect_over_100=$extreme_surface_aspect_count extreme_threshold=$fatal_surface_aspect_threshold"',
         '    puts "MCP_CONSOLE solid=$target_solid stage=2d_result initial_bad=$initial_aspect_bad_count final_bad=$unfixed_aspect_report repair_path=$repair_path_label shell_count=$shell_count"',
         '    if {$unfixed_aspect_report > 0} {',
         '        puts "MCP_PT_WARN solid=$target_solid aspect_unfixed=$unfixed_aspect_report continue_to_tetmesh_keep_surface_mesh=1"',
         '    }',
-        '    if {$shell_count > $crash_guard_shell_limit && $unfixed_aspect_report > 0} {',
+        '    if {$surface_fit_degraded_keep_surface} {',
+        '        puts "MCP_PT_STOP solid=$target_solid surface_fit_degraded_after_repair before=$surface_fit_degraded_before after=$surface_fit_degraded_after fit_tol=$surface_fit_degraded_tol ratio=$surface_fit_degraded_ratio limit=$repair_fit_degrade_ratio action=keep_surface_no_tetra shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report keep_repaired_surface_mesh=1"',
+        '        puts "MCP_CONSOLE solid=$target_solid stage=3d_skip reason=surface_fit_degraded shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report fit_before=$surface_fit_degraded_before fit_after=$surface_fit_degraded_after fit_tol=$surface_fit_degraded_tol fit_ratio=$surface_fit_degraded_ratio"',
+        '        set kept_surface_shell_count $shell_count',
+        '        set ok 0',
+        '        break',
+        '    }',
+        '    if {$shell_count > $crash_guard_shell_limit} {',
         '        puts "MCP_PT_STOP solid=$target_solid crash_guard_skip_tetmesh shell_count=$shell_count limit=$crash_guard_shell_limit unfixed_aspect=$unfixed_aspect_report keep_repaired_surface_mesh=1"',
         '        puts "MCP_CONSOLE solid=$target_solid stage=3d_skip reason=crash_guard shell_count=$shell_count limit=$crash_guard_shell_limit unfixed_aspect=$unfixed_aspect_report"',
+        '        set kept_surface_shell_count $shell_count',
+        '        set ok 0',
+        '        break',
+        '    }',
+        '    if {$extreme_surface_aspect_count > 0} {',
+        '        puts "MCP_PT_STOP solid=$target_solid extreme_aspect_skip_tetmesh shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report extreme_aspect=$extreme_surface_aspect_count threshold=$fatal_surface_aspect_threshold keep_repaired_surface_mesh=1"',
+        '        puts "MCP_CONSOLE solid=$target_solid stage=3d_skip reason=extreme_aspect shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report extreme_aspect=$extreme_surface_aspect_count threshold=$fatal_surface_aspect_threshold"',
         '        set kept_surface_shell_count $shell_count',
         '        set ok 0',
         '        break',
@@ -2428,7 +2562,7 @@ def generate_plain_tetra_tcl(
         '    set before_tetmesh_elems [mcp_all_elems]',
         '    puts "MCP_CONSOLE solid=$target_solid stage=3d_start shell_count=$shell_count target_vol_skew=$target_vol_skew"',
         '    *freesimulation',
-        '    *createstringarray 2 "pars: upd_shell fix_comp_bdr vol_skew=\'0.700000,0.800000,0.600000,1.000000,0.860000,0.990000\'" "tet: 67 1.3 -1 0 0.8 -1 -1"',
+        '    *createstringarray 2 "pars: upd_shell=0 fix_comp_bdr vol_skew=\'0.700000,0.800000,0.600000,1.000000,0.860000,0.990000\'" "tet: 67 1.3 -1 0 0.8 -1 -1"',
         '    *createmark components 2 "$target_component"',
         '    if {[hm_marklength components 2] == 0} {',
         '        puts "MCP_PT_WARN solid=$target_solid tetmesh_failed=no_component_mark component=$target_component"',
@@ -2492,9 +2626,18 @@ def generate_plain_tetra_tcl(
         '    }',
         '    if {$unrepaired_vol_skew_report > 0} {',
         '        puts "MCP_PT_FAIL solid=$target_solid unrepaired_vol_skew_over_$repair_vol_skew=$unrepaired_vol_skew_report delete_tetra_keep_surface_shells=1"',
+        '        puts "MCP_PT_INFO solid=$target_solid rollback_keep_surface_mesh=1 shell_count=$shell_count"',
         '        set final_bad_solid $target_solid',
         '        set final_bad_vol_count $unrepaired_vol_skew_report',
         '        mcp_delete_elems [mcp_tetra_ids_in_component $target_component]',
+        '        set rollback_shell_ids [mcp_shells_on_surfaces $all_surfs]',
+        '        set rollback_extreme_ids [mcp_bad_shell_aspect_ids $rollback_shell_ids $fatal_surface_aspect_threshold]',
+        '        set rollback_normal_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $rollback_shell_ids $surface_aspect_threshold] $rollback_extreme_ids]',
+        '        set shell_count [llength $rollback_shell_ids]',
+        '        set extreme_surface_aspect_count [llength $rollback_extreme_ids]',
+        '        set normal_aspect_bad_count [llength $rollback_normal_ids]',
+        '        set unfixed_aspect_report [expr {$normal_aspect_bad_count + $extreme_surface_aspect_count}]',
+        '        puts "MCP_PT_INFO solid=$target_solid rollback_surface_quality shell_count=$shell_count normal_aspect_bad=$normal_aspect_bad_count extreme_aspect_over_100=$extreme_surface_aspect_count total_aspect_bad=$unfixed_aspect_report extreme_threshold=$fatal_surface_aspect_threshold"',
         '        set ok 0',
         '        break',
         '    }',
@@ -2517,7 +2660,7 @@ def generate_plain_tetra_tcl(
         '}',
         'if {!$ok && $final_bad_vol_count > 0} { puts "MCP_PT_QUALITY_FAIL solid=$final_bad_solid bad_volume_elements=$final_bad_vol_count kept_surface_shells=1" }',
         'if {!$ok && $final_bad_vol_count == 0} { puts "MCP_PT_FAIL solid=$target_solid no_accepted_tetra_after_retries kept_surface_shells=$kept_surface_shell_count" }',
-        'puts "MCP_PT_DONE solid=$target_solid ok=$ok total=$final_count tet4=$t4 tet10=$t10 unfixed_aspect=$unfixed_aspect_report tetmesh_generation_vol_skew_target=$target_vol_skew unrepaired_vol_skew_over_$repair_vol_skew=$unrepaired_vol_skew_report"',
+        'puts "MCP_PT_DONE solid=$target_solid ok=$ok total=$final_count tet4=$t4 tet10=$t10 unfixed_aspect=$unfixed_aspect_report extreme_aspect_over_100=$extreme_surface_aspect_count tetmesh_generation_vol_skew_target=$target_vol_skew unrepaired_vol_skew_over_$repair_vol_skew=$unrepaired_vol_skew_report"',
         'puts "MCP_CONSOLE solid=$target_solid stage=3d_result ok=$ok tet4=$t4 tet10=$t10 unfixed_aspect=$unfixed_aspect_report bad_vol=$unrepaired_vol_skew_report"',
     ]
     if output_hm_path:
@@ -3896,6 +4039,36 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
         lines.append(f"最终模型：{output_hm_path}")
     lines.append("")
 
+    initial_extreme_aspect_total = int(repair_agg.get("surface_aspect_over_100_initial_count") or 0)
+    extreme_aspect_total = int(repair_agg.get("surface_aspect_over_100_count") or 0)
+    if initial_extreme_aspect_total > 0 or extreme_aspect_total > 0:
+        extreme_aspect_solids = {
+            sid: info for sid, info in repair_by_solid.items()
+            if int(info.get("surface_aspect_over_100_initial_count") or 0) > 0
+            or int(info.get("surface_aspect_over_100_count") or 0) > 0
+        }
+        lines.append("!!! 严重 2D Aspect 警告 !!!")
+        lines.append("-" * 28)
+        lines.append(
+            f"检测到 aspect > {TETRA_FATAL_SURFACE_ASPECT:g} 的 2D 面单元；这些极端单元未参与自动 2D 修复，"
+            "其余普通不合格 2D 单元已继续按原流程修复。"
+        )
+        lines.append(
+            f"涉及实体数量：{_mcp_fmt_int(len(extreme_aspect_solids))}；"
+            f"初始极端面单元数量：{_mcp_fmt_int(initial_extreme_aspect_total)}；"
+            f"当前保留极端面单元数量：{_mcp_fmt_int(extreme_aspect_total)}"
+        )
+        for sid in sorted(extreme_aspect_solids, key=lambda value: int(value)):
+            info = extreme_aspect_solids[sid]
+            lines.append(
+                f"  - solid {sid}: 初始 aspect>{TETRA_FATAL_SURFACE_ASPECT:g}="
+                f"{_mcp_fmt_int(info.get('surface_aspect_over_100_initial_count', 0))}, "
+                f"当前 aspect>{TETRA_FATAL_SURFACE_ASPECT:g}="
+                f"{_mcp_fmt_int(info.get('surface_aspect_over_100_count', 0))}, "
+                f"阈值={info.get('surface_aspect_over_100_threshold', TETRA_FATAL_SURFACE_ASPECT)}"
+            )
+        lines.append("")
+
     lines.append("一、模型识别和分类")
     lines.append("-" * 28)
     lines.append(f"检测到的实体数量：{_mcp_fmt_int(total_solids)}")
@@ -4017,17 +4190,25 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
 
     lines.append("六、2D 面网格修复统计")
     lines.append("-" * 28)
-    lines.append(f"初始 aspect 不合格三角形数量：{_mcp_fmt_int(repair_agg.get('initial_bad', 0))}")
+    lines.append(f"初始普通 aspect 不合格三角形数量（10 < aspect <= {TETRA_FATAL_SURFACE_ASPECT:g}）：{_mcp_fmt_int(repair_agg.get('initial_bad', 0))}")
     lines.append(f"triangle_cleanup 修复数量：{_mcp_fmt_int(repair_agg.get('triangle_cleanup_repaired', 0))}")
     lines.append(f"smooth_5 修复数量：{_mcp_fmt_int(repair_agg.get('smooth_5_repaired', 0))}")
     lines.append(f"local_remesh 修复数量：{_mcp_fmt_int(repair_agg.get('local_remesh_repaired', 0))}")
     lines.append(f"replace_nodes 修复数量：{_mcp_fmt_int(repair_agg.get('replace_nodes_repaired', 0))}")
+    lines.append(f"额外 replace_nodes 修复数量：{_mcp_fmt_int(repair_agg.get('replace_nodes_extra_repaired', 0))}")
+    lines.append(
+        "贴合度下降后的保守修复数量（不含 replace_nodes）："
+        f"{_mcp_fmt_int(repair_agg.get('fit_degrade_final_no_replace_repaired', 0))}"
+    )
     lines.append(f"replace_nodes 实际执行次数：{_mcp_fmt_int(repair_agg.get('replace_nodes_changed', 0))}")
+    lines.append(f"额外 replace_nodes 实际执行次数：{_mcp_fmt_int(repair_agg.get('replace_nodes_extra_changed', 0))}")
     lines.append(f"replace_nodes 快速通道触发实体数量：{_mcp_fmt_int(repair_agg.get('replace_nodes_fast_path_count', 0))}")
     lines.append(f"replace_nodes 快速通道识别 sliver 数量：{_mcp_fmt_int(repair_agg.get('replace_nodes_fast_path_sliver_count', 0))}")
     lines.append(f"智能跳过低收益修复步骤次数：{_mcp_fmt_int(repair_agg.get('smart_repair_skip_count', 0))}")
     lines.append(f"local_remesh 新生成 shell 数量：{_mcp_fmt_int(repair_agg.get('local_remesh_new_shells', 0))}")
-    lines.append(f"最终剩余 aspect 不合格三角形数量：{_mcp_fmt_int(repair_agg.get('final_bad', 0))}")
+    lines.append(f"初始 aspect > {TETRA_FATAL_SURFACE_ASPECT:g} 面单元数量：{_mcp_fmt_int(repair_agg.get('surface_aspect_over_100_initial_count', 0))}")
+    lines.append(f"当前保留 aspect > {TETRA_FATAL_SURFACE_ASPECT:g} 面单元数量：{_mcp_fmt_int(repair_agg.get('surface_aspect_over_100_count', 0))}")
+    lines.append(f"最终剩余 aspect 不合格三角形总数（aspect > 10）：{_mcp_fmt_int(repair_agg.get('final_bad', 0))}")
     lines.append("")
 
     lines.append("七、3D 体网格修复统计")
@@ -4039,9 +4220,17 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     lines.append(f"smooth_15 修复数量：{_mcp_fmt_int(repair_agg.get('vol_skew_smooth_15_repaired', 0))}")
     lines.append(f"最终剩余 vol skew 不合格体单元数量：{_mcp_fmt_int(repair_agg.get('vol_skew_final_bad', 0))}")
     lines.append(f"因 3D 质量失败退回面网格的实体数量：{_mcp_fmt_int(repair_agg.get('tetra_deleted_keep_surface_shells_count', 0))}")
+    lines.append(
+        "退回时记录保留 2D 面网格的实体数量："
+        f"{_mcp_fmt_int(repair_agg.get('rollback_kept_surface_mesh_count', 0))}"
+    )
     lines.append(f"退回前仍不合格体单元数量：{_mcp_fmt_int(repair_agg.get('bad_volume_elements_when_rolled_back', 0))}")
     lines.append(f"因防崩保护跳过 tetra 并保留 2D 面网格的实体数量：{_mcp_fmt_int(repair_agg.get('crash_guard_keep_surface_mesh_count', 0))}")
     lines.append(f"防崩保护触发时剩余 2D aspect 不合格单元数量：{_mcp_fmt_int(repair_agg.get('crash_guard_unfixed_aspect_count', 0))}")
+    lines.append(f"因极端 2D aspect 跳过 tetra 并保留 2D 面网格的实体数量：{_mcp_fmt_int(repair_agg.get('extreme_aspect_keep_surface_mesh_count', 0))}")
+    lines.append(f"极端 2D aspect 触发时剩余 2D aspect 不合格单元数量：{_mcp_fmt_int(repair_agg.get('extreme_aspect_unfixed_aspect_count', 0))}")
+    lines.append(f"因 2D 修复后贴合度下降跳过 tetra 的实体数量：{_mcp_fmt_int(repair_agg.get('surface_fit_degraded_keep_surface_mesh_count', 0))}")
+    lines.append(f"贴合度下降触发时剩余 2D aspect 不合格单元数量：{_mcp_fmt_int(repair_agg.get('surface_fit_degraded_unfixed_aspect_count', 0))}")
     lines.append("")
 
     lines.append("八、按实体修复过程")
@@ -4051,6 +4240,9 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
         if (
             int(info.get("initial_bad") or 0) > 0
             or int(info.get("final_bad") or 0) > 0
+            or int(info.get("surface_aspect_over_100_initial_count") or 0) > 0
+            or int(info.get("surface_aspect_over_100_count") or 0) > 0
+            or int(info.get("surface_fit_degraded_keep_surface_mesh") or 0) > 0
             or int(info.get("vol_skew_initial_bad") or 0) > 0
             or int(info.get("vol_skew_final_bad") or 0) > 0
         )
@@ -4061,14 +4253,25 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
         for sid in sorted(active_repairs, key=lambda value: int(value)):
             info = active_repairs[sid]
             lines.append(
-                f"solid {sid}: 初始不合格={_mcp_fmt_int(info.get('initial_bad', 0))}, "
-                f"最终不合格={_mcp_fmt_int(info.get('final_bad', 0))}"
+                f"solid {sid}: 初始普通不合格={_mcp_fmt_int(info.get('initial_bad', 0))}, "
+                f"最终不合格总数={_mcp_fmt_int(info.get('final_bad', 0))}"
             )
+            if int(info.get("surface_aspect_over_100_initial_count") or 0) > 0 or int(info.get("surface_aspect_over_100_count") or 0) > 0:
+                lines.append(
+                    "  - 严重 2D aspect 警告："
+                    f"初始 aspect>{TETRA_FATAL_SURFACE_ASPECT:g}="
+                    f"{_mcp_fmt_int(info.get('surface_aspect_over_100_initial_count', 0))}，"
+                    f"当前 aspect>{TETRA_FATAL_SURFACE_ASPECT:g}="
+                    f"{_mcp_fmt_int(info.get('surface_aspect_over_100_count', 0))}；"
+                    "这些单元未作为自动修复目标。"
+                )
             for step, label in (
                 ("triangle_cleanup", "triangle_cleanup"),
                 ("smooth_5", "smooth_5"),
                 ("local_remesh", "local_remesh"),
                 ("replace_nodes", "replace_nodes"),
+                ("replace_nodes_extra", "replace_nodes_extra"),
+                ("fit_degrade_final_no_replace", "fit_degrade_final_no_replace"),
             ):
                 value = info.get(step)
                 if isinstance(value, dict):
@@ -4079,6 +4282,8 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     )
             if info.get("replace_nodes_changed") is not None:
                 lines.append(f"  - replace_nodes_changed={_mcp_fmt_int(info.get('replace_nodes_changed'))}")
+            if info.get("replace_nodes_extra_changed") is not None:
+                lines.append(f"  - replace_nodes_extra_changed={_mcp_fmt_int(info.get('replace_nodes_extra_changed'))}")
             if isinstance(info.get("replace_nodes_fast_path"), dict):
                 value = info.get("replace_nodes_fast_path")
                 lines.append(
@@ -4110,6 +4315,11 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                         )
             if int(info.get("tetra_deleted_keep_surface_shells") or 0) > 0:
                 lines.append("  - 结果：3D 质量修复后仍有不合格体单元，已删除 tetra 体网格并保留 2D 面网格。")
+                if int(info.get("rollback_kept_surface_mesh") or 0) > 0:
+                    lines.append(
+                        "  - 回退保留：已删除 tetra，并保留当前 2D 面网格，shell_count="
+                        f"{_mcp_fmt_int(info.get('rollback_surface_shell_count', info.get('pre_tetra_surface_shell_count', 0)))}"
+                    )
                 if info.get("bad_volume_elements_when_rolled_back") is not None:
                     lines.append(
                         "  - 退回前仍不合格体单元数量="
@@ -4122,6 +4332,32 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                 lines.append(
                     f"  - 防崩保护：shell_count={_mcp_fmt_int(info.get('crash_guard_shell_count', 0))}, "
                     f"limit={_mcp_fmt_int(info.get('crash_guard_limit', 0))}, "
+                    f"剩余 aspect 不合格={_mcp_fmt_int(info.get('final_bad', 0))}, "
+                    f"其中极端 aspect>{TETRA_FATAL_SURFACE_ASPECT:g}="
+                    f"{_mcp_fmt_int(info.get('surface_aspect_over_100_count', 0))}"
+                )
+            if int(info.get("extreme_aspect_keep_surface_mesh") or 0) > 0:
+                lines.append(
+                    "  - 结果：修复后仍有极端 2D aspect 单元，未进入 3D tetra，已保留修复后的 2D 面网格。"
+                )
+                lines.append(
+                    f"  - 极端 2D aspect：shell_count={_mcp_fmt_int(info.get('extreme_aspect_shell_count', 0))}, "
+                    f"threshold={info.get('surface_aspect_over_100_threshold', TETRA_FATAL_SURFACE_ASPECT)}, "
+                    f"剩余 aspect 不合格={_mcp_fmt_int(info.get('final_bad', 0))}, "
+                    f"其中极端={_mcp_fmt_int(info.get('surface_aspect_over_100_count', 0))}"
+                )
+            if int(info.get("surface_fit_degraded_keep_surface_mesh") or 0) > 0:
+                lines.append(
+                    "  - 结果：2D 修复后贴合度明显下降，已追加一次不含 replace_nodes 的保守修复；"
+                    "仍不满足贴合度要求，未进入 3D tetra。"
+                )
+                lines.append(
+                    f"  - 贴合度：before={info.get('surface_fit_before', 0)}, "
+                    f"after={info.get('surface_fit_after', 0)}, "
+                    f"tol={info.get('surface_fit_tolerance', 0)}, "
+                    f"ratio={info.get('surface_fit_ratio', 0)}, "
+                    f"limit={info.get('surface_fit_ratio_limit', 0)}, "
+                    f"shell_count={_mcp_fmt_int(info.get('surface_fit_shell_count', 0))}, "
                     f"剩余 aspect 不合格={_mcp_fmt_int(info.get('final_bad', 0))}"
                 )
     lines.append("")

@@ -10,6 +10,8 @@ namespace eval ::hm_mcp_launcher {
     variable python_exe "python"
     variable host "127.0.0.1"
     variable port 47881
+    variable listener_retry_count 10
+    variable last_listener_errors ""
     variable output_path [file normalize [file join $project_dir outputs full_mesh_from_panel.hm]]
     variable auto_listener 1
     variable continue_on_error 1
@@ -120,38 +122,63 @@ proc ::hm_mcp_launcher::ensure_listener {} {
     variable project_dir
     variable python_exe
     variable port
+    variable listener_retry_count
+    variable last_listener_errors
 
     set old_pwd [pwd]
-    set pycode [format {import hypermesh_mcp_server as hm; print(hm.create_gui_listener_tcl(port=%d)['script_path'])} $port]
-    if {[catch {
-        cd $project_dir
-        set output [exec $python_exe -c $pycode]
-    } err opts]} {
-        catch {cd $old_pwd}
-        return -options $opts $err
-    }
-    catch {cd $old_pwd}
+    set base_port $port
+    set last_listener_errors ""
+    set tried {}
 
-    set listener_path [last_nonempty_line $output]
-    if {$listener_path eq ""} {
-        error "Python 没有返回 listener Tcl 路径。"
+    for {set offset 0} {$offset < $listener_retry_count} {incr offset} {
+        set candidate [expr {$base_port + $offset}]
+        if {[lsearch -exact $tried $candidate] >= 0} {
+            continue
+        }
+        lappend tried $candidate
+        set pycode [format {import hypermesh_mcp_server as hm; print(hm.create_gui_listener_tcl(port=%d)['script_path'])} $candidate]
+        if {[catch {
+            cd $project_dir
+            set output [exec $python_exe -c $pycode]
+        } err opts]} {
+            append last_listener_errors "port=$candidate: create listener Tcl failed: $err\n"
+            continue
+        }
+
+        set listener_path [last_nonempty_line $output]
+        if {$listener_path eq ""} {
+            append last_listener_errors "port=$candidate: Python 没有返回 listener Tcl 路径。\n"
+            continue
+        }
+        set listener_path [file normalize $listener_path]
+        if {![file exists $listener_path]} {
+            append last_listener_errors "port=$candidate: listener Tcl 不存在：$listener_path\n"
+            continue
+        }
+        if {[catch {source $listener_path} source_err source_opts]} {
+            append last_listener_errors "port=$candidate: source listener failed: $source_err\n"
+            continue
+        }
+        catch {cd $old_pwd}
+        set port $candidate
+        return $listener_path
     }
-    set listener_path [file normalize $listener_path]
-    if {![file exists $listener_path]} {
-        error "listener Tcl 不存在：$listener_path"
-    }
-    source $listener_path
-    return $listener_path
+
+    catch {cd $old_pwd}
+    error "所有自动连接端口都失败，已尝试：$tried\n$last_listener_errors"
 }
 
 proc ::hm_mcp_launcher::manual_connection_help_text {} {
     variable project_dir
     variable port
+    variable listener_retry_count
+    variable last_listener_errors
+    set backup_port [expr {$port + $listener_retry_count}]
     set panel_path [file normalize [info script]]
     set ps_dir [file nativename $project_dir]
     set panel_tcl [string map {"\\" "/"} $panel_path]
-    set py_cmd [format {python -c "import hypermesh_mcp_server as hm; print(hm.create_gui_listener_tcl(port=%d)['script_path'])"} $port]
-    return "\n手动建立连接方法：\n1. 在 PowerShell 中运行：\n   cd \"$ps_dir\"\n   $py_cmd\n\n2. 复制 PowerShell 输出的 Tcl 文件路径。\n\n3. 在 HyperMesh 的 Tcl 命令窗口中运行，注意把路径替换成上一步实际输出的路径：\n   source \"E:/mcp/hypermesh-mcp-server/runs/hypermesh_mcp_xxxxxx.tcl\"\n\n4. 如果只是重新打开本面板，也可以在 HyperMesh 中运行：\n   source \"$panel_tcl\"\n\n5. 连接成功后，回到本面板取消勾选“开始前自动建立/刷新 HyperMesh 连接”，再点击“开始划分”。\n"
+    set py_cmd [format {python -c "import hypermesh_mcp_server as hm; print(hm.create_gui_listener_tcl(port=%d)['script_path'])"} $backup_port]
+    return "\n手动建立连接方法：\n\n自动连接已经尝试从当前端口开始的一组备用端口。如果仍失败，建议不要继续使用当前端口 $port，先换新的备用端口 $backup_port。\n\n1. 在 PowerShell 中运行：\n   cd \"$ps_dir\"\n   $py_cmd\n\n2. 复制 PowerShell 输出的 Tcl 文件路径。\n\n3. 在 HyperMesh 的 Tcl 命令窗口中运行，注意把路径替换成上一步实际输出的路径：\n   source \"E:/mcp/hypermesh-mcp-server/runs/hypermesh_mcp_xxxxxx.tcl\"\n\n4. 告诉本面板后续使用同一个备用端口，在 HyperMesh Tcl 命令窗口中运行：\n   set ::hm_mcp_launcher::port $backup_port\n\n5. 如果只是重新打开本面板，也可以在 HyperMesh 中运行：\n   source \"$panel_tcl\"\n\n6. 连接成功后，回到本面板取消勾选“开始前自动建立/刷新 HyperMesh 连接”，再点击“开始划分”。\n\n自动连接失败详情：\n$last_listener_errors\n"
 }
 
 proc ::hm_mcp_launcher::make_stamp {} {
@@ -354,6 +381,7 @@ proc ::hm_mcp_launcher::poll_log {} {
 proc ::hm_mcp_launcher::start_workflow {} {
     variable project_dir
     variable auto_listener
+    variable port
     variable current_pid
     variable current_log
     variable current_stamp
@@ -383,7 +411,7 @@ proc ::hm_mcp_launcher::start_workflow {} {
             append_log [manual_connection_help_text]
             return
         }
-        append_log "连接成功：$listener_path\n"
+        append_log "连接成功：$listener_path\n当前端口：$port\n"
     }
 
     set cmd [build_command]
@@ -573,7 +601,7 @@ proc ::hm_mcp_launcher::build_ui {} {
             ::hm_mcp_launcher::append_log [::hm_mcp_launcher::manual_connection_help_text]
         } else {
             ::hm_mcp_launcher::set_status "连接成功"
-            ::hm_mcp_launcher::append_log "连接成功：$p\n"
+            ::hm_mcp_launcher::append_log "连接成功：$p\n当前端口：$::hm_mcp_launcher::port\n"
         }
     }
     ttk::button $w.root.actions.run -text "开始划分" -style HM.TButton -command ::hm_mcp_launcher::start_workflow

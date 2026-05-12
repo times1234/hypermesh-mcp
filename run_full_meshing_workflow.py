@@ -244,6 +244,22 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
                 repair.setdefault(sid, {})["bad_volume_elements_when_rolled_back"] = int(match.group(2))
                 continue
 
+            match = re.search(
+                r"MCP_PT_STOP solid=(\d+) crash_guard_skip_tetmesh shell_count=(\d+) "
+                r"limit=(\d+) unfixed_aspect=(\d+) keep_repaired_surface_mesh=1",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["crash_guard_keep_surface_mesh"] = 1
+                repair.setdefault(sid, {})["crash_guard_shell_count"] = int(match.group(2))
+                repair.setdefault(sid, {})["crash_guard_limit"] = int(match.group(3))
+                repair.setdefault(sid, {})["final_bad"] = int(match.group(4))
+                repair.setdefault(sid, {})["vol_skew_initial_bad"] = 0
+                repair.setdefault(sid, {})["vol_skew_final_bad"] = 0
+                repair.setdefault(sid, {})["tetra_not_attempted_reason"] = "crash_guard_skip_tetmesh"
+                continue
+
             match = re.search(r"MCP_PT_INFO solid=(\d+) aspect_bad_local=(\d+)", line)
             if match:
                 sid, bad = match.group(1), int(match.group(2))
@@ -341,6 +357,8 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "vol_skew_smooth_15_repaired": 0,
         "tetra_deleted_keep_surface_shells_count": 0,
         "bad_volume_elements_when_rolled_back": 0,
+        "crash_guard_keep_surface_mesh_count": 0,
+        "crash_guard_unfixed_aspect_count": 0,
     }
     for item in repair.values():
         aggregate["initial_bad"] += int(item.get("initial_bad") or 0)
@@ -351,6 +369,9 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         aggregate["vol_skew_final_bad"] += int(item.get("vol_skew_final_bad") or 0)
         aggregate["tetra_deleted_keep_surface_shells_count"] += int(item.get("tetra_deleted_keep_surface_shells") or 0)
         aggregate["bad_volume_elements_when_rolled_back"] += int(item.get("bad_volume_elements_when_rolled_back") or 0)
+        aggregate["crash_guard_keep_surface_mesh_count"] += int(item.get("crash_guard_keep_surface_mesh") or 0)
+        if int(item.get("crash_guard_keep_surface_mesh") or 0) > 0:
+            aggregate["crash_guard_unfixed_aspect_count"] += int(item.get("final_bad") or 0)
         for step in ("triangle_cleanup", "smooth_5", "local_remesh", "replace_nodes"):
             value = item.get(step)
             if isinstance(value, dict):
@@ -543,6 +564,12 @@ def _isolate_rolled_back_solids(
                 f"3D 修复后不合格单元数量：{int(info.get('vol_skew_final_bad') or 0)}",
             ]
         )
+        if int(info.get("crash_guard_keep_surface_mesh") or 0) > 0:
+            message_lines.append(
+                "3D 状态：未进入 tetra，shell 数量 "
+                f"{int(info.get('crash_guard_shell_count') or 0)} 超过防崩阈值 "
+                f"{int(info.get('crash_guard_limit') or 0)}，已保留修复后的 2D 面网格。"
+            )
     message = "\n".join(message_lines)
     message_tcl = _tcl_braced(message)
     script = f"""
@@ -825,40 +852,61 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "tetra_tet4_total": repair_summary["tetra_tet4_total"],
     }
     rollback_count = int(repair_summary["repair_aggregate"].get("tetra_deleted_keep_surface_shells_count") or 0)
+    crash_guard_count = int(repair_summary["repair_aggregate"].get("crash_guard_keep_surface_mesh_count") or 0)
     rolled_back_solids: list[dict[str, Any]] = []
+    solid_name_by_id = {
+        str(sid): name
+        for batch in plan_batches
+        for sid, name in (batch.get("solid_names") or {}).items()
+    }
+    for sid, info in sorted(repair_summary["repair_by_solid"].items(), key=lambda pair: int(pair[0])):
+        if int(info.get("tetra_deleted_keep_surface_shells") or 0) > 0 or int(info.get("crash_guard_keep_surface_mesh") or 0) > 0:
+            rolled_back_solids.append(
+                {
+                    "solid_id": int(sid),
+                    "component_name": solid_name_by_id.get(str(sid), ""),
+                    "bad_volume_elements": int(info.get("bad_volume_elements_when_rolled_back") or 0),
+                    "crash_guard": int(info.get("crash_guard_keep_surface_mesh") or 0),
+                    "crash_guard_shell_count": int(info.get("crash_guard_shell_count") or 0),
+                    "crash_guard_limit": int(info.get("crash_guard_limit") or 0),
+                }
+            )
     if rollback_count:
-        solid_name_by_id = {
-            str(sid): name
-            for batch in plan_batches
-            for sid, name in (batch.get("solid_names") or {}).items()
-        }
-        for sid, info in sorted(repair_summary["repair_by_solid"].items(), key=lambda pair: int(pair[0])):
-            if int(info.get("tetra_deleted_keep_surface_shells") or 0) > 0:
-                rolled_back_solids.append(
-                    {
-                        "solid_id": int(sid),
-                        "component_name": solid_name_by_id.get(str(sid), ""),
-                        "bad_volume_elements": int(info.get("bad_volume_elements_when_rolled_back") or 0),
-                    }
-                )
         rollback_error = {
             "step": "tetra_quality",
             "status": "rolled_back_to_surface_mesh",
             "solid_count": rollback_count,
             "bad_volume_elements": repair_summary["repair_aggregate"].get("bad_volume_elements_when_rolled_back", 0),
-            "solids": rolled_back_solids,
+            "solids": [item for item in rolled_back_solids if not item.get("crash_guard")],
         }
         workflow["errors"].append(rollback_error)
+    if crash_guard_count:
+        guard_error = {
+            "step": "tetra_quality",
+            "status": "crash_guard_keep_surface_mesh",
+            "solid_count": crash_guard_count,
+            "unfixed_aspect": repair_summary["repair_aggregate"].get("crash_guard_unfixed_aspect_count", 0),
+            "solids": [item for item in rolled_back_solids if item.get("crash_guard")],
+        }
+        workflow["errors"].append(guard_error)
+    if rolled_back_solids:
         solid_text = "，".join(
             f"solid {item['solid_id']}({item['component_name'] or '未命名'})"
             for item in rolled_back_solids
         )
-        workflow["warnings"].append(
-            "警告：3D tetra 质量修复后仍有不合格体单元；"
-            f"{rollback_count} 个实体已删除 tetra 体网格并退回为仅保留 2D 面网格。"
-            f"失败实体：{solid_text or '未记录'}。"
-            "详细信息见中文 TXT 报告。"
-        )
+        if crash_guard_count:
+            workflow["warnings"].append(
+                "警告：部分实体触发 tetra 防崩保护，未进入 3D tetra，已保留修复后的 2D 面网格。"
+                f"触发实体：{solid_text or '未记录'}。"
+                "详细信息见中文 TXT 报告。"
+            )
+        elif rollback_count:
+            workflow["warnings"].append(
+                "警告：3D tetra 质量修复后仍有不合格体单元；"
+                f"{rollback_count} 个实体已删除 tetra 体网格并退回为仅保留 2D 面网格。"
+                f"失败实体：{solid_text or '未记录'}。"
+                "详细信息见中文 TXT 报告。"
+            )
 
     workflow["success"] = (
         bool(final_save.get("success"))

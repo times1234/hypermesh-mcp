@@ -234,6 +234,7 @@ TETRA_VERY_COMPLEX_MIN_ELEMENT_SIZE = 0.20
 TETRA_MAX_SHELL_ELEMENTS = 8000
 TETRA_COMPLEX_MAX_SHELL_ELEMENTS = 2500
 TETRA_VERY_COMPLEX_MAX_SHELL_ELEMENTS = 1500
+TETRA_CRASH_GUARD_SHELL_ELEMENTS = 150000
 TETRA_DIRECT_TETMESH_SURFACE_COUNT_LIMIT = 50
 
 # Generated-script boundary markers used by _meshing_rule_violation
@@ -2016,6 +2017,7 @@ def generate_plain_tetra_tcl(
         f"set feat_angle {float(feature_angle)}",
         f"set growth {float(growth_rate)}",
         f"set max_shell_before_tetmesh {int(max_shell_elements_before_tetmesh)}",
+        f"set crash_guard_shell_limit {int(TETRA_CRASH_GUARD_SHELL_ELEMENTS)}",
         f"set allow_tetmesh {1 if allow_tetmesh else 0}",
         f"set allow_surface_mesh {1 if allow_surface_mesh else 0}",
         f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
@@ -2347,6 +2349,12 @@ def generate_plain_tetra_tcl(
         '    set unfixed_aspect_report [llength $bad_aspect_ids]',
         '    if {$unfixed_aspect_report > 0} {',
         '        puts "MCP_PT_WARN solid=$target_solid aspect_unfixed=$unfixed_aspect_report continue_to_tetmesh_keep_surface_mesh=1"',
+        '    }',
+        '    if {$shell_count > $crash_guard_shell_limit && $unfixed_aspect_report > 0} {',
+        '        puts "MCP_PT_STOP solid=$target_solid crash_guard_skip_tetmesh shell_count=$shell_count limit=$crash_guard_shell_limit unfixed_aspect=$unfixed_aspect_report keep_repaired_surface_mesh=1"',
+        '        set kept_surface_shell_count $shell_count',
+        '        set ok 0',
+        '        break',
         '    }',
         '    if {!$allow_tetmesh} {',
         '        puts "MCP_PT_STOP solid=$target_solid shell_count=$shell_count tetmesh_disabled_for_high_risk_geometry keep_surface_mesh=1"',
@@ -3963,6 +3971,8 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     lines.append(f"最终剩余 vol skew 不合格体单元数量：{_mcp_fmt_int(repair_agg.get('vol_skew_final_bad', 0))}")
     lines.append(f"因 3D 质量失败退回面网格的实体数量：{_mcp_fmt_int(repair_agg.get('tetra_deleted_keep_surface_shells_count', 0))}")
     lines.append(f"退回前仍不合格体单元数量：{_mcp_fmt_int(repair_agg.get('bad_volume_elements_when_rolled_back', 0))}")
+    lines.append(f"因防崩保护跳过 tetra 并保留 2D 面网格的实体数量：{_mcp_fmt_int(repair_agg.get('crash_guard_keep_surface_mesh_count', 0))}")
+    lines.append(f"防崩保护触发时剩余 2D aspect 不合格单元数量：{_mcp_fmt_int(repair_agg.get('crash_guard_unfixed_aspect_count', 0))}")
     lines.append("")
 
     lines.append("八、按实体修复过程")
@@ -4025,6 +4035,15 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                         "  - 退回前仍不合格体单元数量="
                         f"{_mcp_fmt_int(info.get('bad_volume_elements_when_rolled_back'))}"
                     )
+            if int(info.get("crash_guard_keep_surface_mesh") or 0) > 0:
+                lines.append(
+                    "  - 结果：触发 tetra 防崩保护，未进入 3D tetra，已保留修复后的 2D 面网格。"
+                )
+                lines.append(
+                    f"  - 防崩保护：shell_count={_mcp_fmt_int(info.get('crash_guard_shell_count', 0))}, "
+                    f"limit={_mcp_fmt_int(info.get('crash_guard_limit', 0))}, "
+                    f"剩余 aspect 不合格={_mcp_fmt_int(info.get('final_bad', 0))}"
+                )
     lines.append("")
 
     lines.append("九、失败和异常记录")
@@ -4038,6 +4057,13 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     "- tetra 质量失败："
                     f"{_mcp_fmt_int(item.get('solid_count', 0))} 个实体已退回到 2D 面网格；"
                     f"退回前不合格体单元数={_mcp_fmt_int(item.get('bad_volume_elements', 0))}"
+                )
+            elif item.get("status") == "crash_guard_keep_surface_mesh":
+                lines.append(
+                    "- tetra 防崩保护："
+                    f"{_mcp_fmt_int(item.get('solid_count', 0))} 个实体未进入 tetra，"
+                    f"已保留修复后的 2D 面网格；剩余 aspect 不合格数="
+                    f"{_mcp_fmt_int(item.get('unfixed_aspect', 0))}"
                 )
             else:
                 lines.append(f"- step={item.get('step', 'unknown')} batch={item.get('batch', '')} status={item.get('status', '')} solids={item.get('solid_ids', '')}")

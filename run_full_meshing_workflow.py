@@ -317,6 +317,46 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
                 continue
 
             match = re.search(
+                r"MCP_PT_INFO solid=(\d+) surface_backup_created shell_count=(\d+) "
+                r"backup_count=(\d+) component=(\S+)",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["surface_backup_shell_count"] = int(match.group(2))
+                repair[sid]["surface_backup_count"] = int(match.group(3))
+                repair[sid]["surface_backup_component"] = match.group(4)
+                continue
+
+            match = re.search(
+                r"MCP_PT_INFO solid=(\d+) surface_backup_restored restored_count=(\d+) "
+                r"expected=(\d+) component=(\S+)",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["surface_backup_restored_count"] = int(match.group(2))
+                repair[sid]["surface_backup_expected_count"] = int(match.group(3))
+                repair[sid]["surface_backup_component"] = match.group(4)
+                continue
+
+            match = re.search(
+                r"MCP_PT_STOP solid=(\d+) surface_backup_failed shell_count=(\d+) "
+                r"backup_count=(\d+) keep_repaired_surface_mesh=1",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["surface_backup_failed_keep_surface_mesh"] = 1
+                repair[sid]["surface_backup_shell_count"] = int(match.group(2))
+                repair[sid]["surface_backup_count"] = int(match.group(3))
+                repair.setdefault(sid, {})["final_bad"] = int(repair.get(sid, {}).get("final_bad") or 0)
+                repair.setdefault(sid, {})["vol_skew_initial_bad"] = 0
+                repair.setdefault(sid, {})["vol_skew_final_bad"] = 0
+                repair.setdefault(sid, {})["tetra_not_attempted_reason"] = "surface_backup_failed"
+                continue
+
+            match = re.search(
                 r"MCP_PT_INFO solid=(\d+) repaired_surface_mesh_ready shell_count=(\d+) "
                 r"final_aspect_bad=(\d+)(?: normal_aspect_bad=(\d+))?"
                 r"(?: (?:extreme_surface_aspect|extreme_aspect_over_100)=(\d+))?",
@@ -517,6 +557,9 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "tetra_deleted_keep_surface_shells_count": 0,
         "bad_volume_elements_when_rolled_back": 0,
         "rollback_kept_surface_mesh_count": 0,
+        "surface_backup_created_count": 0,
+        "surface_backup_restored_count": 0,
+        "surface_backup_failed_keep_surface_mesh_count": 0,
         "crash_guard_keep_surface_mesh_count": 0,
         "crash_guard_unfixed_aspect_count": 0,
         "extreme_aspect_keep_surface_mesh_count": 0,
@@ -554,6 +597,13 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         aggregate["tetra_deleted_keep_surface_shells_count"] += int(item.get("tetra_deleted_keep_surface_shells") or 0)
         aggregate["bad_volume_elements_when_rolled_back"] += int(item.get("bad_volume_elements_when_rolled_back") or 0)
         aggregate["rollback_kept_surface_mesh_count"] += int(item.get("rollback_kept_surface_mesh") or 0)
+        if int(item.get("surface_backup_count") or 0) > 0:
+            aggregate["surface_backup_created_count"] += 1
+        if int(item.get("surface_backup_restored_count") or 0) > 0:
+            aggregate["surface_backup_restored_count"] += 1
+        aggregate["surface_backup_failed_keep_surface_mesh_count"] += int(
+            item.get("surface_backup_failed_keep_surface_mesh") or 0
+        )
         aggregate["crash_guard_keep_surface_mesh_count"] += int(item.get("crash_guard_keep_surface_mesh") or 0)
         if int(item.get("crash_guard_keep_surface_mesh") or 0) > 0:
             aggregate["crash_guard_unfixed_aspect_count"] += int(item.get("final_bad") or 0)
@@ -1162,6 +1212,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     surface_fit_degraded_count = int(
         repair_summary["repair_aggregate"].get("surface_fit_degraded_keep_surface_mesh_count") or 0
     )
+    surface_backup_failed_count = int(
+        repair_summary["repair_aggregate"].get("surface_backup_failed_keep_surface_mesh_count") or 0
+    )
     initial_extreme_aspect_count = int(
         repair_summary["repair_aggregate"].get(
             "extreme_surface_aspect_initial_count",
@@ -1199,6 +1252,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     for sid, info in sorted(repair_summary["repair_by_solid"].items(), key=lambda pair: int(pair[0])):
         if (
             int(info.get("tetra_deleted_keep_surface_shells") or 0) > 0
+            or int(info.get("surface_backup_failed_keep_surface_mesh") or 0) > 0
             or int(info.get("crash_guard_keep_surface_mesh") or 0) > 0
             or int(info.get("extreme_aspect_keep_surface_mesh") or 0) > 0
             or int(info.get("surface_fit_degraded_keep_surface_mesh") or 0) > 0
@@ -1208,6 +1262,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                     "solid_id": int(sid),
                     "component_name": solid_name_by_id.get(str(sid), ""),
                     "bad_volume_elements": int(info.get("bad_volume_elements_when_rolled_back") or 0),
+                    "surface_backup_failed": int(info.get("surface_backup_failed_keep_surface_mesh") or 0),
                     "crash_guard": int(info.get("crash_guard_keep_surface_mesh") or 0),
                     "extreme_aspect_guard": int(info.get("extreme_aspect_keep_surface_mesh") or 0),
                     "surface_fit_degraded": int(info.get("surface_fit_degraded_keep_surface_mesh") or 0),
@@ -1266,6 +1321,14 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             ],
         }
         workflow["errors"].append(fit_error)
+    if surface_backup_failed_count:
+        backup_error = {
+            "step": "tetra_quality",
+            "status": "surface_backup_failed_keep_surface_mesh",
+            "solid_count": surface_backup_failed_count,
+            "solids": [item for item in rolled_back_solids if item.get("surface_backup_failed")],
+        }
+        workflow["errors"].append(backup_error)
     if rolled_back_solids:
         solid_text = "，".join(
             f"solid {item['solid_id']}({item['component_name'] or '未命名'})"

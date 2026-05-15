@@ -20,6 +20,7 @@ namespace eval ::hm_mcp_launcher {
     variable drag_element_size_max 1.5
     variable drag_fit_tolerance_ratio 0.05
     variable drag_retry_count 2
+    variable drag_aspect_guard 1
 
     variable tetra_element_size_min 1.5
     variable tetra_element_size_max 2.0
@@ -31,6 +32,10 @@ namespace eval ::hm_mcp_launcher {
     variable tetra_fit_tolerance_ratio 0.01
     variable tetra_target_vol_skew 0.70
     variable tetra_repair_vol_skew 0.99
+    variable spin_section_element_size_min 0.20
+    variable spin_section_element_size_max 1.50
+    variable spin_density_min 12
+    variable spin_density_max 240
 
     variable probe_timeout 180
     variable phase2_timeout 120
@@ -218,11 +223,19 @@ proc ::hm_mcp_launcher::normalize_mesh_parameters {} {
     variable tetra_element_size_max
     variable tetra_min_element_size_min
     variable tetra_min_element_size_max
+    variable spin_section_element_size_min
+    variable spin_section_element_size_max
+    variable spin_density_min
+    variable spin_density_max
 
     normalize_pair drag_element_size_min drag_element_size_max 0.5 1.5
     normalize_pair tetra_element_size_min tetra_element_size_max 1.5 2.0
     normalize_pair tetra_min_element_size_min tetra_min_element_size_max 0.20 0.50
-    append_log "尺寸限制：drag=$drag_element_size_min..$drag_element_size_max, tetra目标=$tetra_element_size_min..$tetra_element_size_max, tetra最小=$tetra_min_element_size_min..$tetra_min_element_size_max\n"
+    normalize_pair spin_section_element_size_min spin_section_element_size_max 0.20 1.50
+    normalize_pair spin_density_min spin_density_max 12 240
+    set spin_density_min [expr {int(round($spin_density_min))}]
+    set spin_density_max [expr {int(round($spin_density_max))}]
+    append_log "尺寸限制：drag=$drag_element_size_min..$drag_element_size_max, tetra目标=$tetra_element_size_min..$tetra_element_size_max, tetra最小=$tetra_min_element_size_min..$tetra_min_element_size_max, spin截面=$spin_section_element_size_min..$spin_section_element_size_max, spin份数=$spin_density_min..$spin_density_max\n"
 }
 
 proc ::hm_mcp_launcher::build_command {} {
@@ -236,6 +249,7 @@ proc ::hm_mcp_launcher::build_command {} {
     variable drag_element_size_max
     variable drag_fit_tolerance_ratio
     variable drag_retry_count
+    variable drag_aspect_guard
     variable tetra_element_size_min
     variable tetra_element_size_max
     variable tetra_min_element_size_min
@@ -246,6 +260,10 @@ proc ::hm_mcp_launcher::build_command {} {
     variable tetra_fit_tolerance_ratio
     variable tetra_target_vol_skew
     variable tetra_repair_vol_skew
+    variable spin_section_element_size_min
+    variable spin_section_element_size_max
+    variable spin_density_min
+    variable spin_density_max
     variable probe_timeout
     variable phase2_timeout
     variable drag_timeout
@@ -271,6 +289,10 @@ proc ::hm_mcp_launcher::build_command {} {
         --drag-element-size-max $drag_element_size_max \
         --drag-fit-tolerance-ratio $drag_fit_tolerance_ratio \
         --drag-retry-count $drag_retry_count \
+        --spin-section-element-size-min $spin_section_element_size_min \
+        --spin-section-element-size-max $spin_section_element_size_max \
+        --spin-density-min $spin_density_min \
+        --spin-density-max $spin_density_max \
         --tetra-element-size $tetra_element_size_max \
         --tetra-element-size-min $tetra_element_size_min \
         --tetra-element-size-max $tetra_element_size_max \
@@ -287,6 +309,9 @@ proc ::hm_mcp_launcher::build_command {} {
         lappend cmd --continue-on-error
     } else {
         lappend cmd --stop-on-error
+    }
+    if {$drag_aspect_guard} {
+        lappend cmd --drag-aspect-guard
     }
     return $cmd
 }
@@ -566,12 +591,18 @@ proc ::hm_mcp_launcher::build_ui {} {
     add_row $w.root.main.left 6 "tetra目标上限" ::hm_mcp_launcher::tetra_element_size_max "目标尺寸上限"
     add_row $w.root.main.left 7 "tetra最小下限" ::hm_mcp_launcher::tetra_min_element_size_min "最小尺寸下限"
     add_row $w.root.main.left 8 "tetra最小上限" ::hm_mcp_launcher::tetra_min_element_size_max "最小尺寸上限"
+    add_row $w.root.main.left 9 "spin份数下限" ::hm_mcp_launcher::spin_density_min "按半径自动计算后的下限"
+    add_row $w.root.main.left 10 "spin份数上限" ::hm_mcp_launcher::spin_density_max "按半径自动计算后的上限"
     ttk::checkbutton $w.root.main.left.auto -text "开始前自动建立/刷新 HyperMesh 连接" -variable ::hm_mcp_launcher::auto_listener -style HMCheck.TCheckbutton
-    grid $w.root.main.left.auto -row 9 -column 0 -columnspan 3 -sticky w -pady {7 0}
+    add_row $w.root.main.left 11 "spin section size min" ::hm_mcp_launcher::spin_section_element_size_min "spin section 2D size min"
+    add_row $w.root.main.left 12 "spin section size max" ::hm_mcp_launcher::spin_section_element_size_max "spin section 2D size max"
+    grid $w.root.main.left.auto -row 13 -column 0 -columnspan 3 -sticky w -pady {7 0}
 
     ttk::labelframe $w.root.main.right -text "质量和修复参数" -padding 12 -style HMSection.TLabelframe
     grid $w.root.main.right -row 0 -column 1 -sticky nsew -padx {8 0}
     grid columnconfigure $w.root.main.right 1 -weight 1
+    ttk::checkbutton $w.root.main.right.dragaspect -text "drag三层" -variable ::hm_mcp_launcher::drag_aspect_guard -style HMCheck.TCheckbutton
+    grid $w.root.main.right.dragaspect -row 8 -column 0 -columnspan 3 -sticky w -pady {7 0}
     add_row $w.root.main.right 0 "drag 贴合比例" ::hm_mcp_launcher::drag_fit_tolerance_ratio "越小越严格"
     add_row $w.root.main.right 1 "drag 重试次数" ::hm_mcp_launcher::drag_retry_count ""
     add_row $w.root.main.right 2 "tetra 最大偏差" ::hm_mcp_launcher::tetra_max_deviation ""

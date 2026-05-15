@@ -96,15 +96,12 @@ def _build_spin_solids(results: dict[str, dict[str, Any]]) -> list[dict[str, Any
         solids.append(
             {
                 "solid_id": int(item["solid_id"]),
-                "source_surface_id": int(item.get("source_surface_id", 0)),
                 "component_name": str(item["component_name"]),
                 "axis": str(item.get("drag_axis") or item.get("axis") or "z"),
                 "element_size": float(item.get("element_size") or 1.0),
                 "spin_method": str(item.get("spin_method") or "cutsection"),
                 "spin_axis": str(item.get("spin_axis") or item.get("drag_axis") or item.get("axis") or "z"),
                 "spin_axis_point": item.get("spin_axis_point"),
-                "spin_profile_surface_id": int(item.get("spin_profile_surface_id", 0) or 0),
-                "spin_profile_normal_axis": str(item.get("spin_profile_normal_axis") or ""),
                 "spin_split_plane_normal": item.get("spin_split_plane_normal"),
                 "spin_split_plane_point": item.get("spin_split_plane_point"),
             }
@@ -686,27 +683,106 @@ def _parse_drag_actual_parameters(response_text: str) -> dict[str, dict[str, Any
                 "element_size_min": float(match.group(4)),
                 "element_size_max": float(match.group(5)),
             }
+            continue
+        match = re.search(
+            r"MCP_DRAG_RESULT solid=(\d+) ok=(\d+) layers=(\d+) aspect_bad=(\d+) "
+            r"threshold=([0-9.eE+-]+) one_layer_fallback=(\d+)",
+            line,
+        )
+        if match:
+            item = actual.setdefault(match.group(1), {})
+            item.update(
+                {
+                    "ok": int(match.group(2)),
+                    "layers": int(match.group(3)),
+                    "aspect_bad": int(match.group(4)),
+                    "aspect_threshold": float(match.group(5)),
+                    "one_layer_fallback": bool(int(match.group(6))),
+                }
+            )
+            continue
+        match = re.search(
+            r"MCP_DRAG_ONE_LAYER_FALLBACK solid=(\d+) component=(.*?) layers=(\d+) "
+            r"aspect_bad=(\d+) threshold=([0-9.eE+-]+)",
+            line,
+        )
+        if match:
+            item = actual.setdefault(match.group(1), {})
+            item.update(
+                {
+                    "component_name": match.group(2).strip(),
+                    "layers": int(match.group(3)),
+                    "aspect_bad": int(match.group(4)),
+                    "aspect_threshold": float(match.group(5)),
+                    "one_layer_fallback": True,
+                }
+            )
     return actual
+
+
+def _drag_one_layer_fallbacks(
+    drag_solids: list[dict[str, Any]],
+    drag_response: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    actual = _parse_drag_actual_parameters(str((drag_response or {}).get("response", "")))
+    items: list[dict[str, Any]] = []
+    for solid in drag_solids:
+        sid = str(int(solid["solid_id"]))
+        info = actual.get(sid, {})
+        if not info.get("one_layer_fallback"):
+            continue
+        items.append(
+            {
+                "solid_id": int(sid),
+                "component_name": info.get("component_name") or solid.get("component_name", ""),
+                "layers": int(info.get("layers") or 1),
+                "aspect_bad": int(info.get("aspect_bad") or 0),
+                "aspect_threshold": float(info.get("aspect_threshold") or 20.0),
+            }
+        )
+    return items
 
 
 def _parse_spin_results(response_text: str) -> dict[str, dict[str, Any]]:
     actual: dict[str, dict[str, Any]] = {}
     for line in str(response_text or "").splitlines():
         match = re.search(
-            r"MCP_SPIN_RESULT solid=(\d+) ok=(\d+) hex8=(\d+) "
+            r"MCP_SPIN_RESULT solid=(\d+) ok=(\d+) (?:total3d=(\d+) )?hex8=(\d+) "
             r"source_shells=(\d+)(?: source_quads=(\d+))? "
             r"source_surface=(-?\d+) fallback_tetra=(\d+)",
             line,
         )
         if match:
-            actual[match.group(1)] = {
+            item = {
                 "ok": int(match.group(2)),
-                "hex8": int(match.group(3)),
-                "source_shells": int(match.group(4)),
-                "source_quads": int(match.group(5) or 0),
-                "source_surface_id": int(match.group(6)),
-                "fallback_tetra": int(match.group(7)),
+                "total3d": int(match.group(3) or 0),
+                "hex8": int(match.group(4)),
+                "source_shells": int(match.group(5)),
+                "source_quads": int(match.group(6) or 0),
+                "source_surface_id": int(match.group(7)),
+                "fallback_tetra": int(match.group(8)),
             }
+            for key in (
+                "requested_size",
+                "section_size",
+                "section_size_min",
+                "section_size_max",
+                "spin_density",
+                "density_min",
+                "density_max",
+            ):
+                value_match = re.search(rf"{key}=([^\s]+)", line)
+                if not value_match:
+                    continue
+                value = value_match.group(1)
+                if key in {"spin_density", "density_min", "density_max"}:
+                    item[key] = int(float(value))
+                else:
+                    item[key] = float(value)
+            method_match = re.search(r"method=([^\s]+)", line)
+            if method_match:
+                item["method"] = method_match.group(1)
+            actual[match.group(1)] = item
     return actual
 
 
@@ -738,6 +814,8 @@ def _build_part_parameter_report(
     results: dict[str, dict[str, Any]],
     drag_solids: list[dict[str, Any]],
     drag_response: dict[str, Any] | None,
+    spin_solids: list[dict[str, Any]],
+    spin_responses: dict[str, dict[str, Any]],
     plan: dict[str, Any],
     args: argparse.Namespace,
 ) -> list[dict[str, Any]]:
@@ -745,6 +823,7 @@ def _build_part_parameter_report(
     drag_actual = _parse_drag_actual_parameters(str((drag_response or {}).get("response", "")))
     tetra_actual = _parse_tetra_actual_parameters(plan)
     drag_ids = {int(item["solid_id"]) for item in drag_solids}
+    spin_ids = {int(item["solid_id"]) for item in spin_solids}
 
     for solid in drag_solids:
         sid = int(solid["solid_id"])
@@ -762,12 +841,47 @@ def _build_part_parameter_report(
                 "element_size_max": actual.get("element_size_max", args.drag_element_size_max),
                 "fit_tolerance_ratio": args.drag_fit_tolerance_ratio,
                 "retry_count": args.drag_retry_count,
+                "aspect_guard": args.drag_aspect_guard,
+                "aspect_threshold": args.drag_aspect_threshold,
+                "min_layers": args.drag_min_layers,
+                "actual_layers": actual.get("layers"),
+                "aspect_bad": actual.get("aspect_bad"),
+                "one_layer_fallback": actual.get("one_layer_fallback", False),
+            }
+        )
+
+    for solid in spin_solids:
+        sid = int(solid["solid_id"])
+        spin_response = spin_responses.get(str(sid)) or {}
+        response_text = str(spin_response.get("response", "") or spin_response.get("stdout", ""))
+        actual = _parse_spin_results(response_text).get(str(sid), {})
+        items.append(
+            {
+                "solid_id": sid,
+                "component_name": solid.get("component_name", ""),
+                "strategy": "spin_hex",
+                "axis": solid.get("spin_axis") or solid.get("axis", ""),
+                "requested_element_size": actual.get("requested_size", args.spin_element_size),
+                "actual_element_size": actual.get("section_size"),
+                "section_element_size_min": actual.get("section_size_min", args.spin_section_element_size_min),
+                "section_element_size_max": actual.get("section_size_max", args.spin_section_element_size_max),
+                "requested_spin_density_min": args.spin_density_min,
+                "requested_spin_density_max": args.spin_density_max,
+                "actual_spin_density": actual.get("spin_density"),
+                "source_shells": actual.get("source_shells"),
+                "source_quads": actual.get("source_quads"),
+                "source_surface_id": actual.get("source_surface_id"),
+                "hex8": actual.get("hex8"),
+                "total3d": actual.get("total3d"),
+                "fallback_tetra": bool(actual.get("fallback_tetra", False)),
+                "method": actual.get("method", "cutsection"),
+                "retry_count": args.spin_retry_count,
             }
         )
 
     for key, info in sorted(results.items(), key=lambda pair: int(pair[0])):
         sid = int(key)
-        if sid in drag_ids:
+        if sid in drag_ids or sid in spin_ids:
             continue
         strategy = str(info.get("strategy", ""))
         if "tetra" not in strategy:
@@ -1006,6 +1120,37 @@ puts "MCP_ROLLBACK_ISOLATE_DONE solids={solid_ids}"
     )
 
 
+def _show_drag_one_layer_warning_popup(
+    fallback_items: list[dict[str, Any]],
+    *,
+    host: str,
+    port: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    if not fallback_items:
+        return {"success": True, "skipped": True}
+    lines = ["drag 六面体一层兜底提醒", "", "以下实体在 3 层 drag 后 hex aspect 仍超过阈值，已改为 1 层 drag："]
+    for item in fallback_items:
+        lines.append(
+            f"solid {item.get('solid_id')}（{item.get('component_name') or '未命名'}）："
+            f"最终层数={item.get('layers', 1)}，"
+            f"aspect>{item.get('aspect_threshold', 20)} 数量={item.get('aspect_bad', 0)}"
+        )
+    message = "\n".join(lines)
+    script = (
+        f"catch {{tk_messageBox -title \"drag 一层兜底提醒\" -icon warning -type ok "
+        f"-message {_tcl_braced(message)}}}\n"
+        f"puts \"MCP_DRAG_ONE_LAYER_WARNING_POPUP count={len(fallback_items)}\""
+    )
+    return hm.execute_tcl_gui(
+        script,
+        host=host,
+        port=port,
+        timeout_seconds=timeout_seconds,
+        enforce_meshing_rules=False,
+    )
+
+
 def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     stamp = args.stamp or _now_stamp()
     RUNS_DIR.mkdir(exist_ok=True)
@@ -1117,6 +1262,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             element_size_max=args.drag_element_size_max,
             fit_tolerance_ratio=args.drag_fit_tolerance_ratio,
             retry_count=args.drag_retry_count,
+            drag_aspect_guard=args.drag_aspect_guard,
+            drag_aspect_threshold=args.drag_aspect_threshold,
+            drag_min_layers=args.drag_min_layers,
             pause_seconds_after_each_solid=args.drag_pause_seconds,
             checkpoint_every_n_solids=0,
         )
@@ -1141,8 +1289,16 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 "success": drag_response.get("success"),
                 "script_path": str(drag_script_path),
                 "response_path": drag_response_path,
+                "aspect_guard": bool(args.drag_aspect_guard),
+                "aspect_threshold": args.drag_aspect_threshold,
+                "min_layers": args.drag_min_layers,
+                "one_layer_fallback": _drag_one_layer_fallbacks(drag_solids, drag_response),
             }
         )
+        if drag_step["one_layer_fallback"]:
+            workflow["warnings"].append(
+                "警告：部分 drag 六面体实体在至少 3 层且 aspect<20 的策略下仍未通过，已改为 1 层 drag；详见中文报告。"
+            )
         if not drag_response.get("success"):
             workflow["errors"].append({"step": "drag_hex", "response": drag_response})
             if not args.continue_on_error:
@@ -1157,59 +1313,29 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         sid = int(spin_solid["solid_id"])
         try:
             spin_size = float(args.spin_element_size or spin_solid.get("element_size") or args.drag_element_size)
-            spin_method = str(spin_solid.get("spin_method") or "cutsection")
-            if spin_method == "profile_surface":
-                axis_point = spin_solid.get("spin_axis_point")
-                profile_surface_id = int(spin_solid.get("spin_profile_surface_id") or 0)
-                if profile_surface_id <= 0 or not axis_point:
-                    raise RuntimeError(f"Spin solid {sid} is missing profile-surface spin parameters.")
-                spin = hm.generate_guarded_spin_hex_tcl(
-                    source_surface_id=profile_surface_id,
-                    element_size=spin_size,
-                    component_name=str(spin_solid["component_name"]),
-                    axis=str(spin_solid.get("spin_axis") or spin_solid.get("axis") or "z"),
-                    solid_id=sid,
-                    spin_axis_point=list(axis_point),
-                    section_edge_seed_counts=[4, 6, 8],
-                    fit_tolerance_ratio=args.spin_fit_tolerance_ratio,
-                    retry_count=args.spin_retry_count,
-                    angle_degrees=args.spin_angle_degrees,
-                    density=args.spin_density,
-                )
-            elif spin_method == "cutsection":
-                axis_point = spin_solid.get("spin_axis_point")
-                split_normal = spin_solid.get("spin_split_plane_normal")
-                split_point = spin_solid.get("spin_split_plane_point")
-                if not axis_point or not split_normal or not split_point:
-                    raise RuntimeError(f"Spin solid {sid} is missing cut-section spin parameters.")
-                spin = hm.generate_cutsection_spin_hex_tcl(
-                    solid_id=sid,
-                    component_name=str(spin_solid["component_name"]),
-                    split_plane_normal=list(split_normal),
-                    split_plane_point=list(split_point),
-                    spin_axis=str(spin_solid.get("spin_axis") or spin_solid.get("axis") or "z"),
-                    spin_axis_point=list(axis_point),
-                    element_size=spin_size,
-                    density=args.spin_density,
-                    fit_tolerance_ratio=args.spin_fit_tolerance_ratio,
-                    retry_count=args.spin_retry_count,
-                    section_edge_seed_counts=[4, 6, 8],
-                    include_existing_section_surfaces=False,
-                    allow_quad_only_fallback=True,
-                    delete_existing_component_elements=True,
-                )
-            else:
-                spin = hm.generate_guarded_spin_hex_tcl(
-                    source_surface_id=int(spin_solid["source_surface_id"]),
-                    element_size=spin_size,
-                    component_name=str(spin_solid["component_name"]),
-                    axis=str(spin_solid.get("axis") or "z"),
-                    solid_id=sid,
-                    fit_tolerance_ratio=args.spin_fit_tolerance_ratio,
-                    retry_count=args.spin_retry_count,
-                    angle_degrees=args.spin_angle_degrees,
-                    density=args.spin_density,
-                )
+            axis_point = spin_solid.get("spin_axis_point")
+            split_normal = spin_solid.get("spin_split_plane_normal")
+            split_point = spin_solid.get("spin_split_plane_point")
+            if not axis_point or not split_normal or not split_point:
+                raise RuntimeError(f"Spin solid {sid} is missing cut-section spin parameters.")
+            spin = hm.generate_cutsection_spin_hex_tcl(
+                solid_id=sid,
+                component_name=str(spin_solid["component_name"]),
+                split_plane_normal=list(split_normal),
+                split_plane_point=list(split_point),
+                spin_axis=str(spin_solid.get("spin_axis") or spin_solid.get("axis") or "z"),
+                spin_axis_point=list(axis_point),
+                element_size=spin_size,
+                density=args.spin_density_max,
+                density_min=args.spin_density_min,
+                density_max=args.spin_density_max,
+                section_element_size_min=args.spin_section_element_size_min,
+                section_element_size_max=args.spin_section_element_size_max,
+                retry_count=args.spin_retry_count,
+                section_edge_seed_counts=[100, 75],
+                include_existing_section_surfaces=False,
+                delete_existing_component_elements=True,
+            )
             spin_script_path = RUNS_DIR / f"workflow_spin_hex_s{sid}_{stamp}.tcl"
             spin_script_path.write_text(spin["script"], encoding="utf-8")
             start = time.time()
@@ -1226,7 +1352,8 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             parsed = _parse_spin_results(response_text).get(str(sid), {})
             spin_response["parsed_result"] = parsed
             spin_responses[str(sid)] = spin_response
-            if spin_response.get("success") and int(parsed.get("ok") or 0) == 1 and int(parsed.get("hex8") or 0) > 0:
+            spun_3d_count = int(parsed.get("total3d") or parsed.get("hex8") or 0)
+            if spin_response.get("success") and int(parsed.get("ok") or 0) == 1 and spun_3d_count > 0:
                 spin_step["completed"].append({"solid_id": sid, **parsed, "script_path": str(spin_script_path)})
             else:
                 spin_step["fallback_to_tetra"].append({"solid_id": sid, **parsed, "script_path": str(spin_script_path)})
@@ -1344,6 +1471,8 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         results=active_results,
         drag_solids=drag_solids,
         drag_response=drag_response,
+        spin_solids=spin_solids,
+        spin_responses=spin_responses,
         plan=plan,
         args=args,
     )
@@ -1526,6 +1655,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             },
         },
         "drag_count": len(drag_solids),
+        "drag": drag_step,
         "spin": spin_step,
         "tetra": tetra_step,
         "final_save": final_save,
@@ -1537,10 +1667,15 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "drag_element_size_max": args.drag_element_size_max,
             "drag_fit_tolerance_ratio": args.drag_fit_tolerance_ratio,
             "drag_retry_count": args.drag_retry_count,
+            "drag_aspect_guard": args.drag_aspect_guard,
+            "drag_aspect_threshold": args.drag_aspect_threshold,
+            "drag_min_layers": args.drag_min_layers,
             "spin_element_size": args.spin_element_size,
-            "spin_fit_tolerance_ratio": args.spin_fit_tolerance_ratio,
             "spin_retry_count": args.spin_retry_count,
-            "spin_density": args.spin_density,
+            "spin_density_min": args.spin_density_min,
+            "spin_density_max": args.spin_density_max,
+            "spin_section_element_size_min": args.spin_section_element_size_min,
+            "spin_section_element_size_max": args.spin_section_element_size_max,
             "tetra_element_size": args.tetra_element_size,
             "tetra_element_size_min": args.tetra_element_size_min,
             "tetra_element_size_max": args.tetra_element_size_max,
@@ -1576,6 +1711,14 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "success": isolate_result.get("success"),
             "solids": rolled_back_solids,
         }
+    if drag_step.get("one_layer_fallback"):
+        drag_popup = _show_drag_one_layer_warning_popup(
+            drag_step.get("one_layer_fallback", []),
+            host=args.host,
+            port=args.port,
+            timeout_seconds=args.phase2_timeout,
+        )
+        workflow["steps"]["drag_one_layer_warning_popup"] = drag_popup
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_summary_{stamp}.json", workflow)
     _write_json_if_enabled(args.write_json, RUNS_DIR / "workflow_latest_summary.json", workflow)
     _log(f"Chinese report: {report.get('report_path')}")
@@ -1604,12 +1747,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--drag-fit-tolerance-ratio", type=float, default=0.05)
     parser.add_argument("--drag-retry-count", type=int, default=2)
     parser.add_argument("--drag-pause-seconds", type=float, default=0.5)
+    parser.add_argument("--drag-aspect-guard", action="store_true", help="Force drag to try at least 3 layers and require hex aspect below threshold.")
+    parser.add_argument("--drag-aspect-threshold", type=float, default=20.0)
+    parser.add_argument("--drag-min-layers", type=int, default=3)
     parser.add_argument("--spin-timeout", type=int, default=900)
     parser.add_argument("--spin-element-size", type=float, default=1.0)
-    parser.add_argument("--spin-fit-tolerance-ratio", type=float, default=0.05)
-    parser.add_argument("--spin-retry-count", type=int, default=1)
+    parser.add_argument("--spin-retry-count", type=int, default=2)
     parser.add_argument("--spin-angle-degrees", type=float, default=360.0)
-    parser.add_argument("--spin-density", type=int, default=96)
+    parser.add_argument("--spin-density", type=int, default=240, help="Deprecated alias for --spin-density-max.")
+    parser.add_argument("--spin-density-min", type=int, default=12)
+    parser.add_argument("--spin-density-max", type=int, default=None)
+    parser.add_argument("--spin-section-element-size-min", type=float, default=0.2)
+    parser.add_argument("--spin-section-element-size-max", type=float, default=1.5)
     parser.add_argument("--tetra-element-size", type=float, default=1.5)
     parser.add_argument("--tetra-element-size-min", type=float, default=1.5)
     parser.add_argument("--tetra-element-size-max", type=float, default=2.0)
@@ -1629,6 +1778,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.spin_density_max is None:
+        args.spin_density_max = args.spin_density
+    if args.spin_density_min > args.spin_density_max:
+        args.spin_density_min, args.spin_density_max = args.spin_density_max, args.spin_density_min
+    if args.spin_section_element_size_min <= 0:
+        args.spin_section_element_size_min = 0.2
+    if args.spin_section_element_size_max <= 0:
+        args.spin_section_element_size_max = 1.5
+    if args.spin_section_element_size_min > args.spin_section_element_size_max:
+        args.spin_section_element_size_min, args.spin_section_element_size_max = (
+            args.spin_section_element_size_max,
+            args.spin_section_element_size_min,
+        )
+    if args.drag_min_layers < 1:
+        args.drag_min_layers = 1
+    if args.drag_aspect_threshold <= 0:
+        args.drag_aspect_threshold = 20.0
     try:
         summary = run_workflow(args)
     except Exception as exc:

@@ -45,20 +45,19 @@ HyperMesh meshing strategy for this workstation:
    strategy for suitable revolved bodies, otherwise fall back to tetra. The
    generated workflow must validate that real 3D hex elements were created; a
    leftover 2D section alone is a failure.
-7. For obvious revolved bodies, prefer spin hex meshing, but never invent the
+7. For obvious revolved bodies, prefer spin meshing, but never invent the
    section from guessed radii or from a side/end face. First split the solid with
    a real middle cutting plane, use only the newly created surfaces that lie on
-   that cutting plane as 2D section sources, mesh those section surfaces as 100%
-   quads, then spin to 3D. If the true cut section cannot be guaranteed as all
-   quads, or if spin creates no valid 3D hex elements, clean up temporary shells
-   and fall back to the tetra strategy.
+   that cutting plane as 2D section sources, mesh one section surface, then spin
+   it to 3D. The section mesh may be mixed, but its size is chosen and checked
+   from the actual section dimensions; if the section mesh is too coarse, clean
+   up temporary shells and fall back to the tetra strategy.
 8. Try a structured hex route before tetra when the geometry supports it:
-   drag for simple constant-section extrusions, spin for clean true-section
-   revolved solids, cut-section spin for stepped/recessed revolved solids.
+   drag for simple constant-section extrusions and cut-section spin for
+   revolved solids.
    If the chosen hex route fails validation, fall back to tetra for that object.
    Clean bearing/ring-like revolved bodies should get a real cut-section spin
-   attempt before tetra; direct surface-id spin is not enough unless the surface
-   is already the true radial cross-section.
+   attempt before tetra; do not use direct surface-id spin.
 9. Component names should describe the physical object, not the mesh type.
    Examples: housing, shaft_ring, spacer_block_upper, support_flange.
 10. Do not repair quality by blindly refining the whole mesh. Prefer strategy
@@ -112,9 +111,9 @@ GENERIC_MESHING_RULES = {
             "Drag hex element_size is clamped to 0.5-1.5 mm and must be chosen "
             "from both extrusion thickness and source-face size: min(requested, "
             "drag_distance/4, source_minor/3, source_major/8). Layer count is "
-            "auto-computed as round(drag_distance / element_size). Minimum 1 "
-            "layer. A thin solid with 1 layer is acceptable; do not fallback to "
-            "tetra just because the drag direction is thin."
+            "auto-computed as round(drag_distance / element_size). Agent-side "
+            "generation defaults to at least 3 layers with a native hex aspect "
+            "check; offline panel keeps the older behavior unless the checkbox is enabled."
         ),
         "retry_policy": (
             "After each failed attempt, reduce element_size by 20% and retry. "
@@ -151,8 +150,9 @@ GENERIC_MESHING_RULES = {
         "method": [
             "split the actual solid with body_splitmerge_with_plane",
             "detect the two newly created cross-section surfaces",
-            "mesh one cross-section surface first; mixed 2D section mesh is allowed during spin debugging",
-            "spin only the quad shell elements from that 2D section into 3D hex elements",
+            "try meshing one cross-section surface twice with a size chosen from that section's bbox",
+            "mixed 2D section meshes are allowed when the mesh density is reasonable for the section size",
+            "spin the accepted 2D section mesh into 3D elements",
         ],
         "fallback": "tetra_surface_deviation_rtrias",
     },
@@ -262,11 +262,11 @@ SPECIAL_WORKFLOWS = {
     "cutsection_spin_hex": {
         "tool": "generate_cutsection_spin_hex_tcl",
         "method": [
-            "Use this for stepped/recessed/ambiguous revolved solids where an existing face is not a trustworthy spin section.",
+            "Use this for revolved solids; do not use a guessed existing surface as the spin section.",
             "Split the target solid with body_splitmerge_with_plane using a user-provided middle plane.",
             "Detect the real section surfaces by meshing each new surface temporarily and checking node distance to the split plane.",
-            "Accept only all-quad section meshes that lie on the split plane, then spin them 360 degrees about the x axis.",
-            "Delete only the temporary 2D seed shell elements after spin; keep generated 3D hex elements.",
+            "Select one cut-section surface and try meshing it twice.",
+            "Continue only when the 2D section is all quads, then spin it around the real rotation axis.",
         ],
         "required_inputs": [
             "solid_id",
@@ -276,9 +276,8 @@ SPECIAL_WORKFLOWS = {
             "element size and spin density",
         ],
         "why": (
-            "Direct surface-id spin is only safe when the selected surface is a "
-            "true cross-section. For recessed or stepped rings, a real solid "
-            "split is the reliable way to obtain that cross-section."
+            "A real solid split is the reliable way to obtain the radial "
+            "cross-section for recessed or stepped rings."
         ),
     },
     "quality_policy": {
@@ -1711,8 +1710,8 @@ def get_meshing_rules() -> dict[str, Any]:
             "CRITICAL: See generic_rules['critical_rule_every_change_must_enforce'] 闁?every MCP change MUST include enforcement in GENERIC_MESHING_RULES and/or _meshing_rule_violation.",
             "CRITICAL: See generic_rules['critical_rule_phase2_color_mandatory'] - execute Phase 2 finalization before meshing.",
             "Do not decide tetra/drag/spin by component name.",
-            "Classify by geometry: holes/flanges/bosses/cutouts -> tetra; simple constant extrusions with matched quad source face -> drag; clean true cross-section revolved bodies -> spin.",
-            "For stepped or recessed revolved solids, use the generic cut-section spin workflow rather than guessed surface-id spin.",
+            "Classify by geometry: holes/flanges/bosses/cutouts -> tetra; simple constant extrusions with matched quad source face -> drag; revolved bodies -> cut-section spin.",
+            "For revolved solids, use the generic cut-section spin workflow rather than guessed surface-id spin.",
             "quality cleanup should prefer strategy changes and local repair; do not blindly refine or delete unfixable bad elements.",
             "visible GUI mode changes where the Tcl runs; meshing logic and input/output paths remain explicit.",
         ],
@@ -3158,6 +3157,9 @@ def generate_guarded_drag_hex_tcl(
     preview_edge_seed_counts: list[int] | None = None,
     source_edge_lengths: list[float] | None = None,
     seed_balance_ratio_threshold: float = 1.6,
+    drag_aspect_guard: bool = True,
+    drag_aspect_threshold: float = 20.0,
+    drag_min_layers: int = 3,
     output_hm_path: str | None = None,
 ) -> dict[str, Any]:
     """Generate guarded drag-hex Tcl: match edge seeds, then all-quad source face or no drag."""
@@ -3171,12 +3173,14 @@ def generate_guarded_drag_hex_tcl(
         raise ValueError("target_density must be greater than 0.")
     if solid_id is not None and solid_id <= 0:
         raise ValueError("solid_id must be greater than 0 when supplied.")
-    if fit_tolerance_ratio <= 0:
-        raise ValueError("fit_tolerance_ratio must be greater than 0.")
     if retry_count < 0:
         raise ValueError("retry_count cannot be negative.")
     if seed_balance_ratio_threshold <= 1.0:
         raise ValueError("seed_balance_ratio_threshold must be greater than 1.0.")
+    if drag_aspect_threshold <= 0:
+        raise ValueError("drag_aspect_threshold must be > 0.")
+    if drag_min_layers < 1:
+        raise ValueError("drag_min_layers must be >= 1.")
     if preview_edge_seed_counts and any(int(count) <= 0 for count in preview_edge_seed_counts):
         raise ValueError("preview_edge_seed_counts must contain positive integers.")
     if source_edge_lengths and any(float(length) <= 0 for length in source_edge_lengths):
@@ -3262,6 +3266,9 @@ def generate_guarded_drag_hex_tcl(
         f"set drag_layers {int(layers)}",
         f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
         f"set retry_count {int(retry_count)}",
+        f"set drag_aspect_guard {1 if drag_aspect_guard else 0}",
+        f"set drag_aspect_threshold {float(drag_aspect_threshold)}",
+        f"set drag_min_layers {int(drag_min_layers)}",
         "proc mcp_all_elems {} {",
         '    *createmark elems 1 "all"',
         "    return [hm_getmark elems 1]",
@@ -3280,6 +3287,17 @@ def generate_guarded_drag_hex_tcl(
         "        if {$cfg == 208} {incr hexes}",
         "    }",
         "    return $hexes",
+        "}",
+        "proc mcp_aspect_bad_count {elems threshold} {",
+        "    if {[llength $elems] == 0} {return 0}",
+        "    if {[catch {eval *createmark elements 1 $elems; *createmark elements 2; *elementtestaspect elements 1 $threshold 2 2 0 \"  3D Aspect Ratio  \"} err]} {",
+        "        puts \"MCP_DRAG_ASPECT_WARN native_failed=$err\"",
+        "        return 999999",
+        "    }",
+        "    if {[catch {hm_marklength elements 2} n]} {",
+        "        if {[catch {llength [hm_getmark elements 2]} n]} {return 999999}",
+        "    }",
+        "    return $n",
         "}",
         "proc mcp_bbox_fit_ok {elems solid_id fit_ratio elem_size} {",
         "    if {$solid_id <= 0} {return 1}",
@@ -3311,6 +3329,7 @@ def generate_guarded_drag_hex_tcl(
         "set source_size [expr {min($source_minor/3.0, $source_major/8.0)}]",
         "set elem_size [expr {max(0.5, min(1.5, min($requested_elem_size, $thickness_size, $source_size)))}]",
         "if {$drag_layers <= 0} {set drag_layers [expr {max(1, round($drag_distance/$elem_size))}]}",
+        "if {$drag_aspect_guard && $drag_layers < $drag_min_layers} {set drag_layers $drag_min_layers}",
         'puts "MCP_DRAG_SIZE single solid=$target_solid thickness=$drag_distance source_minor=$source_minor source_major=$source_major requested=$requested_elem_size thickness_size=$thickness_size source_size=$source_size chosen=$elem_size layers=$drag_layers limits=0.5..1.5"',
         "*createmark surfaces 1 $source_surface",
         "*interactiveremeshsurf 1 $elem_size 1 1 1 1 1",
@@ -3334,7 +3353,9 @@ def generate_guarded_drag_hex_tcl(
         "    set hex_success 0",
         "    set final_hex_count 0",
         "    set attempt 0",
-        "    while {$attempt <= $retry_count && !$hex_success} {",
+        "    set max_attempts [expr {$retry_count + 1}]",
+        "    if {$drag_aspect_guard} {set max_attempts 3}",
+        "    while {$attempt < $max_attempts && !$hex_success} {",
         '        puts "MCP guarded drag attempt=$attempt elem_size=$elem_size"',
         "        set before_elems [mcp_all_elems]",
         "        # auto-flip: ensure drag goes from source face INTO solid",
@@ -3377,11 +3398,17 @@ def generate_guarded_drag_hex_tcl(
         "        }",
         "        set hex_count [mcp_count_hex8 $new_elems]",
         "        set fit_ok [mcp_bbox_fit_ok $new_elems $target_solid $fit_tol_ratio $elem_size]",
-        "        if {[llength $new_elems] > 0 && $hex_count == [llength $new_elems] && $fit_ok} {",
+        "        set aspect_bad 0",
+        "        if {$drag_aspect_guard} {",
+        "            set aspect_bad [mcp_aspect_bad_count $new_elems $drag_aspect_threshold]",
+        "            puts \"MCP_DRAG_ASPECT single solid=$target_solid attempt=[expr {$attempt+1}] layers=$drag_layers bad=$aspect_bad threshold=$drag_aspect_threshold\"",
+        "        }",
+        "        if {[llength $new_elems] > 0 && $hex_count == [llength $new_elems] && $fit_ok && (!$drag_aspect_guard || $aspect_bad == 0)} {",
         "            set hex_success 1",
+        "            puts \"MCP_DRAG_RESULT solid=$target_solid ok=1 layers=$drag_layers aspect_bad=$aspect_bad threshold=$drag_aspect_threshold one_layer_fallback=0\"",
         '            puts "MCP guarded drag completed: hex8=$hex_count fit_ok=$fit_ok"',
         "        } else {",
-        '            puts "MCP guarded drag invalid: new_elements=[llength $new_elems] hex8=$hex_count fit_ok=$fit_ok; cleaning and retrying/falling back."',
+        '            puts "MCP guarded drag invalid: new_elements=[llength $new_elems] hex8=$hex_count fit_ok=$fit_ok aspect_bad=$aspect_bad; cleaning and retrying/falling back."',
         "            if {[llength $new_elems] > 0} { eval *createmark elems 1 $new_elems; catch {*deletemark elems 1} }",
         "        }",
         "        incr attempt",
@@ -3416,6 +3443,9 @@ def generate_batched_drag_hex_tcl(
     retry_count: int = 2,
     element_size_min: float = 0.5,
     element_size_max: float = 1.5,
+    drag_aspect_guard: bool = True,
+    drag_aspect_threshold: float = 20.0,
+    drag_min_layers: int = 3,
     matched_edge_groups: list[list[int]] | None = None,
     pause_seconds_after_each_solid: float = 1.0,
     checkpoint_every_n_solids: int = 0,
@@ -3440,6 +3470,10 @@ def generate_batched_drag_hex_tcl(
         raise ValueError("pause_seconds_after_each_solid cannot be negative.")
     if checkpoint_every_n_solids < 0:
         raise ValueError("checkpoint_every_n_solids cannot be negative.")
+    if drag_aspect_threshold <= 0:
+        raise ValueError("drag_aspect_threshold must be > 0.")
+    if drag_min_layers < 1:
+        raise ValueError("drag_min_layers must be >= 1.")
 
     checkpoint_path = _quote_tcl_path(checkpoint_hm_path) if checkpoint_hm_path else ""
 
@@ -3465,6 +3499,9 @@ def generate_batched_drag_hex_tcl(
         f"set elem_size_max {float(element_size_max)}",
         f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
         f"set retry_count {int(retry_count)}",
+        f"set drag_aspect_guard {1 if drag_aspect_guard else 0}",
+        f"set drag_aspect_threshold {float(drag_aspect_threshold)}",
+        f"set drag_min_layers {int(drag_min_layers)}",
         f"set pause_ms_after_each_solid {int(float(pause_seconds_after_each_solid) * 1000)}",
         f"set checkpoint_every_n_solids {int(checkpoint_every_n_solids)}",
         f'set checkpoint_hm_path "{checkpoint_path}"',
@@ -3482,6 +3519,18 @@ def generate_batched_drag_hex_tcl(
         "proc b_all {} { *createmark elems 1 \"all\"; return [hm_getmark elems 1] }",
         "proc b_sub {a b} { array set x {}; foreach i $b {set x($i) 1}; set o {}; foreach i $a {if {![info exists x($i)]} {lappend o $i}}; return $o }",
         "proc b_hex {e} { set c 0; foreach i $e { if {![catch {hm_getvalue elems id=$i dataname=config} g]} {if {$g==208} {incr c}} }; return $c }",
+        "proc b_del {e} { if {[llength $e]>0} { eval *createmark elems 1 $e; catch {*deletemark elems 1} } }",
+        "proc b_aspect_bad {e threshold} {",
+        "    if {[llength $e]==0} {return 0}",
+        "    if {[catch {eval *createmark elements 1 $e; *createmark elements 2; *elementtestaspect elements 1 $threshold 2 2 0 \"  3D Aspect Ratio  \"} err]} {",
+        "        puts \"MCP_DRAG_ASPECT_WARN native_failed=$err\"",
+        "        return 999999",
+        "    }",
+        "    if {[catch {hm_marklength elements 2} n]} {",
+        "        if {[catch {llength [hm_getmark elements 2]} n]} {return 999999}",
+        "    }",
+        "    return $n",
+        "}",
         "proc b_fit {e id r z} {",
         "    if {$id<=0} {return 1}; if {[llength $e]==0} {return 0}",
         "    eval *createmark elems 2 $e; *createmark surfaces 2 \"by solids\" $id",
@@ -3508,8 +3557,10 @@ def generate_batched_drag_hex_tcl(
         "    set source_size [expr {min($source_minor/3.0, $source_major/8.0)}]",
         "    set cs [expr {max($elem_size_min, min($elem_size_max, min($elem_size, $thickness_size, $source_size)))}]",
         '    puts "MCP_DRAG_SIZE solid=$sid thickness=$dd source_minor=$source_minor source_major=$source_major requested=$elem_size thickness_size=$thickness_size source_size=$source_size chosen=$cs limits=$elem_size_min..$elem_size_max"',
-        "    set hs 0; set at 0",
-        "    while {$at<=$retry_count&&!$hs} {",
+        "    set hs 0; set at 0; set one_layer_fallback 0; set final_layers 0; set final_aspect_bad 0",
+        "    set max_attempts [expr {$retry_count + 1}]",
+        "    if {$drag_aspect_guard} {set max_attempts 3}",
+        "    while {$at<$max_attempts&&!$hs} {",
         "        *createmark surfaces 1 $surf",
         "        *interactiveremeshsurf 1 $cs 1 1 1 1 1",
         "        *set_meshfaceparams 0 5 1 0 0 1 0.5 1 1",
@@ -3527,7 +3578,7 @@ def generate_batched_drag_hex_tcl(
         "            foreach e {0 1 2 3} { catch {*set_meshedgeparams $e $td 1 0 0 0 $cs 0 0} }",
         "        }",
         "        *automesh 0 5 1; *storemeshtodatabase 1; *ameshclearsurface",
-        '        puts "MCP_DRAG_ASPECT_CHECK_SKIPPED solid=$sid"',
+        "        if {!$drag_aspect_guard} {puts \"MCP_DRAG_ASPECT_CHECK_SKIPPED solid=$sid\"}",
         '        *createmark elems 1 "by surface" $surf',
         '        set source_shells [hm_getmark elems 1]',
         '        puts "MCP_DRAG_SOURCE_SHELLS solid=$sid surf=$surf count=[llength $source_shells]"',
@@ -3541,11 +3592,12 @@ def generate_batched_drag_hex_tcl(
         "        set ss $source_shells; set qc 0",
         "        foreach i $ss { set cf [hm_getvalue elems id=$i dataname=config]; if {$cf==104||$cf==108} {incr qc} }",
         "        if {[llength $ss]==0||$qc!=[llength $ss]} {",
-        "            if {[llength $ss]>0} {eval *createmark elems 1 $ss; catch {*deletemark elems 1}}",
-        "            puts \"MCP_DRAG_SKIP_TETRA solid=$sid reason=non_quad_source removed_old_tetra_path=1\"",
-        "            break",
+        "            b_del $ss",
+            "            puts \"MCP_DRAG_SKIP_TETRA solid=$sid reason=non_quad_source removed_old_tetra_path=1\"",
+            "            break",
         "        }",
         "        set dl [expr {max(1,round($dd/$cs))}]",
+        "        if {$drag_aspect_guard && $dl < $drag_min_layers} {set dl $drag_min_layers}",
         "        set be [b_all]",
         "        *createmark surfaces 2 $surf",
         "        set sb [hm_getboundingbox surfaces 2 0 0 0]",
@@ -3560,8 +3612,7 @@ def generate_batched_drag_hex_tcl(
         "            *meshdragelements2 1 1 $dd $dl 0 0.0 0",
         "        } _mcp_drag_err]} {",
         "            puts \"MCP_DRAG_FAIL stage=meshdragelements_error solid=$sid error=$_mcp_drag_err\"",
-        "            eval *createmark elems 1 $source_shells",
-        "            catch {*deletemark elems 1}",
+        "            b_del $source_shells",
         "            set cs [expr {$cs*0.8}]",
         "            if {$cs<$elem_size_min} {set cs $elem_size_min}",
         "            incr at",
@@ -3572,24 +3623,77 @@ def generate_batched_drag_hex_tcl(
         "        puts \"MCP_DRAG_NEW_ELEMS solid=$sid count=[llength $new_drag_elems]\"",
         "        if {[llength $new_drag_elems] == 0} {",
         "            puts \"MCP_DRAG_FAIL stage=meshdragelements_empty solid=$sid\"",
-        "            eval *createmark elems 1 $source_shells",
-        "            catch {*deletemark elems 1}",
+        "            b_del $source_shells",
         "            set cs [expr {$cs*0.8}]",
         "            if {$cs<$elem_size_min} {set cs $elem_size_min}",
         "            incr at",
         "            continue",
         "        }",
         "        set ne $new_drag_elems; set hc [b_hex $ne]; set fo [b_fit $ne $sid $fit_tol_ratio $cs]",
-        "        if {[llength $ne]>0&&$hc==[llength $ne]&&$fo} { set hs 1 } else {",
-        "            if {[llength $ne]>0} {eval *createmark elems 1 $ne; catch {*deletemark elems 1}}",
-        "            eval *createmark elems 1 $source_shells; catch {*deletemark elems 1}",
+        "        set aspect_bad 0",
+        "        if {$drag_aspect_guard} {",
+        "            set aspect_bad [b_aspect_bad $ne $drag_aspect_threshold]",
+        "            puts \"MCP_DRAG_ASPECT solid=$sid attempt=[expr {$at+1}] layers=$dl bad=$aspect_bad threshold=$drag_aspect_threshold\"",
+        "        }",
+        "        if {[llength $ne]>0&&$hc==[llength $ne]&&$fo&&(!$drag_aspect_guard||$aspect_bad==0)} {",
+        "            set hs 1; set final_layers $dl; set final_aspect_bad $aspect_bad",
+        "        } else {",
+        "            b_del $ne",
+        "            b_del $source_shells",
         "            set cs [expr {$cs*0.8}]; if {$cs<$elem_size_min} {set cs $elem_size_min}",
         "        }; incr at",
         "    }",
+        "    if {!$hs && $drag_aspect_guard} {",
+        "        puts \"MCP_DRAG_ONE_LAYER_RETRY solid=$sid reason=aspect_guard_failed attempts=$max_attempts\"",
+        "        *createmark surfaces 1 $surf",
+        "        *interactiveremeshsurf 1 $cs 1 1 1 1 1",
+        "        *set_meshfaceparams 0 5 1 0 0 1 0.5 1 1",
+        "        *createmark surfaces 2 $surf",
+        "        set bb [hm_getboundingbox surfaces 2 0 0 0]",
+        "        set mj [lindex [lsort -real [list [expr {abs([lindex $bb 3]-[lindex $bb 0])}] [expr {abs([lindex $bb 4]-[lindex $bb 1])}] [expr {abs([lindex $bb 5]-[lindex $bb 2])}]]] 2]",
+        "        set td [expr {int(round($mj/$cs))}]; if {$td<4} {set td 4}",
+        "        foreach e {0 1 2 3} { catch {*set_meshedgeparams $e $td 1 0 0 0 $cs 0 0} }",
+        "        *automesh 0 5 1; *storemeshtodatabase 1; *ameshclearsurface",
+        "        *createmark elems 1 \"by surface\" $surf",
+        "        set source_shells [hm_getmark elems 1]",
+        "        set ss $source_shells; set qc 0",
+        "        foreach i $ss { set cf [hm_getvalue elems id=$i dataname=config]; if {$cf==104||$cf==108} {incr qc} }",
+        "        if {[llength $ss]>0&&$qc==[llength $ss]} {",
+        "            set be [b_all]",
+        "            *createmark surfaces 2 $surf",
+        "            set sb [hm_getboundingbox surfaces 2 0 0 0]",
+        "            *createmark surfaces 2 \"by solids\" $sid",
+        "            set bb [hm_getboundingbox surfaces 2 0 0 0]",
+        "            if {$ax eq \"x\"} {set dvx 1; set dvy 0; set dvz 0; set sc [expr {([lindex $sb 0]+[lindex $sb 3])/2.0}]; set smin [lindex $bb 0]; set smax [lindex $bb 3]} else { if {$ax eq \"y\"} {set dvx 0; set dvy 1; set dvz 0; set sc [expr {([lindex $sb 1]+[lindex $sb 4])/2.0}]; set smin [lindex $bb 1]; set smax [lindex $bb 4]} else {set dvx 0; set dvy 0; set dvz 1; set sc [expr {([lindex $sb 2]+[lindex $sb 5])/2.0}]; set smin [lindex $bb 2]; set smax [lindex $bb 5]} }",
+        "            if {[expr {$sc-$smin}] > [expr {$smax-$sc}]} { set dvx [expr {-1*$dvx}]; set dvy [expr {-1*$dvy}]; set dvz [expr {-1*$dvz}] }",
+        "            *createvector 1 $dvx $dvy $dvz",
+        "            eval *createmark elems 1 $source_shells",
+        "            if {![catch {*meshdragelements2 1 1 $dd 1 0 0.0 0} _mcp_drag_err]} {",
+        "                set after_drag [b_all]",
+        "                set new_drag_elems [b_sub $after_drag $be]",
+        "                set ne $new_drag_elems; set hc [b_hex $ne]; set fo [b_fit $ne $sid $fit_tol_ratio $cs]",
+        "                set aspect_bad [b_aspect_bad $ne $drag_aspect_threshold]",
+        "                if {[llength $ne]>0&&$hc==[llength $ne]&&$fo} {",
+        "                    set hs 1; set one_layer_fallback 1; set final_layers 1; set final_aspect_bad $aspect_bad",
+        "                    puts \"MCP_DRAG_ONE_LAYER_FALLBACK solid=$sid component=$dc layers=1 aspect_bad=$aspect_bad threshold=$drag_aspect_threshold\"",
+        "                } else {",
+        "                    b_del $ne",
+        "                    puts \"MCP_DRAG_FAIL stage=one_layer_fallback_quality solid=$sid hex=$hc total=[llength $ne] fit=$fo\"",
+        "                }",
+        "            } else {",
+        "                puts \"MCP_DRAG_FAIL stage=one_layer_fallback_error solid=$sid error=$_mcp_drag_err\"",
+        "            }",
+        "        } else {",
+        "            b_del $ss",
+        "            puts \"MCP_DRAG_FAIL stage=one_layer_fallback_non_quad_source solid=$sid\"",
+        "        }",
+        "    }",
         "    if {!$hs} {",
+        "        if {[info exists source_shells]&&[llength $source_shells]>0} {b_del $source_shells}",
         "        puts \"MCP_DRAG_SKIP_TETRA solid=$sid reason=drag_failed removed_old_tetra_path=1\"",
         "    }",
-        "    if {$hs&&[info exists source_shells]&&[llength $source_shells]>0} {eval *createmark elems 1 $source_shells; catch {*deletemark elems 1}}",
+        "    if {$hs} {puts \"MCP_DRAG_RESULT solid=$sid ok=1 layers=$final_layers aspect_bad=$final_aspect_bad threshold=$drag_aspect_threshold one_layer_fallback=$one_layer_fallback\"}",
+        "    if {$hs&&[info exists source_shells]&&[llength $source_shells]>0} {b_del $source_shells}",
         "    catch {*endhistorystate \"MCP guarded drag hex batch s$sid\"}",
         "    incr completed_drag_solids",
         "    catch {update}",
@@ -3614,193 +3718,6 @@ def generate_batched_drag_hex_tcl(
 
 
 @mcp.tool()
-def generate_guarded_spin_hex_tcl(
-    source_surface_id: int,
-    element_size: float,
-    component_name: str,
-    axis: str = "z",
-    solid_id: int | None = None,
-    spin_axis_point: list[float] | None = None,
-    section_edge_seed_counts: list[int] | None = None,
-    fit_tolerance_ratio: float = 0.05,
-    retry_count: int = 1,
-    angle_degrees: float = 360.0,
-    density: int = 96,
-    output_hm_path: str | None = None,
-) -> dict[str, Any]:
-    """Generate guarded spin-hex Tcl: all-quad section or no spin."""
-    if element_size <= 0:
-        raise ValueError("element_size must be greater than 0.")
-    if density <= 0:
-        raise ValueError("density must be greater than 0.")
-    if not component_name.strip():
-        raise ValueError("component_name cannot be empty.")
-    if solid_id is not None and solid_id <= 0:
-        raise ValueError("solid_id must be greater than 0 when supplied.")
-    if fit_tolerance_ratio <= 0:
-        raise ValueError("fit_tolerance_ratio must be greater than 0.")
-    if retry_count < 0:
-        raise ValueError("retry_count cannot be negative.")
-    retry_count = min(int(retry_count), 2)
-    if spin_axis_point is not None and len(spin_axis_point) != 3:
-        raise ValueError("spin_axis_point must contain 3 numbers when supplied.")
-    if section_edge_seed_counts is None:
-        section_edge_seed_counts = [4, 6, 8]
-    section_edge_seed_counts = [int(value) for value in section_edge_seed_counts if int(value) > 0]
-    section_edge_seed_counts = section_edge_seed_counts[:3]
-    if not section_edge_seed_counts:
-        raise ValueError("section_edge_seed_counts must contain at least one positive integer.")
-
-    axis_key = axis.strip().lower()
-    normals = {
-        "x": (1, 0, 0),
-        "y": (0, 1, 0),
-        "z": (0, 0, 1),
-    }
-    if axis_key not in normals:
-        raise ValueError("axis must be one of: x, y, z.")
-
-    nx, ny, nz = normals[axis_key]
-    if spin_axis_point is None:
-        ax = ay = az = 0.0
-        has_axis_point = 0
-    else:
-        ax, ay, az = [float(value) for value in spin_axis_point]
-        has_axis_point = 1
-    seed_counts_text = " ".join(str(value) for value in section_edge_seed_counts)
-    comp = component_name.replace('"', '\\"')
-    lines = [
-        "# HyperMesh MCP generated guarded spin-hex script",
-        "# Use for clean revolved bodies. Do not use for flanges with bolt holes or protrusions.",
-        "# Precondition: the selected source section should have matched edge seeds and be all quads.",
-        f'set spin_component "{comp}"',
-        f"set source_surface {int(source_surface_id)}",
-        f"set target_solid {int(solid_id) if solid_id is not None else 0}",
-        f"set elem_size {float(element_size)}",
-        f"set spin_angle {float(angle_degrees)}",
-        f"set spin_density {int(density)}",
-        f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
-        f"set retry_count {int(retry_count)}",
-        f"set has_axis_point {has_axis_point}",
-        f"set axis_px {ax}",
-        f"set axis_py {ay}",
-        f"set axis_pz {az}",
-        f"set section_edge_seed_counts {{{seed_counts_text}}}",
-        "proc mcp_all_elems {} {",
-        '    *createmark elems 1 "all"',
-        "    return [hm_getmark elems 1]",
-        "}",
-        "proc mcp_list_subtract {a b} {",
-        "    array set seen {}",
-        "    foreach x $b {set seen($x) 1}",
-        "    set out {}",
-        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
-        "    return $out",
-        "}",
-        "proc mcp_count_hex8 {elems} {",
-        "    set hexes 0",
-        "    foreach eid $elems {",
-        "        if {[catch {hm_getvalue elems id=$eid dataname=config} cfg]} {continue}",
-        "        if {$cfg == 208} {incr hexes}",
-        "    }",
-        "    return $hexes",
-        "}",
-        "proc mcp_bbox_fit_ok {elems solid_id fit_ratio elem_size} {",
-        "    if {$solid_id <= 0} {return 1}",
-        "    if {[llength $elems] == 0} {return 0}",
-        "    eval *createmark elems 2 $elems",
-        "    *createmark surfaces 2 \"by solids\" $solid_id",
-        "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
-        "    if {[catch {hm_getboundingbox surfaces 2 0 0 0} sbb]} {return 0}",
-        "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
-        "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
-        "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
-        "    set diag [expr {sqrt($sx*$sx + $sy*$sy + $sz*$sz)}]",
-        "    set tol [expr {max($elem_size * 1.5, $diag * $fit_ratio)}]",
-        "    for {set i 0} {$i < 6} {incr i} {",
-        "        if {abs([lindex $ebb $i] - [lindex $sbb $i]) > $tol} {return 0}",
-        "    }",
-        "    return 1",
-        "}",
-        'catch {*beginhistorystate "MCP guarded spin hex"}',
-        '*currentcollector components "$spin_component"',
-        "*createmark surfaces 1 $source_surface",
-        "*createmark surfaces 2 $source_surface",
-        "set bb [hm_getboundingbox surfaces 2 0 0 0]",
-        "set cx [expr {([lindex $bb 0] + [lindex $bb 3]) / 2.0}]",
-        "set cy [expr {([lindex $bb 1] + [lindex $bb 4]) / 2.0}]",
-        "set cz [expr {([lindex $bb 2] + [lindex $bb 5]) / 2.0}]",
-        "if {$has_axis_point} {set cx $axis_px; set cy $axis_py; set cz $axis_pz}",
-        "set source_shells {}",
-        "set quad_count 0",
-        "foreach edge_seed $section_edge_seed_counts {",
-        "    *createmark surfaces 1 $source_surface",
-        "    *interactiveremeshsurf 1 $elem_size 4 4 2 1 1",
-        "    *set_meshfaceparams 0 4 1 0 0 1 0.5 1 1",
-        "    *automesh 0 4 1",
-        "    *storemeshtodatabase 1",
-        "    *ameshclearsurface",
-        '    *createmark elems 1 "by surface" $source_surface',
-        "    set source_shells [hm_getmark elems 1]",
-        "    set quad_count 0",
-        "    foreach eid $source_shells {",
-        "        set cfg [hm_getvalue elems id=$eid dataname=config]",
-        "        if {$cfg == 104 || $cfg == 108} { incr quad_count }",
-        "    }",
-        "    puts \"MCP guarded spin source edge_seed=$edge_seed shells=[llength $source_shells] quads=$quad_count\"",
-        "    if {[llength $source_shells] > 0 && $quad_count == [llength $source_shells]} {break}",
-        "    if {[llength $source_shells] > 0} { eval *createmark elems 1 $source_shells; catch {*deletemark elems 1} }",
-        "}",
-        "if {[llength $source_shells] == 0 || $quad_count != [llength $source_shells]} {",
-        '    puts "MCP guarded spin skipped: source section is not all quads."',
-        "    if {[llength $source_shells] > 0} { eval *createmark elems 1 $source_shells; catch {*deletemark elems 1} }",
-        '    puts "MCP guarded spin skipped tetra fallback: removed_old_tetra_path=1"',
-        '    puts "MCP_SPIN_RESULT solid=$target_solid ok=0 hex8=0 source_shells=[llength $source_shells] source_quads=$quad_count source_surface=$source_surface fallback_tetra=1"',
-        "} else {",
-        "    set hex_success 0",
-        "    set final_hex_count 0",
-        "    set attempt 0",
-        "    while {$attempt <= $retry_count && !$hex_success} {",
-        '        puts "MCP guarded spin attempt=$attempt elem_size=$elem_size"',
-        "        set before_elems [mcp_all_elems]",
-        f"        *createplane 1 {nx} {ny} {nz} $cx $cy $cz",
-        "        *meshspinelements2 1 1 $spin_angle $spin_density 1 0.0 0",
-        "        set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
-        "        set hex_count [mcp_count_hex8 $new_elems]",
-        "        set fit_ok [mcp_bbox_fit_ok $new_elems $target_solid $fit_tol_ratio $elem_size]",
-        "        if {[llength $new_elems] > 0 && $hex_count == [llength $new_elems] && $fit_ok} {",
-        "            set hex_success 1",
-        "            set final_hex_count $hex_count",
-        '            puts "MCP guarded spin completed: hex8=$hex_count fit_ok=$fit_ok"',
-        "        } else {",
-        '            puts "MCP guarded spin invalid: new_elements=[llength $new_elems] hex8=$hex_count fit_ok=$fit_ok; cleaning and retrying/falling back."',
-        "            if {[llength $new_elems] > 0} { eval *createmark elems 1 $new_elems; catch {*deletemark elems 1} }",
-        "        }",
-        "        incr attempt",
-        "    }",
-        "    eval *createmark elems 1 $source_shells",
-        "    catch {*deletemark elems 1}",
-        '    if {!$hex_success} { puts "MCP guarded spin failed: tetra fallback removed_old_tetra_path=1" }',
-        '    puts "MCP_SPIN_RESULT solid=$target_solid ok=$hex_success hex8=$final_hex_count source_shells=[llength $source_shells] source_quads=$quad_count source_surface=$source_surface fallback_tetra=[expr {!$hex_success}]"',
-        "}",
-        'catch {*endhistorystate "MCP guarded spin hex"}',
-    ]
-    if output_hm_path:
-        lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
-
-    return {
-        "success": True,
-        "script": _wrap_generated_tcl("generate_guarded_spin_hex_tcl", "\n".join(lines)),
-        "strategy": (
-            "Use spin for clean revolved bodies when the source section can be "
-            "meshed as 100% quads. Fall back to tetra for flanges, protrusions, "
-            "or any non-quad section. If the selected surface is not a true "
-            "cross-section of the solid, use generate_cutsection_spin_hex_tcl."
-        ),
-    }
-
-
-@mcp.tool()
 def generate_cutsection_spin_hex_tcl(
     solid_id: int,
     component_name: str,
@@ -3809,13 +3726,15 @@ def generate_cutsection_spin_hex_tcl(
     spin_axis: str = "x",
     spin_axis_point: list[float] | None = None,
     element_size: float = 0.7,
-    density: int = 96,
+    density: int = 240,
+    density_min: int = 12,
+    density_max: int | None = None,
+    section_element_size_min: float = 0.2,
+    section_element_size_max: float = 1.5,
     plane_tolerance: float = 0.02,
-    fit_tolerance_ratio: float = 0.05,
     retry_count: int = 1,
     section_edge_seed_counts: list[int] | None = None,
     include_existing_section_surfaces: bool = False,
-    allow_quad_only_fallback: bool = True,
     delete_existing_component_elements: bool = True,
     output_hm_path: str | None = None,
 ) -> dict[str, Any]:
@@ -3826,18 +3745,30 @@ def generate_cutsection_spin_hex_tcl(
         raise ValueError("element_size must be greater than 0.")
     if density <= 0:
         raise ValueError("density must be greater than 0.")
+    if density_min <= 0:
+        raise ValueError("density_min must be greater than 0.")
+    if density_max is None:
+        density_max = density
+    if density_max <= 0:
+        raise ValueError("density_max must be greater than 0.")
+    density_min = int(density_min)
+    density_max = int(density_max)
+    if density_min > density_max:
+        density_min, density_max = density_max, density_min
+    if section_element_size_min <= 0 or section_element_size_max <= 0:
+        raise ValueError("section_element_size_min/max must be greater than 0.")
+    if section_element_size_min > section_element_size_max:
+        section_element_size_min, section_element_size_max = section_element_size_max, section_element_size_min
     if plane_tolerance <= 0:
         raise ValueError("plane_tolerance must be greater than 0.")
-    if fit_tolerance_ratio <= 0:
-        raise ValueError("fit_tolerance_ratio must be greater than 0.")
     if retry_count < 0:
         raise ValueError("retry_count cannot be negative.")
     retry_count = min(int(retry_count), 2)
     if section_edge_seed_counts is None:
-        section_edge_seed_counts = [4, 6, 8]
-    section_edge_seed_counts = [int(value) for value in section_edge_seed_counts if int(value) > 0]
-    section_edge_seed_counts = section_edge_seed_counts[:3]
-    if not section_edge_seed_counts:
+        section_edge_seed_counts = [100, 75]
+    section_size_percentages = [int(value) for value in section_edge_seed_counts if int(value) > 0]
+    section_size_percentages = section_size_percentages[:2]
+    if not section_size_percentages:
         raise ValueError("section_edge_seed_counts must contain at least one positive integer.")
     if not component_name.strip():
         raise ValueError("component_name cannot be empty.")
@@ -3875,8 +3806,7 @@ def generate_cutsection_spin_hex_tcl(
 
     delete_existing = "1" if delete_existing_component_elements else "0"
     include_existing = "1" if include_existing_section_surfaces else "0"
-    quad_fallback = "1" if allow_quad_only_fallback else "0"
-    seed_counts_text = " ".join(str(value) for value in section_edge_seed_counts)
+    size_factors_text = " ".join(f"{value / 100.0:.6g}" for value in section_size_percentages)
     lines = [
         "# HyperMesh MCP generated cut-section spin-hex script",
         "# Use for stepped/recessed revolved solids where an existing face is not a reliable section.",
@@ -3884,13 +3814,14 @@ def generate_cutsection_spin_hex_tcl(
         f'set target_component "{comp}"',
         f"set target_solid {int(solid_id)}",
         f"set elem_size {float(element_size)}",
-        f"set spin_density {int(density)}",
+        f"set spin_density_min {int(density_min)}",
+        f"set spin_density_max {int(density_max)}",
+        f"set section_size_min {float(section_element_size_min)}",
+        f"set section_size_max {float(section_element_size_max)}",
         f"set plane_tol {float(plane_tolerance)}",
-        f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
         f"set retry_count {int(retry_count)}",
-        f"set section_edge_seed_counts {{{seed_counts_text}}}",
+        f"set section_size_factors {{{size_factors_text}}}",
         f"set include_existing_section_surfaces {include_existing}",
-        f"set allow_quad_only_fallback {quad_fallback}",
         f"set delete_existing_component_elements {delete_existing}",
         f"set split_nx {nx}",
         f"set split_ny {ny}",
@@ -3901,6 +3832,7 @@ def generate_cutsection_spin_hex_tcl(
         f"set axis_px {ax}",
         f"set axis_py {ay}",
         f"set axis_pz {az}",
+        f'set spin_axis_key "{axis_key}"',
         "proc mcp_mark_count {entity mark_id} {",
         "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
         "    return $n",
@@ -3944,26 +3876,13 @@ def generate_cutsection_spin_hex_tcl(
         "    }",
         "    return $hexes",
         "}",
-        "proc mcp_bbox_fit_ok {elems solid_id fit_ratio elem_size} {",
-        "    if {[llength $elems] == 0} {return 0}",
-        "    eval *createmark elems 2 $elems",
-        "    *createmark surfaces 2 \"by solids\" $solid_id",
-        "    if {[mcp_mark_count elems 2] == 0 || [mcp_mark_count surfaces 2] == 0} {return 0}",
-        "    if {[catch {hm_getboundingbox elems 2 0 0 0} ebb]} {return 0}",
-        "    if {[catch {hm_getboundingbox surfaces 2 0 0 0} sbb]} {return 0}",
-        "    set sx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
-        "    set sy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
-        "    set sz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
-        "    set diag [expr {sqrt($sx*$sx + $sy*$sy + $sz*$sz)}]",
-        "    set tol [expr {max($elem_size * 1.5, $diag * $fit_ratio)}]",
-        "    for {set i 0} {$i < 6} {incr i} {",
-        "        set diff [expr {abs([lindex $ebb $i] - [lindex $sbb $i])}]",
-        "        if {$diff > $tol} {",
-        '            puts "MCP mesh-solid fit failed: bbox_index=$i mesh=[lindex $ebb $i] solid=[lindex $sbb $i] diff=$diff tol=$tol"',
-        "            return 0",
-        "        }",
+        "proc mcp_quad_shell_count {elems} {",
+        "    set quads 0",
+        "    foreach eid $elems {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=config} cfg]} {continue}",
+        "        if {$cfg == 104 || $cfg == 108} {incr quads}",
         "    }",
-        "    return 1",
+        "    return $quads",
         "}",
         "proc mcp_node_plane_dist {nid nx ny nz px py pz} {",
         "    set x [hm_getvalue nodes id=$nid dataname=x]",
@@ -3973,21 +3892,92 @@ def generate_cutsection_spin_hex_tcl(
         "    if {$d < 0} {set d [expr {-$d}]}",
         "    return $d",
         "}",
+        "proc mcp_section_size_info {sid requested_size section_min section_max} {",
+        "    *createmark surfaces 2 $sid",
+        "    if {[catch {hm_getboundingbox surfaces 2 0 0 0} bb] || [llength $bb] < 6} {",
+        "        return [list $requested_size 0.0 0.0 0.0 1]",
+        "    }",
+        "    set dx [expr {abs([lindex $bb 3] - [lindex $bb 0])}]",
+        "    set dy [expr {abs([lindex $bb 4] - [lindex $bb 1])}]",
+        "    set dz [expr {abs([lindex $bb 5] - [lindex $bb 2])}]",
+        "    set dims [lsort -real [list $dx $dy $dz]]",
+        "    set minor [lindex $dims 1]",
+        "    set major [lindex $dims 2]",
+        "    set diag [expr {sqrt($dx*$dx + $dy*$dy + $dz*$dz)}]",
+        "    set chosen [expr {min($requested_size, max($section_min, min($section_max, min($minor/3.0, $major/10.0))))}]",
+        "    if {$chosen <= 0} {set chosen $requested_size}",
+        "    set area_est [expr {$minor * $major}]",
+        "    set min_shells [expr {int(ceil($area_est / max($chosen*$chosen*4.0, 1.0e-9)))}]",
+        "    if {$min_shells < 2} {set min_shells 2}",
+        "    if {$min_shells > 80} {set min_shells 80}",
+        "    return [list $chosen $minor $major $diag $min_shells]",
+        "}",
+        "proc mcp_node_axis_radius {nid axis_key ax ay az} {",
+        "    set x [hm_getvalue nodes id=$nid dataname=x]",
+        "    set y [hm_getvalue nodes id=$nid dataname=y]",
+        "    set z [hm_getvalue nodes id=$nid dataname=z]",
+        "    if {$axis_key eq \"x\"} {",
+        "        set d1 [expr {$y - $ay}]",
+        "        set d2 [expr {$z - $az}]",
+        "    } elseif {$axis_key eq \"y\"} {",
+        "        set d1 [expr {$x - $ax}]",
+        "        set d2 [expr {$z - $az}]",
+        "    } else {",
+        "        set d1 [expr {$x - $ax}]",
+        "        set d2 [expr {$y - $ay}]",
+        "    }",
+        "    return [expr {sqrt($d1*$d1 + $d2*$d2)}]",
+        "}",
+        "proc mcp_spin_density_for_shells {shells axis_key ax ay az section_size min_density max_density} {",
+        "    set max_radius 0.0",
+        "    foreach eid $shells {",
+        "        foreach nid [hm_getvalue elems id=$eid dataname=nodes] {",
+        "            set r [mcp_node_axis_radius $nid $axis_key $ax $ay $az]",
+        "            if {$r > $max_radius} {set max_radius $r}",
+        "        }",
+        "    }",
+        "    if {$section_size <= 0} {set section_size 1.0}",
+        "    set raw [expr {int(ceil((2.0 * 3.141592653589793 * $max_radius) / $section_size))}]",
+        "    set density $raw",
+        "    set density_min [expr {int($min_density)}]",
+        "    set density_max [expr {int($max_density)}]",
+        "    if {$density_min < 1} {set density_min 1}",
+        "    if {$density_max < 1} {set density_max 1}",
+        "    if {$density_min > $density_max} {set tmp $density_min; set density_min $density_max; set density_max $tmp}",
+        "    if {$density < $density_min} {set density $density_min}",
+        "    if {$density > $density_max} {set density $density_max}",
+        '    puts "MCP spin density radius=$max_radius section_size=$section_size min=$density_min max=$density_max raw=$raw chosen=$density"',
+        "    return $density",
+        "}",
         "proc mcp_mesh_true_section {sid elem_size nx ny nz px py pz plane_tol} {",
-        "    set mesh_modes {{4 4}}",
-        "    if {!$::mcp_allow_quad_only_fallback} {set mesh_modes {{1 5}}}",
+        "    set size_info [mcp_section_size_info $sid $elem_size $::mcp_section_size_min $::mcp_section_size_max]",
+        "    set base_size [lindex $size_info 0]",
+        "    set section_minor [lindex $size_info 1]",
+        "    set section_major [lindex $size_info 2]",
+        "    set section_min_shells [lindex $size_info 4]",
+        '    puts "MCP section size surface=$sid requested=$elem_size chosen=$base_size minor=$section_minor major=$section_major min_shells=$section_min_shells"',
+        "    set mesh_modes {{1 5} {4 4}}",
         "    foreach mode_pair $mesh_modes {",
         "        set interactive_mode [lindex $mode_pair 0]",
         "        set face_mode [lindex $mode_pair 1]",
-        "        foreach edge_seed $::mcp_section_edge_seed_counts {",
-        "            *createmark surfaces 1 $sid",
-        "            catch {*setedgedensitylinkwithaspectratio -1}",
-        "            *setedgedensitylink 1",
-        "            *interactiveremeshsurf 1 $elem_size $interactive_mode $face_mode 2 1 1",
-        "            *set_meshfaceparams 0 $face_mode 1 0 0 1 0.5 1 1",
-        "            *automesh 0 $face_mode 1",
-        "            *storemeshtodatabase 1",
-        "            *ameshclearsurface",
+        "        foreach size_factor $::mcp_section_size_factors {",
+        "            set local_size [expr {$base_size * $size_factor}]",
+        "            if {$local_size < $::mcp_section_size_min} {set local_size $::mcp_section_size_min}",
+        "            if {$local_size > $::mcp_section_size_max} {set local_size $::mcp_section_size_max}",
+        "            if {[catch {",
+        "                *createmark surfaces 1 $sid",
+        "                catch {*setedgedensitylinkwithaspectratio -1}",
+        "                *setedgedensitylink 1",
+        "                *interactiveremeshsurf 1 $local_size $interactive_mode $face_mode 2 1 1",
+        "                *set_meshfaceparams 0 $face_mode 1 0 0 1 0.5 1 1",
+        "                *automesh 0 $face_mode 1",
+        "                *storemeshtodatabase 1",
+        "                *ameshclearsurface",
+        "            } mesh_err]} {",
+        '                puts "MCP rejected section surface=$sid mesh_mode=$face_mode size=$local_size automesh_error=$mesh_err"',
+        "                catch {*ameshclearsurface}",
+        "                continue",
+        "            }",
         '            *createmark elems 1 "by surface" $sid',
         "            set shells [hm_getmark elems 1]",
         "            if {[llength $shells] == 0} {continue}",
@@ -4001,10 +3991,12 @@ def generate_cutsection_spin_hex_tcl(
         "                    if {$d > $maxdist} {set maxdist $d}",
         "                }",
         "            }",
-        "            if {$quads == [llength $shells] && $maxdist <= $plane_tol} {",
-        '                puts "MCP accepted true section surface=$sid mesh_mode=$face_mode edge_seed=$edge_seed shells=[llength $shells] maxdist=$maxdist plane_tol=$plane_tol"',
+        "            if {[llength $shells] >= $section_min_shells && $maxdist <= $plane_tol} {",
+        "                set ::mcp_last_section_size $local_size",
+        '                puts "MCP accepted true section surface=$sid mesh_mode=$face_mode size=$local_size shells=[llength $shells] quads=$quads min_shells=$section_min_shells maxdist=$maxdist plane_tol=$plane_tol"',
         "                return $shells",
         "            }",
+        '            puts "MCP rejected section surface=$sid mesh_mode=$face_mode size=$local_size shells=[llength $shells] quads=$quads min_shells=$section_min_shells maxdist=$maxdist plane_tol=$plane_tol"',
         "            mcp_delete_elems $shells",
         "        }",
         "    }",
@@ -4012,12 +4004,18 @@ def generate_cutsection_spin_hex_tcl(
         "}",
         'catch {*beginhistorystate "MCP cut-section spin hex"}',
         '*currentcollector components "$target_component"',
-        "set ::mcp_allow_quad_only_fallback $allow_quad_only_fallback",
-        "set ::mcp_section_edge_seed_counts $section_edge_seed_counts",
+        "set ::mcp_section_size_factors $section_size_factors",
+        "set ::mcp_section_size_min $section_size_min",
+        "set ::mcp_section_size_max $section_size_max",
         "set hex_success 0",
         "set final_hex_count 0",
+        "set final_3d_count 0",
         "set final_source_shell_count 0",
         "set final_source_quad_count 0",
+        "set final_source_surface -1",
+        "set final_spin_density 0",
+        "set final_section_size $elem_size",
+        "set ::mcp_last_section_size $elem_size",
         "if {$delete_existing_component_elements} {",
         '    *createmark elems 1 "by comp name" $target_component',
         "    if {[mcp_mark_count elems 1] > 0} {catch {*deletemark elems 1}}",
@@ -4034,6 +4032,11 @@ def generate_cutsection_spin_hex_tcl(
         "        set new_surfs [lsort -integer [mcp_list_subtract [mcp_all_surfs] $before_surfs]]",
         '        puts "MCP cut-section new_surfs=$new_surfs"',
         "        set candidate_surfs $new_surfs",
+        "        if {[llength $candidate_surfs] == 0} {",
+        '            puts "MCP cut-section no new surfaces; checking existing solid surfaces on the split plane."',
+        "            *createmark surfs 2 \"by solids\" $target_solid",
+        "            set candidate_surfs [hm_getmark surfs 2]",
+        "        }",
         "        if {$include_existing_section_surfaces} {",
         "            *createmark surfs 2 \"by solids\" $target_solid",
         "            set solid_surfs [hm_getmark surfs 2]",
@@ -4046,34 +4049,44 @@ def generate_cutsection_spin_hex_tcl(
         "            set effective_plane_tol [expr {max($plane_tol, $attempt_size * 0.05)}]",
         '            puts "MCP cut-section spin attempt=$attempt elem_size=$attempt_size"',
         "            set seed_shells {}",
+        "            set seed_surface -1",
         "            foreach sid $candidate_surfs {",
         "                set shells [mcp_mesh_true_section $sid $attempt_size $split_nx $split_ny $split_nz $split_px $split_py $split_pz $effective_plane_tol]",
-        "                foreach e $shells {lappend seed_shells $e}",
+        "                if {[llength $shells] > 0} {",
+        "                    set seed_shells $shells",
+        "                    set seed_surface $sid",
+        "                    break",
+        "                }",
         "            }",
-            "            if {[llength $seed_shells] == 0} {",
-        '                puts "MCP cut-section spin attempt failed: no true all-quad section surfaces were found."',
+        "            if {[llength $seed_shells] == 0} {",
+        '                puts "MCP cut-section spin attempt failed: no section mesh elements within plane tolerance were found."',
         "                incr attempt",
         "                continue",
         "            }",
-            "            set before_elems [mcp_all_elems]",
-            "            set final_source_shell_count [llength $seed_shells]",
-            "            set final_source_quad_count [llength $seed_shells]",
-            "            eval *createmark elems 1 $seed_shells",
+        "            set before_elems [mcp_all_elems]",
+        "            set final_source_shell_count [llength $seed_shells]",
+        "            set final_source_quad_count [mcp_quad_shell_count $seed_shells]",
+        "            set final_source_surface $seed_surface",
+        '            puts "MCP cut-section selected_section_surface=$seed_surface source_shells=$final_source_shell_count source_quads=$final_source_quad_count"',
+        "            eval *createmark elems 1 $seed_shells",
         f"            *createplane 1 {snx} {sny} {snz} $axis_px $axis_py $axis_pz",
-        "            if {[catch {*meshspinelements2 1 1 360 $spin_density 1 0.0 0} spin_err]} {",
+        "            set actual_spin_density [mcp_spin_density_for_shells $seed_shells $spin_axis_key $axis_px $axis_py $axis_pz $::mcp_last_section_size $spin_density_min $spin_density_max]",
+        "            set final_spin_density $actual_spin_density",
+        "            set final_section_size $::mcp_last_section_size",
+        "            if {[catch {*meshspinelements2 1 1 360 $actual_spin_density 1 0.0 0} spin_err]} {",
         '                puts "MCP cut-section spin attempt failed: $spin_err"',
         "            } else {",
         "                set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
         "                set hex_count [mcp_hex8_count $new_elems]",
-        "                set fit_ok [mcp_bbox_fit_ok $new_elems $target_solid $fit_tol_ratio $attempt_size]",
-                "                if {[llength $new_elems] > 0 && $hex_count == [llength $new_elems] && $fit_ok} {",
+        "                if {[llength $new_elems] > 0} {",
         "                    eval *createmark elems 1 $new_elems",
         "                    catch {*movemark elems 1 $target_component}",
-                    "                    set hex_success 1",
-                    "                    set final_hex_count $hex_count",
-        '                    puts "MCP cut-section spin completed: hex8=$hex_count fit_ok=$fit_ok"',
+        "                    set hex_success 1",
+        "                    set final_hex_count $hex_count",
+        "                    set final_3d_count [llength $new_elems]",
+        '                    puts "MCP cut-section spin completed: total_3d=[llength $new_elems] hex8=$hex_count"',
         "                } else {",
-        '                    puts "MCP cut-section spin invalid: new_elements=[llength $new_elems] hex8=$hex_count fit_ok=$fit_ok; cleaning and retrying/falling back."',
+        '                    puts "MCP cut-section spin invalid: new_elements=[llength $new_elems] hex8=$hex_count; cleaning and retrying/falling back."',
         "                    mcp_delete_elems $new_elems",
         "                }",
         "            }",
@@ -4083,7 +4096,7 @@ def generate_cutsection_spin_hex_tcl(
         "    }",
         "}",
         'if {!$hex_success} { puts "MCP cut-section spin failed: tetra fallback removed_old_tetra_path=1" }',
-        'puts "MCP_SPIN_RESULT solid=$target_solid ok=$hex_success hex8=$final_hex_count source_shells=$final_source_shell_count source_quads=$final_source_quad_count source_surface=-1 fallback_tetra=[expr {!$hex_success}] method=cutsection"',
+        'puts "MCP_SPIN_RESULT solid=$target_solid ok=$hex_success total3d=$final_3d_count hex8=$final_hex_count source_shells=$final_source_shell_count source_quads=$final_source_quad_count source_surface=$final_source_surface fallback_tetra=[expr {!$hex_success}] method=cutsection requested_size=$elem_size section_size=$final_section_size section_size_min=$section_size_min section_size_max=$section_size_max spin_density=$final_spin_density density_min=$spin_density_min density_max=$spin_density_max"',
         'catch {*endhistorystate "MCP cut-section spin hex"}',
     ]
     if output_hm_path:
@@ -4093,9 +4106,9 @@ def generate_cutsection_spin_hex_tcl(
         "success": True,
         "script": _wrap_generated_tcl("generate_cutsection_spin_hex_tcl", "namespace eval ::mcp_meshing {\n" + "\n".join(lines) + "\n}\n"),
         "strategy": (
-            "Generic cut-section spin: split the actual solid first, accept only "
-            "new all-quad surfaces that lie on that cut plane, then spin those "
-            "2D shells. This is intended for stepped/recessed revolved solids."
+            "Generic cut-section spin: split the actual solid first, select one "
+            "new cut-section surface, choose a local 2D size from that section, "
+            "then spin the accepted section mesh."
         ),
     }
 
@@ -4398,6 +4411,7 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
         tetra_count = int(report_data.get("tetra_count") or 0)
     other_count = max(0, total_solids - drag_count - spin_count - tetra_count)
 
+    drag_step = report_data.get("drag", {}) if isinstance(report_data.get("drag"), dict) else {}
     spin_step = report_data.get("spin", {}) if isinstance(report_data.get("spin"), dict) else {}
     tetra_step = report_data.get("tetra", {}) if isinstance(report_data.get("tetra"), dict) else {}
     final_save = report_data.get("final_save", {}) if isinstance(report_data.get("final_save"), dict) else {}
@@ -4489,6 +4503,15 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     lines.append("二、网格生成结果")
     lines.append("-" * 28)
     lines.append(f"drag 六面体实体数量：{_mcp_fmt_int(drag_count)}")
+    drag_one_layer = drag_step.get("one_layer_fallback", []) if isinstance(drag_step.get("one_layer_fallback"), list) else []
+    if drag_one_layer:
+        lines.append(f"drag 三层 aspect 检查后改为一层兜底的实体数量：{_mcp_fmt_int(len(drag_one_layer))}")
+        for item in drag_one_layer:
+            lines.append(
+                f"  - solid {item.get('solid_id', '')} {item.get('component_name', '')}: "
+                f"最终层数={item.get('layers', 1)}, "
+                f"aspect>{item.get('aspect_threshold', 20)} 数量={item.get('aspect_bad', 0)}"
+            )
     lines.append(f"spin 六面体尝试实体数量：{_mcp_fmt_int(spin_step.get('count', 0))}")
     lines.append(f"spin 六面体成功实体数量：{_mcp_fmt_int(len(spin_step.get('completed', []) or []))}")
     lines.append(f"spin 失败后转 tetra 实体数量：{_mcp_fmt_int(len(spin_step.get('fallback_to_tetra', []) or []) + len(spin_step.get('failed', []) or []))}")
@@ -4512,6 +4535,15 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
             ("drag_element_size_max", "drag 六面体网格尺寸上限"),
             ("drag_fit_tolerance_ratio", "drag 贴合容差比例"),
             ("drag_retry_count", "drag 重试次数"),
+            ("drag_aspect_guard", "drag 三层 aspect 检查"),
+            ("drag_aspect_threshold", "drag hex aspect 阈值"),
+            ("drag_min_layers", "drag 最少层数"),
+            ("spin_element_size", "spin 截面 2D 请求尺寸"),
+            ("spin_retry_count", "spin 重试次数"),
+            ("spin_density_min", "spin 旋转份数下限"),
+            ("spin_density_max", "spin 旋转份数上限"),
+            ("spin_section_element_size_min", "spin 截面 2D 尺寸下限"),
+            ("spin_section_element_size_max", "spin 截面 2D 尺寸上限"),
             ("tetra_element_size", "tetra 四面体网格尺寸"),
             ("tetra_element_size_min", "tetra 四面体目标尺寸下限"),
             ("tetra_element_size_max", "tetra 四面体目标尺寸上限"),
@@ -4551,6 +4583,40 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     f"distance={item.get('drag_distance', '未记录')}, "
                     f"fit_tolerance_ratio={item.get('fit_tolerance_ratio', '未记录')}, "
                     f"retry_count={item.get('retry_count', '未记录')}"
+                )
+                if item.get("aspect_guard") is not None:
+                    lines.append(
+                        "  - drag aspect："
+                        f"enabled={item.get('aspect_guard')}, "
+                        f"threshold={item.get('aspect_threshold', '未记录')}, "
+                        f"min_layers={item.get('min_layers', '未记录')}, "
+                        f"actual_layers={item.get('actual_layers', '未记录')}, "
+                        f"aspect_bad={item.get('aspect_bad', '未记录')}, "
+                        f"one_layer_fallback={item.get('one_layer_fallback', False)}"
+                    )
+            elif str(strategy).startswith("spin"):
+                lines.append(
+                    "  - 截面 2D 尺寸："
+                    f"requested={item.get('requested_element_size', '未记录')}, "
+                    f"actual={item.get('actual_element_size', '未记录')}, "
+                    f"limit={item.get('section_element_size_min', '未记录')}..{item.get('section_element_size_max', '未记录')}"
+                )
+                lines.append(
+                    "  - spin 参数："
+                    f"axis={item.get('axis', '未记录')}, "
+                    f"method={item.get('method', '未记录')}, "
+                    f"density_limit={item.get('requested_spin_density_min', '未记录')}..{item.get('requested_spin_density_max', '未记录')}, "
+                    f"actual_density={item.get('actual_spin_density', '未记录')}, "
+                    f"retry_count={item.get('retry_count', '未记录')}"
+                )
+                lines.append(
+                    "  - spin 结果："
+                    f"source_surface={item.get('source_surface_id', '未记录')}, "
+                    f"source_shells={item.get('source_shells', '未记录')}, "
+                    f"source_quads={item.get('source_quads', '未记录')}, "
+                    f"total3d={item.get('total3d', '未记录')}, "
+                    f"hex8={item.get('hex8', '未记录')}, "
+                    f"fallback_tetra={item.get('fallback_tetra', False)}"
                 )
             else:
                 lines.append(

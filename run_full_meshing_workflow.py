@@ -782,8 +782,52 @@ def _parse_spin_results(response_text: str) -> dict[str, dict[str, Any]]:
             method_match = re.search(r"method=([^\s]+)", line)
             if method_match:
                 item["method"] = method_match.group(1)
+            split_match = re.search(r"split_solids=<([^>]*)>", line)
+            if split_match:
+                item["split_solid_ids"] = [
+                    int(value)
+                    for value in split_match.group(1).split()
+                    if value.strip().lstrip("-").isdigit()
+                ]
             actual[match.group(1)] = item
     return actual
+
+
+def _promote_spin_fallback_solids_to_tetra(
+    *,
+    parsed: dict[str, Any],
+    spin_solid: dict[str, Any],
+    active_results: dict[str, dict[str, Any]],
+    results: dict[str, dict[str, Any]],
+) -> list[int]:
+    sid = int(spin_solid["solid_id"])
+    fallback_ids = [int(value) for value in parsed.get("split_solid_ids") or [sid] if int(value) > 0]
+    if sid not in fallback_ids:
+        fallback_ids.insert(0, sid)
+    source = dict(results.get(str(sid)) or active_results.get(str(sid)) or {})
+    if not source:
+        source = {
+            "solid_id": sid,
+            "component_name": spin_solid.get("component_name", f"solid_{sid}"),
+            "element_size": spin_solid.get("element_size", 1.0),
+            "min_element_size": 0.5,
+            "surf_count": 0,
+            "evidence": [],
+        }
+    for fallback_id in fallback_ids:
+        target = dict(source)
+        target["solid_id"] = fallback_id
+        target["strategy"] = "tetra_plain"
+        if fallback_id != sid:
+            target["component_name"] = f"{source.get('component_name', f'solid_{sid}')}_split{fallback_id}"
+        target.setdefault("evidence", [])
+        target["evidence"] = list(target["evidence"])
+        target["evidence"].append("spin failed after split -> tetra fallback")
+        target["allow_tetmesh"] = True
+        target["allow_surface_mesh"] = True
+        active_results[str(fallback_id)] = target
+        results[str(fallback_id)] = target
+    return fallback_ids
 
 
 def _parse_tetra_actual_parameters(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1356,13 +1400,15 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             if spin_response.get("success") and int(parsed.get("ok") or 0) == 1 and spun_3d_count > 0:
                 spin_step["completed"].append({"solid_id": sid, **parsed, "script_path": str(spin_script_path)})
             else:
-                spin_step["fallback_to_tetra"].append({"solid_id": sid, **parsed, "script_path": str(spin_script_path)})
-                if str(sid) in active_results:
-                    active_results[str(sid)]["strategy"] = "tetra_plain"
-                    active_results[str(sid)].setdefault("evidence", []).append("spin failed -> tetra fallback")
-                if str(sid) in results:
-                    results[str(sid)]["strategy"] = "tetra_plain"
-                    results[str(sid)].setdefault("evidence", []).append("spin failed -> tetra fallback")
+                fallback_ids = _promote_spin_fallback_solids_to_tetra(
+                    parsed=parsed,
+                    spin_solid=spin_solid,
+                    active_results=active_results,
+                    results=results,
+                )
+                spin_step["fallback_to_tetra"].append(
+                    {"solid_id": sid, **parsed, "fallback_solid_ids": fallback_ids, "script_path": str(spin_script_path)}
+                )
         except Exception as exc:
             spin_step["failed"].append({"solid_id": sid, "error": str(exc)})
             if str(sid) in active_results:

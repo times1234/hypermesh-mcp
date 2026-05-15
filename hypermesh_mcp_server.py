@@ -143,25 +143,16 @@ GENERIC_MESHING_RULES = {
         ),
         "fallback": "tetra_surface_deviation_rtrias",
     },
-    "spin_hex_guarded": {
-        "use_when": [
-            "clean revolved solid",
-            "the selected source surface is already a true cross-section",
-            "the source section meshes as 100% quads",
-        ],
-        "fallback": "cutsection_spin_hex for stepped/recessed revolved solids; otherwise tetra_surface_deviation_rtrias",
-    },
     "cutsection_spin_hex": {
         "use_when": [
             "stepped, recessed, or ambiguous revolved solid",
-            "no existing face can be trusted as the spin section",
             "a middle cutting plane through the rotation axis can be defined",
         ],
         "method": [
             "split the actual solid with body_splitmerge_with_plane",
-            "detect newly created surfaces that lie on the cutting plane",
-            "accept only all-quad section meshes on that plane",
-            "spin the accepted 2D section into 3D hex elements",
+            "detect the two newly created cross-section surfaces",
+            "mesh one cross-section surface first; mixed 2D section mesh is allowed during spin debugging",
+            "spin only the quad shell elements from that 2D section into 3D hex elements",
         ],
         "fallback": "tetra_surface_deviation_rtrias",
     },
@@ -249,7 +240,6 @@ TRUSTED_MESHING_GENERATORS = {
     "generate_batched_plain_tetra_tcl",
     "generate_guarded_drag_hex_tcl",
     "generate_batched_drag_hex_tcl",
-    "generate_guarded_spin_hex_tcl",
     "generate_cutsection_spin_hex_tcl",
 }
 TRUSTED_NON_MESHING_GENERATORS = {
@@ -758,7 +748,10 @@ def _parse_probe_facts(line: str):
             facts[k] = v
     ALIASES = {"id": "solid_id", "solid": "solid_id", "sc": "surf_count", "comp": "component_name",
                "mn": "min_dim", "mx": "max_dim", "md": "mid_dim", "diag": "diagonal",
-               "src_surf": "source_surface_id", "drag_axis": "drag_axis"}
+               "src_surf": "source_surface_id", "drag_axis": "drag_axis",
+               "src_loops": "source_loop_count", "src_inner_loops": "source_inner_loop_count",
+               "src_boundary_edges": "source_boundary_edge_count",
+               "src_boundary_nodes": "source_boundary_node_count"}
     for old, new in ALIASES.items():
         if old in facts and new not in facts:
             facts[new] = facts[old]
@@ -789,6 +782,40 @@ def _generate_geometry_component_name(facts, strategy, suffix_solid_id=True):
     elif strategy == "spin_hex":
         return "disc_D" + str(round(md)) + "_t" + str(round(mn)) + sfx
     return "solid_" + str(round(dx)) + "x" + str(round(dy)) + "x" + str(round(dz)) + sfx
+
+
+def _spin_cutsection_params_from_probe(facts: dict[str, Any]) -> dict[str, Any]:
+    """Build a cut-section spin plan from bbox facts.
+
+    The spin axis is the smallest bbox direction. The split plane must contain
+    that axis, so its normal is chosen from one of the two radial directions.
+    """
+    axis = str(facts.get("drag_axis", "") or "z").lower()
+    if axis not in {"x", "y", "z"}:
+        axis = "z"
+    x0, y0, z0 = (float(facts.get(k, 0.0) or 0.0) for k in ("x0", "y0", "z0"))
+    x1, y1, z1 = (float(facts.get(k, 0.0) or 0.0) for k in ("x1", "y1", "z1"))
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    cz = (z0 + z1) / 2.0
+    normal_by_axis = {
+        "x": [0.0, 1.0, 0.0],
+        "y": [1.0, 0.0, 0.0],
+        "z": [1.0, 0.0, 0.0],
+    }
+    return {
+        "spin_method": "cutsection",
+        "spin_axis": axis,
+        "spin_axis_point": [round(cx, 6), round(cy, 6), round(cz, 6)],
+        "spin_split_plane_normal": normal_by_axis[axis],
+        "spin_split_plane_point": [round(cx, 6), round(cy, 6), round(cz, 6)],
+    }
+
+
+def _spin_params_from_probe(facts: dict[str, Any]) -> dict[str, Any]:
+    # Spin is intentionally based on a real cross-section cut through the
+    # rotation axis. Do not reuse drag end faces or guessed longitudinal faces.
+    return _spin_cutsection_params_from_probe(facts)
 
 
 def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1117,6 +1144,92 @@ def _extract_probe_lines(text: str) -> list[str]:
 
 
 _PROBE_TCL_TEMPLATE = r"""
+proc mcp_all_elems {} {
+    *createmark elems 1 "all"
+    return [hm_getmark elems 1]
+}
+
+proc mcp_all_nodes {} {
+    *createmark nodes 1 "all"
+    return [hm_getmark nodes 1]
+}
+
+proc mcp_list_subtract {a b} {
+    array set seen {}
+    foreach x $b {set seen($x) 1}
+    set out {}
+    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}
+    return $out
+}
+
+proc mcp_delete_elems {elems} {
+    if {[llength $elems] == 0} {return}
+    eval *createmark elems 1 $elems
+    catch {*deletemark elems 1}
+}
+
+proc mcp_delete_nodes {nodes} {
+    if {[llength $nodes] == 0} {return}
+    eval *createmark nodes 1 $nodes
+    catch {*deletemark nodes 1}
+}
+
+proc mcp_shell_loop_info {elems} {
+    if {[llength $elems] == 0} {return {0 0 0}}
+    array set edge_count {}
+    array set edge_nodes {}
+    foreach eid $elems {
+        if {[catch {hm_getvalue elems id=$eid dataname=nodes} nodes]} {continue}
+        set n [llength $nodes]
+        if {$n < 3} {continue}
+        for {set i 0} {$i < $n} {incr i} {
+            set a [lindex $nodes $i]
+            set b [lindex $nodes [expr {($i + 1) % $n}]]
+            if {$a eq "" || $b eq "" || $a == $b} {continue}
+            if {$a < $b} {
+                set key "$a,$b"
+                set pair [list $a $b]
+            } else {
+                set key "$b,$a"
+                set pair [list $b $a]
+            }
+            if {![info exists edge_count($key)]} {set edge_count($key) 0}
+            incr edge_count($key)
+            set edge_nodes($key) $pair
+        }
+    }
+    array set adj {}
+    set boundary_edges 0
+    foreach key [array names edge_count] {
+        if {$edge_count($key) != 1} {continue}
+        incr boundary_edges
+        set pair $edge_nodes($key)
+        set a [lindex $pair 0]
+        set b [lindex $pair 1]
+        lappend adj($a) $b
+        lappend adj($b) $a
+    }
+    array set seen {}
+    set loops 0
+    foreach node [array names adj] {
+        if {[info exists seen($node)]} {continue}
+        incr loops
+        set stack [list $node]
+        set seen($node) 1
+        while {[llength $stack] > 0} {
+            set cur [lindex $stack end]
+            set stack [lrange $stack 0 end-1]
+            foreach nb $adj($cur) {
+                if {![info exists seen($nb)]} {
+                    set seen($nb) 1
+                    lappend stack $nb
+                }
+            }
+        }
+    }
+    return [list $loops $boundary_edges [array size adj]]
+}
+
 proc find_best_source_surface {solid_id drag_axis sbb_min sbb_max} {
     *createmark surfaces 1 "by solids" $solid_id
     set all_surfs [hm_getmark surfaces 1]
@@ -1204,8 +1317,33 @@ foreach sid $solid_ids {
     set sbb_min [list [lindex $bb 0] [lindex $bb 1] [lindex $bb 2]]
     set sbb_max [list [lindex $bb 3] [lindex $bb 4] [lindex $bb 5]]
     set src_surf [find_best_source_surface $sid $drag_axis $sbb_min $sbb_max]
+    set src_loop_count 0
+    set src_inner_loop_count 0
+    set src_boundary_edge_count 0
+    set src_boundary_node_count 0
+    if {$src_surf > 0 && $diag > 0.001} {
+        set before_elems [mcp_all_elems]
+        set before_nodes [mcp_all_nodes]
+        set source_probe_size [expr {max(min($diag / 12.0, 5.0), 0.5)}]
+        set source_probe_min [expr {max($source_probe_size / 4.0, 0.2)}]
+        set source_probe_max [expr {$source_probe_size * 2.0}]
+        *createmark surfaces 1 $src_surf
+        *createarray 3 0 0 0
+        catch {*defaultmeshsurf_growth 1 $source_probe_size 3 3 2 1 1 1 35 0 $source_probe_min $source_probe_max 0.2 20.0 1.3 1 3 1 0}
+        set source_elems [mcp_list_subtract [mcp_all_elems] $before_elems]
+        set source_nodes [mcp_list_subtract [mcp_all_nodes] $before_nodes]
+        if {[llength $source_elems] > 0} {
+            set loop_info [mcp_shell_loop_info $source_elems]
+            set src_loop_count [lindex $loop_info 0]
+            set src_boundary_edge_count [lindex $loop_info 1]
+            set src_boundary_node_count [lindex $loop_info 2]
+            if {$src_loop_count > 1} {set src_inner_loop_count [expr {$src_loop_count - 1}]}
+        }
+        mcp_delete_elems $source_elems
+        mcp_delete_nodes $source_nodes
+    }
     
-    puts $f "PROBE: solid=$sid comp=\"$comp_name\" sc=$sc dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag] src_surf=$src_surf drag_axis=$drag_axis"
+    puts $f "PROBE: solid=$sid comp=\"$comp_name\" sc=$sc x0=[format %.6f [lindex $bb 0]] y0=[format %.6f [lindex $bb 1]] z0=[format %.6f [lindex $bb 2]] x1=[format %.6f [lindex $bb 3]] y1=[format %.6f [lindex $bb 4]] z1=[format %.6f [lindex $bb 5]] dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag] src_surf=$src_surf drag_axis=$drag_axis src_loops=$src_loop_count src_inner_loops=$src_inner_loop_count src_boundary_edges=$src_boundary_edge_count src_boundary_nodes=$src_boundary_node_count"
 }
 close $f
 """
@@ -1264,22 +1402,33 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         sc = f.get("surf_count", 6)
         dims = sorted([dx, dy, dz])
         mn, md, mx = dims[0], dims[1], dims[2]
-        is_circular = (dx > 0 and dy > 0 and abs(dx - dy) / max(dx, dy) < 0.20)
+        drag_axis = str(f.get("drag_axis", "") or "").lower()
+        if drag_axis == "x":
+            cross_a, cross_b = dy, dz
+        elif drag_axis == "y":
+            cross_a, cross_b = dx, dz
+        else:
+            cross_a, cross_b = dx, dy
+        cross_ratio = min(cross_a, cross_b) / max(cross_a, cross_b, 0.001)
+        is_axisymmetric_bbox = cross_ratio >= 0.85
         strategy = "tetra_plain"
         evidence = []
         elem_size = 1.0
         min_elem_size = 0.5
         src_surf = f.get("source_surface_id", -1)
+        source_inner_loops = int(f.get("source_inner_loop_count", 0) or 0)
         
         if sc == 6 and mx > 0 and mn / mx < 0.40 and src_surf > 0:
             strategy = "drag_hex"
             evidence.append("6-face thin -> drag")
-        elif is_circular and slender > 2.5 and mx > 2 * md and sc <= 10:
+        elif sc == 4 and mx > 0 and src_surf > 0 and cross_ratio >= 0.75 and mn / mx <= 0.60:
+            strategy = "drag_hex"
+            evidence.append("4-surface short cylinder -> drag")
+        elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops > 0 and mn / mx <= 0.55 and 10 <= sc <= 24:
             strategy = "spin_hex"
-            evidence.append("shaft -> spin")
-        elif is_circular and slender < 3 and mx < 2 * md and 6 < sc <= 10:
-            strategy = "spin_hex"
-            evidence.append("compact -> spin")
+            evidence.append("axisymmetric recessed/hollow body -> cut-section spin")
+        elif is_axisymmetric_bbox and src_surf > 0 and mn / mx <= 0.55 and 10 <= sc <= 24:
+            evidence.append("axisymmetric but source section has no inner loop -> tetra")
         elif slender > 15 and mn < 2.0:
             strategy = "tetra_plain"
             evidence.append("thin plate")
@@ -1318,6 +1467,7 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
             allow_tetmesh = True
             allow_surface_mesh = True
         name = _generate_geometry_component_name(f, strategy, suffix_solid_id=True)
+        spin_plan = _spin_params_from_probe(f) if strategy == "spin_hex" else {}
         results[str(sid)] = {
             "solid_id": sid, "strategy": strategy, "component_name": name,
             "element_size": round(elem_size, 2),
@@ -1327,11 +1477,16 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
             "allow_surface_mesh": allow_surface_mesh,
             "evidence": evidence,
             "source_surface_id": f.get("source_surface_id", -1),
+            "source_loop_count": int(f.get("source_loop_count", 0) or 0),
+            "source_inner_loop_count": source_inner_loops,
+            "source_boundary_edge_count": int(f.get("source_boundary_edge_count", 0) or 0),
+            "source_boundary_node_count": int(f.get("source_boundary_node_count", 0) or 0),
             "drag_axis": f.get("drag_axis", ""),
             "gear_axis": f.get("drag_axis", ""),
             "geometry_confirms_gear_teeth": strategy == "gear_aware_tetra",
             "surf_count": sc,
             "dims": {"dx": dx, "dy": dy, "dz": dz, "mn": mn, "md": md, "mx": mx},
+            **spin_plan,
         }
     counts = {}
     for r in results.values():
@@ -1370,7 +1525,10 @@ def suggest_component_names(probe_lines):
     names = {}
     for line in _probe_lines_iter(probe_lines):
         stripped = line.strip()
-        if not stripped or not stripped.startswith("PROBE:"):
+        if not stripped or not (
+            stripped.startswith("PROBE:")
+            or stripped.startswith("MCP_PROBE_SOLID")
+        ):
             continue
         f = _parse_probe_facts(line)
         sid = f.get("solid_id", 0)
@@ -1639,6 +1797,66 @@ def generate_geometry_probe_tcl(
         "    eval *createmark nodes 1 $nodes",
         "    catch {*deletemark nodes 1}",
         "}",
+        "proc mcp_shell_loop_info {elems} {",
+        "    if {[llength $elems] == 0} {return {0 0 0}}",
+        "    array set edge_count {}",
+        "    array set edge_nodes {}",
+        "    foreach eid $elems {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=nodes} nodes]} {continue}",
+        "        set n [llength $nodes]",
+        "        if {$n < 3} {continue}",
+        "        for {set i 0} {$i < $n} {incr i} {",
+        "            set a [lindex $nodes $i]",
+        "            set b [lindex $nodes [expr {($i + 1) % $n}]]",
+        "            if {$a eq \"\" || $b eq \"\" || $a == $b} {continue}",
+        "            if {$a < $b} {",
+        "                set key \"$a,$b\"",
+        "                set pair [list $a $b]",
+        "            } else {",
+        "                set key \"$b,$a\"",
+        "                set pair [list $b $a]",
+        "            }",
+        "            if {![info exists edge_count($key)]} {set edge_count($key) 0}",
+        "            incr edge_count($key)",
+        "            set edge_nodes($key) $pair",
+        "        }",
+        "    }",
+        "    array set adj {}",
+        "    set boundary_edges 0",
+        "    foreach key [array names edge_count] {",
+        "        if {$edge_count($key) != 1} {continue}",
+        "        incr boundary_edges",
+        "        set pair $edge_nodes($key)",
+        "        set a [lindex $pair 0]",
+        "        set b [lindex $pair 1]",
+        "        lappend adj($a) $b",
+        "        lappend adj($b) $a",
+        "    }",
+        "    array set seen {}",
+        "    set loops 0",
+        "    foreach node [array names adj] {",
+        "        if {[info exists seen($node)]} {continue}",
+        "        incr loops",
+        "        set stack [list $node]",
+        "        set seen($node) 1",
+        "        while {[llength $stack] > 0} {",
+        "            set cur [lindex $stack end]",
+        "            set stack [lrange $stack 0 end-1]",
+        "            foreach nb $adj($cur) {",
+        "                if {![info exists seen($nb)]} {",
+        "                    set seen($nb) 1",
+        "                    lappend stack $nb",
+        "                }",
+        "            }",
+        "        }",
+        "    }",
+        "    return [list $loops $boundary_edges [array size adj]]",
+        "}",
+        "proc mcp_surface_loop_info {surface_id} {",
+        "    if {$surface_id <= 0} {return {0 0 0}}",
+        "    *createmark elems 1 \"by surface\" $surface_id",
+        "    return [mcp_shell_loop_info [hm_getmark elems 1]]",
+        "}",
         "proc mcp_best_source_surface {solid_id drag_axis solid_bb} {",
         "    *createmark surfaces 1 \"by solids\" $solid_id",
         "    set all_surfs [hm_getmark surfaces 1]",
@@ -1726,11 +1944,20 @@ def generate_geometry_probe_tcl(
         "    }",
         "    set drag_axis \"\"",
         "    set src_surf -1",
+        "    set src_loop_count 0",
+        "    set src_inner_loop_count 0",
+        "    set src_boundary_edge_count 0",
+        "    set src_boundary_node_count 0",
         "    if {$bbox_ok} {",
         "        if {$dx <= $dy && $dx <= $dz} {set drag_axis \"x\"} elseif {$dy <= $dx && $dy <= $dz} {set drag_axis \"y\"} else {set drag_axis \"z\"}",
         "        set src_surf [mcp_best_source_surface $sid $drag_axis $bb]",
+        "        set loop_info [mcp_surface_loop_info $src_surf]",
+        "        set src_loop_count [lindex $loop_info 0]",
+        "        set src_boundary_edge_count [lindex $loop_info 1]",
+        "        set src_boundary_node_count [lindex $loop_info 2]",
+        "        if {$src_loop_count > 1} {set src_inner_loop_count [expr {$src_loop_count - 1}]}",
         "    }",
-        '    mcp_probe_line "MCP_PROBE_SOLID id=$sid exists=1 surf_count=$surf_count elem_count=[llength $new_elems] node_count=[llength $new_nodes] tri_count=$tri_count quad_count=$quad_count bbox_ok=$bbox_ok dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender src_surf=$src_surf drag_axis=$drag_axis"',
+        '    mcp_probe_line "MCP_PROBE_SOLID id=$sid exists=1 surf_count=$surf_count elem_count=[llength $new_elems] node_count=[llength $new_nodes] tri_count=$tri_count quad_count=$quad_count bbox_ok=$bbox_ok x0=[lindex $bb 0] y0=[lindex $bb 1] z0=[lindex $bb 2] x1=[lindex $bb 3] y1=[lindex $bb 4] z1=[lindex $bb 5] dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender src_surf=$src_surf drag_axis=$drag_axis src_loops=$src_loop_count src_inner_loops=$src_inner_loop_count src_boundary_edges=$src_boundary_edge_count src_boundary_nodes=$src_boundary_node_count"',
         "    mcp_delete_elems $new_elems",
         "    mcp_delete_nodes $new_nodes",
         "}",
@@ -3105,6 +3332,7 @@ def generate_guarded_drag_hex_tcl(
         '    puts "MCP guarded drag skipped tetra fallback: removed_old_tetra_path=1"',
         "} else {",
         "    set hex_success 0",
+        "    set final_hex_count 0",
         "    set attempt 0",
         "    while {$attempt <= $retry_count && !$hex_success} {",
         '        puts "MCP guarded drag attempt=$attempt elem_size=$elem_size"',
@@ -3392,6 +3620,8 @@ def generate_guarded_spin_hex_tcl(
     component_name: str,
     axis: str = "z",
     solid_id: int | None = None,
+    spin_axis_point: list[float] | None = None,
+    section_edge_seed_counts: list[int] | None = None,
     fit_tolerance_ratio: float = 0.05,
     retry_count: int = 1,
     angle_degrees: float = 360.0,
@@ -3411,6 +3641,15 @@ def generate_guarded_spin_hex_tcl(
         raise ValueError("fit_tolerance_ratio must be greater than 0.")
     if retry_count < 0:
         raise ValueError("retry_count cannot be negative.")
+    retry_count = min(int(retry_count), 2)
+    if spin_axis_point is not None and len(spin_axis_point) != 3:
+        raise ValueError("spin_axis_point must contain 3 numbers when supplied.")
+    if section_edge_seed_counts is None:
+        section_edge_seed_counts = [4, 6, 8]
+    section_edge_seed_counts = [int(value) for value in section_edge_seed_counts if int(value) > 0]
+    section_edge_seed_counts = section_edge_seed_counts[:3]
+    if not section_edge_seed_counts:
+        raise ValueError("section_edge_seed_counts must contain at least one positive integer.")
 
     axis_key = axis.strip().lower()
     normals = {
@@ -3422,6 +3661,13 @@ def generate_guarded_spin_hex_tcl(
         raise ValueError("axis must be one of: x, y, z.")
 
     nx, ny, nz = normals[axis_key]
+    if spin_axis_point is None:
+        ax = ay = az = 0.0
+        has_axis_point = 0
+    else:
+        ax, ay, az = [float(value) for value in spin_axis_point]
+        has_axis_point = 1
+    seed_counts_text = " ".join(str(value) for value in section_edge_seed_counts)
     comp = component_name.replace('"', '\\"')
     lines = [
         "# HyperMesh MCP generated guarded spin-hex script",
@@ -3435,6 +3681,11 @@ def generate_guarded_spin_hex_tcl(
         f"set spin_density {int(density)}",
         f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
         f"set retry_count {int(retry_count)}",
+        f"set has_axis_point {has_axis_point}",
+        f"set axis_px {ax}",
+        f"set axis_py {ay}",
+        f"set axis_pz {az}",
+        f"set section_edge_seed_counts {{{seed_counts_text}}}",
         "proc mcp_all_elems {} {",
         '    *createmark elems 1 "all"',
         "    return [hm_getmark elems 1]",
@@ -3479,24 +3730,35 @@ def generate_guarded_spin_hex_tcl(
         "set cx [expr {([lindex $bb 0] + [lindex $bb 3]) / 2.0}]",
         "set cy [expr {([lindex $bb 1] + [lindex $bb 4]) / 2.0}]",
         "set cz [expr {([lindex $bb 2] + [lindex $bb 5]) / 2.0}]",
-        "*interactiveremeshsurf 1 $elem_size 4 4 2 1 1",
-        "*set_meshfaceparams 0 4 1 0 0 1 0.5 1 1",
-        "*automesh 0 4 1",
-        "*storemeshtodatabase 1",
-        "*ameshclearsurface",
-        '*createmark elems 1 "by surface" $source_surface',
-        "set source_shells [hm_getmark elems 1]",
+        "if {$has_axis_point} {set cx $axis_px; set cy $axis_py; set cz $axis_pz}",
+        "set source_shells {}",
         "set quad_count 0",
-        "foreach eid $source_shells {",
-        "    set cfg [hm_getvalue elems id=$eid dataname=config]",
-        "    if {$cfg == 104 || $cfg == 108} { incr quad_count }",
+        "foreach edge_seed $section_edge_seed_counts {",
+        "    *createmark surfaces 1 $source_surface",
+        "    *interactiveremeshsurf 1 $elem_size 4 4 2 1 1",
+        "    *set_meshfaceparams 0 4 1 0 0 1 0.5 1 1",
+        "    *automesh 0 4 1",
+        "    *storemeshtodatabase 1",
+        "    *ameshclearsurface",
+        '    *createmark elems 1 "by surface" $source_surface',
+        "    set source_shells [hm_getmark elems 1]",
+        "    set quad_count 0",
+        "    foreach eid $source_shells {",
+        "        set cfg [hm_getvalue elems id=$eid dataname=config]",
+        "        if {$cfg == 104 || $cfg == 108} { incr quad_count }",
+        "    }",
+        "    puts \"MCP guarded spin source edge_seed=$edge_seed shells=[llength $source_shells] quads=$quad_count\"",
+        "    if {[llength $source_shells] > 0 && $quad_count == [llength $source_shells]} {break}",
+        "    if {[llength $source_shells] > 0} { eval *createmark elems 1 $source_shells; catch {*deletemark elems 1} }",
         "}",
         "if {[llength $source_shells] == 0 || $quad_count != [llength $source_shells]} {",
         '    puts "MCP guarded spin skipped: source section is not all quads."',
         "    if {[llength $source_shells] > 0} { eval *createmark elems 1 $source_shells; catch {*deletemark elems 1} }",
         '    puts "MCP guarded spin skipped tetra fallback: removed_old_tetra_path=1"',
+        '    puts "MCP_SPIN_RESULT solid=$target_solid ok=0 hex8=0 source_shells=[llength $source_shells] source_quads=$quad_count source_surface=$source_surface fallback_tetra=1"',
         "} else {",
         "    set hex_success 0",
+        "    set final_hex_count 0",
         "    set attempt 0",
         "    while {$attempt <= $retry_count && !$hex_success} {",
         '        puts "MCP guarded spin attempt=$attempt elem_size=$elem_size"',
@@ -3508,6 +3770,7 @@ def generate_guarded_spin_hex_tcl(
         "        set fit_ok [mcp_bbox_fit_ok $new_elems $target_solid $fit_tol_ratio $elem_size]",
         "        if {[llength $new_elems] > 0 && $hex_count == [llength $new_elems] && $fit_ok} {",
         "            set hex_success 1",
+        "            set final_hex_count $hex_count",
         '            puts "MCP guarded spin completed: hex8=$hex_count fit_ok=$fit_ok"',
         "        } else {",
         '            puts "MCP guarded spin invalid: new_elements=[llength $new_elems] hex8=$hex_count fit_ok=$fit_ok; cleaning and retrying/falling back."',
@@ -3518,6 +3781,7 @@ def generate_guarded_spin_hex_tcl(
         "    eval *createmark elems 1 $source_shells",
         "    catch {*deletemark elems 1}",
         '    if {!$hex_success} { puts "MCP guarded spin failed: tetra fallback removed_old_tetra_path=1" }',
+        '    puts "MCP_SPIN_RESULT solid=$target_solid ok=$hex_success hex8=$final_hex_count source_shells=[llength $source_shells] source_quads=$quad_count source_surface=$source_surface fallback_tetra=[expr {!$hex_success}]"',
         "}",
         'catch {*endhistorystate "MCP guarded spin hex"}',
     ]
@@ -3549,7 +3813,8 @@ def generate_cutsection_spin_hex_tcl(
     plane_tolerance: float = 0.02,
     fit_tolerance_ratio: float = 0.05,
     retry_count: int = 1,
-    include_existing_section_surfaces: bool = True,
+    section_edge_seed_counts: list[int] | None = None,
+    include_existing_section_surfaces: bool = False,
     allow_quad_only_fallback: bool = True,
     delete_existing_component_elements: bool = True,
     output_hm_path: str | None = None,
@@ -3567,6 +3832,13 @@ def generate_cutsection_spin_hex_tcl(
         raise ValueError("fit_tolerance_ratio must be greater than 0.")
     if retry_count < 0:
         raise ValueError("retry_count cannot be negative.")
+    retry_count = min(int(retry_count), 2)
+    if section_edge_seed_counts is None:
+        section_edge_seed_counts = [4, 6, 8]
+    section_edge_seed_counts = [int(value) for value in section_edge_seed_counts if int(value) > 0]
+    section_edge_seed_counts = section_edge_seed_counts[:3]
+    if not section_edge_seed_counts:
+        raise ValueError("section_edge_seed_counts must contain at least one positive integer.")
     if not component_name.strip():
         raise ValueError("component_name cannot be empty.")
     if len(split_plane_normal) != 3 or len(split_plane_point) != 3:
@@ -3604,6 +3876,7 @@ def generate_cutsection_spin_hex_tcl(
     delete_existing = "1" if delete_existing_component_elements else "0"
     include_existing = "1" if include_existing_section_surfaces else "0"
     quad_fallback = "1" if allow_quad_only_fallback else "0"
+    seed_counts_text = " ".join(str(value) for value in section_edge_seed_counts)
     lines = [
         "# HyperMesh MCP generated cut-section spin-hex script",
         "# Use for stepped/recessed revolved solids where an existing face is not a reliable section.",
@@ -3615,6 +3888,7 @@ def generate_cutsection_spin_hex_tcl(
         f"set plane_tol {float(plane_tolerance)}",
         f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
         f"set retry_count {int(retry_count)}",
+        f"set section_edge_seed_counts {{{seed_counts_text}}}",
         f"set include_existing_section_surfaces {include_existing}",
         f"set allow_quad_only_fallback {quad_fallback}",
         f"set delete_existing_component_elements {delete_existing}",
@@ -3700,44 +3974,50 @@ def generate_cutsection_spin_hex_tcl(
         "    return $d",
         "}",
         "proc mcp_mesh_true_section {sid elem_size nx ny nz px py pz plane_tol} {",
-        "    set mesh_modes {{1 5}}",
-        "    if {$::mcp_allow_quad_only_fallback} {lappend mesh_modes {4 4}}",
+        "    set mesh_modes {{4 4}}",
+        "    if {!$::mcp_allow_quad_only_fallback} {set mesh_modes {{1 5}}}",
         "    foreach mode_pair $mesh_modes {",
         "        set interactive_mode [lindex $mode_pair 0]",
         "        set face_mode [lindex $mode_pair 1]",
-        "        *createmark surfaces 1 $sid",
-        "        catch {*setedgedensitylinkwithaspectratio -1}",
-        "        *setedgedensitylink 1",
-        "        *interactiveremeshsurf 1 $elem_size $interactive_mode $face_mode 2 1 1",
-        "        *set_meshfaceparams 0 $face_mode 1 0 0 1 0.5 1 1",
-        "        *automesh 0 $face_mode 1",
-        "        *storemeshtodatabase 1",
-        "        *ameshclearsurface",
-        '        *createmark elems 1 "by surface" $sid',
-        "        set shells [hm_getmark elems 1]",
-        "        if {[llength $shells] == 0} {continue}",
-        "        set quads 0",
-        "        set maxdist 0.0",
-        "        foreach eid $shells {",
-        "            set cfg [hm_getvalue elems id=$eid dataname=config]",
-        "            if {$cfg == 104 || $cfg == 108} {incr quads}",
-        "            foreach nid [hm_getvalue elems id=$eid dataname=nodes] {",
-        "                set d [mcp_node_plane_dist $nid $nx $ny $nz $px $py $pz]",
-        "                if {$d > $maxdist} {set maxdist $d}",
+        "        foreach edge_seed $::mcp_section_edge_seed_counts {",
+        "            *createmark surfaces 1 $sid",
+        "            catch {*setedgedensitylinkwithaspectratio -1}",
+        "            *setedgedensitylink 1",
+        "            *interactiveremeshsurf 1 $elem_size $interactive_mode $face_mode 2 1 1",
+        "            *set_meshfaceparams 0 $face_mode 1 0 0 1 0.5 1 1",
+        "            *automesh 0 $face_mode 1",
+        "            *storemeshtodatabase 1",
+        "            *ameshclearsurface",
+        '            *createmark elems 1 "by surface" $sid',
+        "            set shells [hm_getmark elems 1]",
+        "            if {[llength $shells] == 0} {continue}",
+        "            set quads 0",
+        "            set maxdist 0.0",
+        "            foreach eid $shells {",
+        "                set cfg [hm_getvalue elems id=$eid dataname=config]",
+        "                if {$cfg == 104 || $cfg == 108} {incr quads}",
+        "                foreach nid [hm_getvalue elems id=$eid dataname=nodes] {",
+        "                    set d [mcp_node_plane_dist $nid $nx $ny $nz $px $py $pz]",
+        "                    if {$d > $maxdist} {set maxdist $d}",
+        "                }",
         "            }",
+        "            if {$quads == [llength $shells] && $maxdist <= $plane_tol} {",
+        '                puts "MCP accepted true section surface=$sid mesh_mode=$face_mode edge_seed=$edge_seed shells=[llength $shells] maxdist=$maxdist plane_tol=$plane_tol"',
+        "                return $shells",
+        "            }",
+        "            mcp_delete_elems $shells",
         "        }",
-        "        if {$quads == [llength $shells] && $maxdist <= $plane_tol} {",
-        '            puts "MCP accepted true section surface=$sid mesh_mode=$face_mode shells=[llength $shells] maxdist=$maxdist plane_tol=$plane_tol"',
-        "            return $shells",
-        "        }",
-        "        mcp_delete_elems $shells",
         "    }",
         "    return {}",
         "}",
         'catch {*beginhistorystate "MCP cut-section spin hex"}',
         '*currentcollector components "$target_component"',
         "set ::mcp_allow_quad_only_fallback $allow_quad_only_fallback",
+        "set ::mcp_section_edge_seed_counts $section_edge_seed_counts",
         "set hex_success 0",
+        "set final_hex_count 0",
+        "set final_source_shell_count 0",
+        "set final_source_quad_count 0",
         "if {$delete_existing_component_elements} {",
         '    *createmark elems 1 "by comp name" $target_component',
         "    if {[mcp_mark_count elems 1] > 0} {catch {*deletemark elems 1}}",
@@ -3770,13 +4050,15 @@ def generate_cutsection_spin_hex_tcl(
         "                set shells [mcp_mesh_true_section $sid $attempt_size $split_nx $split_ny $split_nz $split_px $split_py $split_pz $effective_plane_tol]",
         "                foreach e $shells {lappend seed_shells $e}",
         "            }",
-        "            if {[llength $seed_shells] == 0} {",
+            "            if {[llength $seed_shells] == 0} {",
         '                puts "MCP cut-section spin attempt failed: no true all-quad section surfaces were found."',
         "                incr attempt",
         "                continue",
         "            }",
-        "            set before_elems [mcp_all_elems]",
-        "            eval *createmark elems 1 $seed_shells",
+            "            set before_elems [mcp_all_elems]",
+            "            set final_source_shell_count [llength $seed_shells]",
+            "            set final_source_quad_count [llength $seed_shells]",
+            "            eval *createmark elems 1 $seed_shells",
         f"            *createplane 1 {snx} {sny} {snz} $axis_px $axis_py $axis_pz",
         "            if {[catch {*meshspinelements2 1 1 360 $spin_density 1 0.0 0} spin_err]} {",
         '                puts "MCP cut-section spin attempt failed: $spin_err"',
@@ -3784,10 +4066,11 @@ def generate_cutsection_spin_hex_tcl(
         "                set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
         "                set hex_count [mcp_hex8_count $new_elems]",
         "                set fit_ok [mcp_bbox_fit_ok $new_elems $target_solid $fit_tol_ratio $attempt_size]",
-        "                if {[llength $new_elems] > 0 && $hex_count == [llength $new_elems] && $fit_ok} {",
+                "                if {[llength $new_elems] > 0 && $hex_count == [llength $new_elems] && $fit_ok} {",
         "                    eval *createmark elems 1 $new_elems",
         "                    catch {*movemark elems 1 $target_component}",
-        "                    set hex_success 1",
+                    "                    set hex_success 1",
+                    "                    set final_hex_count $hex_count",
         '                    puts "MCP cut-section spin completed: hex8=$hex_count fit_ok=$fit_ok"',
         "                } else {",
         '                    puts "MCP cut-section spin invalid: new_elements=[llength $new_elems] hex8=$hex_count fit_ok=$fit_ok; cleaning and retrying/falling back."',
@@ -3800,6 +4083,7 @@ def generate_cutsection_spin_hex_tcl(
         "    }",
         "}",
         'if {!$hex_success} { puts "MCP cut-section spin failed: tetra fallback removed_old_tetra_path=1" }',
+        'puts "MCP_SPIN_RESULT solid=$target_solid ok=$hex_success hex8=$final_hex_count source_shells=$final_source_shell_count source_quads=$final_source_quad_count source_surface=-1 fallback_tetra=[expr {!$hex_success}] method=cutsection"',
         'catch {*endhistorystate "MCP cut-section spin hex"}',
     ]
     if output_hm_path:
@@ -4104,6 +4388,7 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     strategy_counts = classification.get("strategy_counts", {}) if isinstance(classification.get("strategy_counts"), dict) else {}
     total_solids = int(classification.get("total_solids") or report_data.get("total_solids") or 0)
     drag_count = int(strategy_counts.get("drag_hex") or report_data.get("drag_count") or 0)
+    spin_count = int(strategy_counts.get("spin_hex") or 0)
     tetra_count = (
         int(strategy_counts.get("tetra_plain") or 0)
         + int(strategy_counts.get("tetra_surface_deviation_rtrias") or 0)
@@ -4111,8 +4396,9 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     )
     if tetra_count == 0:
         tetra_count = int(report_data.get("tetra_count") or 0)
-    other_count = max(0, total_solids - drag_count - tetra_count)
+    other_count = max(0, total_solids - drag_count - spin_count - tetra_count)
 
+    spin_step = report_data.get("spin", {}) if isinstance(report_data.get("spin"), dict) else {}
     tetra_step = report_data.get("tetra", {}) if isinstance(report_data.get("tetra"), dict) else {}
     final_save = report_data.get("final_save", {}) if isinstance(report_data.get("final_save"), dict) else {}
     final_counts = report_data.get("final_counts")
@@ -4182,6 +4468,7 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     lines.append("-" * 28)
     lines.append(f"检测到的实体数量：{_mcp_fmt_int(total_solids)}")
     lines.append(f"分类为 drag 六面体的实体数量：{_mcp_fmt_int(drag_count)}")
+    lines.append(f"分类为 spin 六面体的实体数量：{_mcp_fmt_int(spin_count)}")
     lines.append(f"分类为 tetra 四面体的实体数量：{_mcp_fmt_int(tetra_count)}")
     if other_count:
         lines.append(f"其他策略实体数量：{_mcp_fmt_int(other_count)}")
@@ -4202,6 +4489,9 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     lines.append("二、网格生成结果")
     lines.append("-" * 28)
     lines.append(f"drag 六面体实体数量：{_mcp_fmt_int(drag_count)}")
+    lines.append(f"spin 六面体尝试实体数量：{_mcp_fmt_int(spin_step.get('count', 0))}")
+    lines.append(f"spin 六面体成功实体数量：{_mcp_fmt_int(len(spin_step.get('completed', []) or []))}")
+    lines.append(f"spin 失败后转 tetra 实体数量：{_mcp_fmt_int(len(spin_step.get('fallback_to_tetra', []) or []) + len(spin_step.get('failed', []) or []))}")
     lines.append(f"tetra 批次数量：{_mcp_fmt_int(tetra_step.get('batch_count', 0))}")
     lines.append(f"tetra 成功批次：{_mcp_fmt_int(len(tetra_step.get('completed', []) or []))}")
     lines.append(f"tetra 失败批次：{_mcp_fmt_int(len(tetra_step.get('failed', []) or []))}")

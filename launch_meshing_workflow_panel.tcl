@@ -35,6 +35,7 @@ namespace eval ::hm_mcp_launcher {
     variable probe_timeout 180
     variable phase2_timeout 120
     variable drag_timeout 900
+    variable spin_timeout 900
     variable tetra_timeout 1800
     variable save_timeout 300
 
@@ -248,6 +249,7 @@ proc ::hm_mcp_launcher::build_command {} {
     variable probe_timeout
     variable phase2_timeout
     variable drag_timeout
+    variable spin_timeout
     variable tetra_timeout
     variable save_timeout
     variable current_stamp
@@ -261,6 +263,7 @@ proc ::hm_mcp_launcher::build_command {} {
         --probe-timeout $probe_timeout \
         --phase2-timeout $phase2_timeout \
         --drag-timeout $drag_timeout \
+        --spin-timeout $spin_timeout \
         --tetra-timeout $tetra_timeout \
         --save-timeout $save_timeout \
         --drag-element-size $drag_element_size_max \

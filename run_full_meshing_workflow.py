@@ -88,8 +88,36 @@ def _build_drag_solids(results: dict[str, dict[str, Any]]) -> list[dict[str, Any
     return solids
 
 
+def _build_spin_solids(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    solids: list[dict[str, Any]] = []
+    for key, item in sorted(results.items(), key=lambda pair: int(pair[0])):
+        if item.get("strategy") != "spin_hex":
+            continue
+        solids.append(
+            {
+                "solid_id": int(item["solid_id"]),
+                "source_surface_id": int(item.get("source_surface_id", 0)),
+                "component_name": str(item["component_name"]),
+                "axis": str(item.get("drag_axis") or item.get("axis") or "z"),
+                "element_size": float(item.get("element_size") or 1.0),
+                "spin_method": str(item.get("spin_method") or "cutsection"),
+                "spin_axis": str(item.get("spin_axis") or item.get("drag_axis") or item.get("axis") or "z"),
+                "spin_axis_point": item.get("spin_axis_point"),
+                "spin_profile_surface_id": int(item.get("spin_profile_surface_id", 0) or 0),
+                "spin_profile_normal_axis": str(item.get("spin_profile_normal_axis") or ""),
+                "spin_split_plane_normal": item.get("spin_split_plane_normal"),
+                "spin_split_plane_point": item.get("spin_split_plane_point"),
+            }
+        )
+    return solids
+
+
 def _build_tetra_batches(classification: dict[str, Any]) -> list[dict[str, Any]]:
     return list(classification.get("phase3_tetra_batches") or [])
+
+
+def _build_tetra_batches_from_results(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    return list(hm._tetra_execution_batches(results))
 
 
 def _tcl_braced(value: Any) -> str:
@@ -661,6 +689,27 @@ def _parse_drag_actual_parameters(response_text: str) -> dict[str, dict[str, Any
     return actual
 
 
+def _parse_spin_results(response_text: str) -> dict[str, dict[str, Any]]:
+    actual: dict[str, dict[str, Any]] = {}
+    for line in str(response_text or "").splitlines():
+        match = re.search(
+            r"MCP_SPIN_RESULT solid=(\d+) ok=(\d+) hex8=(\d+) "
+            r"source_shells=(\d+)(?: source_quads=(\d+))? "
+            r"source_surface=(-?\d+) fallback_tetra=(\d+)",
+            line,
+        )
+        if match:
+            actual[match.group(1)] = {
+                "ok": int(match.group(2)),
+                "hex8": int(match.group(3)),
+                "source_shells": int(match.group(4)),
+                "source_quads": int(match.group(5) or 0),
+                "source_surface_id": int(match.group(6)),
+                "fallback_tetra": int(match.group(7)),
+            }
+    return actual
+
+
 def _parse_tetra_actual_parameters(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
     actual: dict[str, dict[str, Any]] = {}
     for batch in plan.get("tetra_batches", []):
@@ -1100,8 +1149,107 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError("Drag-hex step failed.")
     workflow["steps"]["drag_hex"] = drag_step
 
+    _log("[3.5/6] Run spin-hex solids")
+    spin_solids = _build_spin_solids(active_results)
+    spin_step: dict[str, Any] = {"count": len(spin_solids), "completed": [], "fallback_to_tetra": [], "failed": []}
+    spin_responses: dict[str, dict[str, Any]] = {}
+    for spin_solid in spin_solids:
+        sid = int(spin_solid["solid_id"])
+        try:
+            spin_size = float(args.spin_element_size or spin_solid.get("element_size") or args.drag_element_size)
+            spin_method = str(spin_solid.get("spin_method") or "cutsection")
+            if spin_method == "profile_surface":
+                axis_point = spin_solid.get("spin_axis_point")
+                profile_surface_id = int(spin_solid.get("spin_profile_surface_id") or 0)
+                if profile_surface_id <= 0 or not axis_point:
+                    raise RuntimeError(f"Spin solid {sid} is missing profile-surface spin parameters.")
+                spin = hm.generate_guarded_spin_hex_tcl(
+                    source_surface_id=profile_surface_id,
+                    element_size=spin_size,
+                    component_name=str(spin_solid["component_name"]),
+                    axis=str(spin_solid.get("spin_axis") or spin_solid.get("axis") or "z"),
+                    solid_id=sid,
+                    spin_axis_point=list(axis_point),
+                    section_edge_seed_counts=[4, 6, 8],
+                    fit_tolerance_ratio=args.spin_fit_tolerance_ratio,
+                    retry_count=args.spin_retry_count,
+                    angle_degrees=args.spin_angle_degrees,
+                    density=args.spin_density,
+                )
+            elif spin_method == "cutsection":
+                axis_point = spin_solid.get("spin_axis_point")
+                split_normal = spin_solid.get("spin_split_plane_normal")
+                split_point = spin_solid.get("spin_split_plane_point")
+                if not axis_point or not split_normal or not split_point:
+                    raise RuntimeError(f"Spin solid {sid} is missing cut-section spin parameters.")
+                spin = hm.generate_cutsection_spin_hex_tcl(
+                    solid_id=sid,
+                    component_name=str(spin_solid["component_name"]),
+                    split_plane_normal=list(split_normal),
+                    split_plane_point=list(split_point),
+                    spin_axis=str(spin_solid.get("spin_axis") or spin_solid.get("axis") or "z"),
+                    spin_axis_point=list(axis_point),
+                    element_size=spin_size,
+                    density=args.spin_density,
+                    fit_tolerance_ratio=args.spin_fit_tolerance_ratio,
+                    retry_count=args.spin_retry_count,
+                    section_edge_seed_counts=[4, 6, 8],
+                    include_existing_section_surfaces=False,
+                    allow_quad_only_fallback=True,
+                    delete_existing_component_elements=True,
+                )
+            else:
+                spin = hm.generate_guarded_spin_hex_tcl(
+                    source_surface_id=int(spin_solid["source_surface_id"]),
+                    element_size=spin_size,
+                    component_name=str(spin_solid["component_name"]),
+                    axis=str(spin_solid.get("axis") or "z"),
+                    solid_id=sid,
+                    fit_tolerance_ratio=args.spin_fit_tolerance_ratio,
+                    retry_count=args.spin_retry_count,
+                    angle_degrees=args.spin_angle_degrees,
+                    density=args.spin_density,
+                )
+            spin_script_path = RUNS_DIR / f"workflow_spin_hex_s{sid}_{stamp}.tcl"
+            spin_script_path.write_text(spin["script"], encoding="utf-8")
+            start = time.time()
+            spin_response = hm.execute_tcl_gui(
+                spin["script"],
+                host=args.host,
+                port=args.port,
+                timeout_seconds=args.spin_timeout,
+                enforce_meshing_rules=False,
+            )
+            spin_response["elapsed_seconds"] = round(time.time() - start, 2)
+            spin_response["script_path"] = str(spin_script_path)
+            response_text = str(spin_response.get("response", "") or spin_response.get("stdout", ""))
+            parsed = _parse_spin_results(response_text).get(str(sid), {})
+            spin_response["parsed_result"] = parsed
+            spin_responses[str(sid)] = spin_response
+            if spin_response.get("success") and int(parsed.get("ok") or 0) == 1 and int(parsed.get("hex8") or 0) > 0:
+                spin_step["completed"].append({"solid_id": sid, **parsed, "script_path": str(spin_script_path)})
+            else:
+                spin_step["fallback_to_tetra"].append({"solid_id": sid, **parsed, "script_path": str(spin_script_path)})
+                if str(sid) in active_results:
+                    active_results[str(sid)]["strategy"] = "tetra_plain"
+                    active_results[str(sid)].setdefault("evidence", []).append("spin failed -> tetra fallback")
+                if str(sid) in results:
+                    results[str(sid)]["strategy"] = "tetra_plain"
+                    results[str(sid)].setdefault("evidence", []).append("spin failed -> tetra fallback")
+        except Exception as exc:
+            spin_step["failed"].append({"solid_id": sid, "error": str(exc)})
+            if str(sid) in active_results:
+                active_results[str(sid)]["strategy"] = "tetra_plain"
+                active_results[str(sid)].setdefault("evidence", []).append("spin exception -> tetra fallback")
+            if str(sid) in results:
+                results[str(sid)]["strategy"] = "tetra_plain"
+                results[str(sid)].setdefault("evidence", []).append("spin exception -> tetra fallback")
+    _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_spin_hex_responses_{stamp}.json", spin_responses)
+    spin_step["success"] = not spin_step["failed"]
+    workflow["steps"]["spin_hex"] = spin_step
+
     _log("[4/6] Run tetra batches")
-    tetra_batches = _filter_tetra_batches_for_active_results(classification, active_results)
+    tetra_batches = _build_tetra_batches_from_results(active_results)
     plan_batches: list[dict[str, Any]] = []
     tetra_step: dict[str, Any] = {"batch_count": len(tetra_batches), "completed": [], "failed": []}
     for batch in tetra_batches:
@@ -1172,6 +1320,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     plan = {
         "stamp": stamp,
         "drag_count": len(drag_solids),
+        "spin_count": len(spin_solids),
+        "spin_completed_count": len(spin_step.get("completed", [])),
+        "spin_fallback_count": len(spin_step.get("fallback_to_tetra", [])) + len(spin_step.get("failed", [])),
         "tetra_batches": plan_batches,
         "final_save_path": str(output_path),
     }
@@ -1367,8 +1518,15 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "stamp": stamp,
         "success": workflow["success"],
         "output_hm_path": str(output_path),
-        "classification": workflow["steps"]["classification"],
+        "classification": {
+            **workflow["steps"]["classification"],
+            "strategy_counts": {
+                name: sum(1 for item in active_results.values() if item.get("strategy") == name)
+                for name in sorted({str(item.get("strategy", "")) for item in active_results.values()})
+            },
+        },
         "drag_count": len(drag_solids),
+        "spin": spin_step,
         "tetra": tetra_step,
         "final_save": final_save,
         "repair_summary": repair_summary,
@@ -1379,6 +1537,10 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "drag_element_size_max": args.drag_element_size_max,
             "drag_fit_tolerance_ratio": args.drag_fit_tolerance_ratio,
             "drag_retry_count": args.drag_retry_count,
+            "spin_element_size": args.spin_element_size,
+            "spin_fit_tolerance_ratio": args.spin_fit_tolerance_ratio,
+            "spin_retry_count": args.spin_retry_count,
+            "spin_density": args.spin_density,
             "tetra_element_size": args.tetra_element_size,
             "tetra_element_size_min": args.tetra_element_size_min,
             "tetra_element_size_max": args.tetra_element_size_max,
@@ -1442,6 +1604,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--drag-fit-tolerance-ratio", type=float, default=0.05)
     parser.add_argument("--drag-retry-count", type=int, default=2)
     parser.add_argument("--drag-pause-seconds", type=float, default=0.5)
+    parser.add_argument("--spin-timeout", type=int, default=900)
+    parser.add_argument("--spin-element-size", type=float, default=1.0)
+    parser.add_argument("--spin-fit-tolerance-ratio", type=float, default=0.05)
+    parser.add_argument("--spin-retry-count", type=int, default=1)
+    parser.add_argument("--spin-angle-degrees", type=float, default=360.0)
+    parser.add_argument("--spin-density", type=int, default=96)
     parser.add_argument("--tetra-element-size", type=float, default=1.5)
     parser.add_argument("--tetra-element-size-min", type=float, default=1.5)
     parser.add_argument("--tetra-element-size-max", type=float, default=2.0)

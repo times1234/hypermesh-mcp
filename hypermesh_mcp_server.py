@@ -1417,15 +1417,17 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         src_surf = f.get("source_surface_id", -1)
         source_inner_loops = int(f.get("source_inner_loop_count", 0) or 0)
         
-        if sc == 6 and mx > 0 and mn / mx < 0.40 and src_surf > 0:
+        if sc == 6 and mx > 0 and mn / mx < 0.40 and src_surf > 0 and source_inner_loops <= 1:
             strategy = "drag_hex"
             evidence.append("6-face thin -> drag")
-        elif sc == 4 and mx > 0 and src_surf > 0 and cross_ratio >= 0.75 and mn / mx <= 0.60:
+        elif sc == 4 and mx > 0 and src_surf > 0 and cross_ratio >= 0.75 and mn / mx <= 0.60 and source_inner_loops <= 1:
             strategy = "drag_hex"
             evidence.append("4-surface short cylinder -> drag")
-        elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops > 0 and mn / mx <= 0.55 and 10 <= sc <= 24:
+        elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops == 1 and mn / mx <= 0.55 and 10 <= sc <= 24:
             strategy = "spin_hex"
             evidence.append("axisymmetric recessed/hollow body -> cut-section spin")
+        elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops > 1 and mn / mx <= 0.55 and 10 <= sc <= 24:
+            evidence.append("multi-hole thin ring/source section -> tetra")
         elif is_axisymmetric_bbox and src_surf > 0 and mn / mx <= 0.55 and 10 <= sc <= 24:
             evidence.append("axisymmetric but source section has no inner loop -> tetra")
         elif slender > 15 and mn < 2.0:

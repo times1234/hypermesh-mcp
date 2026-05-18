@@ -831,12 +831,13 @@ def _parse_spin_results(response_text: str) -> dict[str, dict[str, Any]]:
                 "spin_density",
                 "density_min",
                 "density_max",
+                "merged_nodes",
             ):
                 value_match = re.search(rf"{key}=([^\s]+)", line)
                 if not value_match:
                     continue
                 value = value_match.group(1)
-                if key in {"spin_density", "density_min", "density_max"}:
+                if key in {"spin_density", "density_min", "density_max", "merged_nodes"}:
                     item[key] = int(float(value))
                 else:
                     item[key] = float(value)
@@ -978,6 +979,7 @@ def _build_part_parameter_report(
                 "source_surface_id": actual.get("source_surface_id"),
                 "hex8": actual.get("hex8"),
                 "total3d": actual.get("total3d"),
+                "merged_nodes": actual.get("merged_nodes"),
                 "fallback_tetra": bool(actual.get("fallback_tetra", False)),
                 "method": actual.get("method", "cutsection"),
                 "retry_count": args.spin_retry_count,
@@ -1012,6 +1014,9 @@ def _build_part_parameter_report(
                 "fit_tolerance_ratio": actual.get("fit_tolerance_ratio", args.tetra_fit_tolerance_ratio),
                 "target_vol_skew": actual.get("target_vol_skew", args.tetra_target_vol_skew),
                 "repair_vol_skew": args.tetra_repair_vol_skew,
+                "gear_axis": info.get("gear_axis", ""),
+                "gear_tooth_surface_count": info.get("gear_tooth_surface_count", 0),
+                "gear_tooth_surface_ids": info.get("gear_tooth_surface_ids", []),
             }
         )
 

@@ -806,6 +806,29 @@ def _parse_probe_facts(line: str):
     return facts
 
 
+def _probe_int_list_value(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return out
+    text = str(value).strip().strip("{}")
+    if not text or text.lower() in {"none", "null", "-"}:
+        return []
+    out = []
+    for token in text.replace(",", " ").split():
+        try:
+            out.append(int(token))
+        except ValueError:
+            continue
+    return out
+
+
 def _probe_lines_iter(probe_lines) -> list[str]:
     if probe_lines is None:
         return []
@@ -866,11 +889,34 @@ def _spin_params_from_probe(facts: dict[str, Any]) -> dict[str, Any]:
     return _spin_cutsection_params_from_probe(facts)
 
 
+def _gear_reason_from_probe(facts: dict[str, Any]) -> str | None:
+    """Return a gear classification reason from geometry facts only."""
+    sc = int(facts.get("surf_count", 0) or 0)
+    dx, dy, dz = float(facts.get("dx", 0) or 0), float(facts.get("dy", 0) or 0), float(facts.get("dz", 0) or 0)
+    dims = sorted([dx, dy, dz])
+    mn, md, mx = dims[0], dims[1], dims[2]
+    if mx <= 0 or md <= 0:
+        return None
+    src_surf = int(facts.get("source_surface_id", -1) or -1)
+    mn_mx = mn / mx
+    md_mx = md / mx
+    mn_md = mn / md
+    mx_md = mx / md
+
+    if src_surf <= 0 and sc >= 100 and md_mx >= 0.95 and 0.18 <= mn_mx <= 0.50:
+        return "gear disk/body: high surface count, circular two-axis envelope, moderate thickness"
+    if src_surf <= 0 and sc >= 180 and md_mx >= 0.70 and mn_mx >= 0.70:
+        return "gear rounded/chamfer body: very high surface count around a compact gear envelope"
+    if src_surf <= 0 and 50 <= sc <= 90 and mn_md >= 0.95 and 3.5 <= mx_md <= 5.0:
+        return "gear shaft/tooth-related slender body: repeated-feature surface count with round cross-section"
+    return None
+
+
 def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     """Return tetra batches ordered to reduce HyperMesh memory-crash risk."""
     tetra = [
         item for item in results.values()
-        if item.get("strategy") in {"tetra_plain", "tetra_surface_deviation_rtrias", "surface_tetra"}
+        if item.get("strategy") in {"tetra_plain", "tetra_surface_deviation_rtrias", "surface_tetra", "gear_aware_tetra"}
     ]
 
     def risk_score(item: dict[str, Any]) -> float:
@@ -1340,6 +1386,120 @@ proc find_best_source_surface {solid_id drag_axis sbb_min sbb_max} {
     return $best_surf
 }
 
+proc mcp_gear_axis_from_bbox {solid_bb fallback_axis} {
+    set dx [expr {abs([lindex $solid_bb 3] - [lindex $solid_bb 0])}]
+    set dy [expr {abs([lindex $solid_bb 4] - [lindex $solid_bb 1])}]
+    set dz [expr {abs([lindex $solid_bb 5] - [lindex $solid_bb 2])}]
+    set dxy [expr {abs($dx - $dy) / max($dx, max($dy, 0.001))}]
+    set dxz [expr {abs($dx - $dz) / max($dx, max($dz, 0.001))}]
+    set dyz [expr {abs($dy - $dz) / max($dy, max($dz, 0.001))}]
+    set best $dxy
+    set axis "z"
+    if {$dxz < $best} {set best $dxz; set axis "y"}
+    if {$dyz < $best} {set best $dyz; set axis "x"}
+    if {$best <= 0.18} {return $axis}
+    return $fallback_axis
+}
+
+proc mcp_angle_span_deg {angles} {
+    set n [llength $angles]
+    if {$n <= 1} {return 0.0}
+    set vals [lsort -real $angles]
+    set max_gap 0.0
+    for {set i 0} {$i < $n} {incr i} {
+        set a [lindex $vals $i]
+        if {$i == [expr {$n - 1}]} {
+            set b [expr {[lindex $vals 0] + 360.0}]
+        } else {
+            set b [lindex $vals [expr {$i + 1}]]
+        }
+        set gap [expr {$b - $a}]
+        if {$gap > $max_gap} {set max_gap $gap}
+    }
+    return [expr {360.0 - $max_gap}]
+}
+
+proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
+    if {$gear_axis eq "x"} {
+        set ax_min 0; set ax_max 3; set r1_min 1; set r1_max 4; set r2_min 2; set r2_max 5
+    } elseif {$gear_axis eq "y"} {
+        set ax_min 1; set ax_max 4; set r1_min 0; set r1_max 3; set r2_min 2; set r2_max 5
+    } else {
+        set ax_min 2; set ax_max 5; set r1_min 0; set r1_max 3; set r2_min 1; set r2_max 4
+    }
+    set c1 [expr {([lindex $solid_bb $r1_min] + [lindex $solid_bb $r1_max]) / 2.0}]
+    set c2 [expr {([lindex $solid_bb $r2_min] + [lindex $solid_bb $r2_max]) / 2.0}]
+    set axis_len [expr {abs([lindex $solid_bb $ax_max] - [lindex $solid_bb $ax_min])}]
+    set len1 [expr {abs([lindex $solid_bb $r1_max] - [lindex $solid_bb $r1_min])}]
+    set len2 [expr {abs([lindex $solid_bb $r2_max] - [lindex $solid_bb $r2_min])}]
+    set max_radial_span [expr {max($len1, $len2)}]
+    set solid_rmax [expr {sqrt($len1*$len1 + $len2*$len2) / 2.0}]
+    if {$solid_rmax <= 0.001} {return {}}
+
+    *createmark surfaces 1 "by solids" $solid_id
+    set all_surfs [hm_getmark surfaces 1]
+    set high_count_gear [expr {[llength $all_surfs] >= 400}]
+    set shaft_end_gear [expr {$axis_len > $max_radial_span * 2.5 && [llength $all_surfs] <= 120}]
+    set candidates {}
+    foreach surf_id $all_surfs {
+        *createmark surfaces 2 $surf_id
+        if {[catch {hm_getboundingbox surfaces 2 0 0 0} sbb] || [llength $sbb] < 6} {continue}
+        set rmin 1.0e30
+        set rmax -1.0
+        set angles {}
+        foreach v1 [list [lindex $sbb $r1_min] [lindex $sbb $r1_max]] {
+            foreach v2 [list [lindex $sbb $r2_min] [lindex $sbb $r2_max]] {
+                set d1 [expr {$v1 - $c1}]
+                set d2 [expr {$v2 - $c2}]
+                set rr [expr {sqrt($d1*$d1 + $d2*$d2)}]
+                if {$rr < $rmin} {set rmin $rr}
+                if {$rr > $rmax} {set rmax $rr}
+                set ang [expr {atan2($d2, $d1) * 180.0 / acos(-1)}]
+                if {$ang < 0} {set ang [expr {$ang + 360.0}]}
+                lappend angles $ang
+            }
+        }
+        set sc1 [expr {([lindex $sbb $r1_min] + [lindex $sbb $r1_max]) / 2.0}]
+        set sc2 [expr {([lindex $sbb $r2_min] + [lindex $sbb $r2_max]) / 2.0}]
+        set center_radius [expr {sqrt(($sc1-$c1)*($sc1-$c1) + ($sc2-$c2)*($sc2-$c2))}]
+        set center_ratio [expr {$center_radius / $solid_rmax}]
+        set outer_ratio [expr {$rmax / $solid_rmax}]
+        set radial_span [expr {$rmax - $rmin}]
+        set radial_span_ratio [expr {$radial_span / $solid_rmax}]
+        set surf_axis_span [expr {abs([lindex $sbb $ax_max] - [lindex $sbb $ax_min])}]
+        set surf_r1_span [expr {abs([lindex $sbb $r1_max] - [lindex $sbb $r1_min])}]
+        set surf_r2_span [expr {abs([lindex $sbb $r2_max] - [lindex $sbb $r2_min])}]
+        set axis_ratio [expr {$surf_axis_span / max($axis_len, 0.001)}]
+        set local_radial_span [expr {max($surf_r1_span, $surf_r2_span)}]
+        set local_span_ratio [expr {$local_radial_span / max($max_radial_span, 0.001)}]
+        set angle_span [mcp_angle_span_deg $angles]
+        set ax_center [expr {([lindex $sbb $ax_min] + [lindex $sbb $ax_max]) / 2.0}]
+        set ax_center_ratio [expr {($ax_center - [lindex $solid_bb $ax_min]) / max($axis_len, 0.001)}]
+
+        # Tooth faces are local repeated flank/top/root faces. The center radius
+        # prevents inner holes/slots from being selected just because their bbox
+        # corners reach outward.
+        if {$shaft_end_gear} {
+            if {($ax_center_ratio <= 0.15 || $ax_center_ratio >= 0.85) && $center_ratio >= 0.35 && $outer_ratio >= 0.45 && $axis_ratio >= 0.05 && $axis_ratio <= 0.16 && $local_span_ratio <= 0.16 && $angle_span <= 35.0 && $radial_span_ratio >= 0.03} {
+                lappend candidates $surf_id
+            }
+        } elseif {$high_count_gear} {
+            if {$center_ratio >= 0.60 && $outer_ratio >= 0.65 && $axis_ratio <= 0.12 && $local_span_ratio <= 0.14 && $angle_span <= 18.0 && $radial_span_ratio >= 0.04} {
+                lappend candidates $surf_id
+            }
+        } else {
+            set ordinary_local [expr {$center_ratio >= 0.50 && $outer_ratio >= 0.58 && $local_span_ratio <= 0.50 && $angle_span <= 80.0 && $radial_span_ratio >= 0.008 && $axis_ratio <= 0.55}]
+            set ordinary_broad_flank [expr {$center_ratio >= 0.20 && $outer_ratio >= 0.58 && $radial_span_ratio >= 0.17 && $local_span_ratio <= 0.90 && $angle_span <= 190.0 && $axis_ratio <= 0.55}]
+            set ordinary_end_sliver [expr {$center_ratio >= 0.48 && $outer_ratio >= 0.52 && $radial_span_ratio >= 0.025 && $local_span_ratio <= 0.08 && $angle_span <= 12.5 && $axis_ratio <= 0.03}]
+            set ordinary_inner_flank [expr {$center_ratio >= 0.30 && $outer_ratio >= 0.44 && $radial_span_ratio >= 0.20 && $local_span_ratio <= 0.22 && $angle_span <= 62.0 && $axis_ratio <= 0.08}]
+            if {$ordinary_local || $ordinary_broad_flank || $ordinary_end_sliver || $ordinary_inner_flank} {
+                lappend candidates $surf_id
+            }
+        }
+    }
+    return $candidates
+}
+
 set f [open "__OUTPUT_PATH__" w]
 *createmark solids 1 "all"
 set solid_ids [hm_getmark solids 1]
@@ -1361,6 +1521,7 @@ foreach sid $solid_ids {
     # 婵犙勫姍濞兼澘螞閳ь剙霉鐎ｅ墎绐楅柟鍨劤閸ゎ參寮甸埀顒勬寘閸曨剚鐓欓柛姘灱缁€瀣博椤栨粍鐣遍梻?
     set drag_axis ""
     if {$mn == $dx} {set drag_axis "x"} elseif {$mn == $dy} {set drag_axis "y"} else {set drag_axis "z"}
+    set gear_axis [mcp_gear_axis_from_bbox $bb $drag_axis]
     
     set sbb_min [list [lindex $bb 0] [lindex $bb 1] [lindex $bb 2]]
     set sbb_max [list [lindex $bb 3] [lindex $bb 4] [lindex $bb 5]]
@@ -1390,8 +1551,10 @@ foreach sid $solid_ids {
         mcp_delete_elems $source_elems
         mcp_delete_nodes $source_nodes
     }
+    set gear_tooth_surfs [mcp_gear_tooth_surfaces $sid $gear_axis $bb]
+    set gear_tooth_csv [join $gear_tooth_surfs ","]
     
-    puts $f "PROBE: solid=$sid comp=\"$comp_name\" sc=$sc x0=[format %.6f [lindex $bb 0]] y0=[format %.6f [lindex $bb 1]] z0=[format %.6f [lindex $bb 2]] x1=[format %.6f [lindex $bb 3]] y1=[format %.6f [lindex $bb 4]] z1=[format %.6f [lindex $bb 5]] dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag] src_surf=$src_surf drag_axis=$drag_axis src_loops=$src_loop_count src_inner_loops=$src_inner_loop_count src_boundary_edges=$src_boundary_edge_count src_boundary_nodes=$src_boundary_node_count"
+    puts $f "PROBE: solid=$sid comp=\"$comp_name\" sc=$sc x0=[format %.6f [lindex $bb 0]] y0=[format %.6f [lindex $bb 1]] z0=[format %.6f [lindex $bb 2]] x1=[format %.6f [lindex $bb 3]] y1=[format %.6f [lindex $bb 4]] z1=[format %.6f [lindex $bb 5]] dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag] src_surf=$src_surf drag_axis=$drag_axis gear_axis=$gear_axis gear_tooth_surfs=$gear_tooth_csv gear_tooth_count=[llength $gear_tooth_surfs] src_loops=$src_loop_count src_inner_loops=$src_inner_loop_count src_boundary_edges=$src_boundary_edge_count src_boundary_nodes=$src_boundary_node_count"
 }
 close $f
 """
@@ -1465,19 +1628,27 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         min_elem_size = 0.5
         src_surf = f.get("source_surface_id", -1)
         source_inner_loops = int(f.get("source_inner_loop_count", 0) or 0)
+        gear_reason = _gear_reason_from_probe(f)
+        gear_tooth_surface_ids = _probe_int_list_value(f.get("gear_tooth_surfs") or f.get("gear_tooth_surface_ids"))
+        gear_tooth_count = int(f.get("gear_tooth_count", len(gear_tooth_surface_ids)) or 0)
         
-        if sc == 6 and mx > 0 and mn / mx < 0.40 and src_surf > 0 and source_inner_loops <= 1:
+        if gear_reason:
+            strategy = "gear_aware_tetra"
+            evidence.append(gear_reason)
+            if gear_tooth_surface_ids:
+                evidence.append(f"gear tooth/outer-band surface candidates: {gear_tooth_count}")
+        elif sc == 6 and mx > 0 and mn / mx < 0.40 and src_surf > 0 and source_inner_loops <= 1:
             strategy = "drag_hex"
             evidence.append("6-face thin -> drag")
         elif sc == 4 and mx > 0 and src_surf > 0 and cross_ratio >= 0.75 and mn / mx <= 0.60 and source_inner_loops <= 1:
             strategy = "drag_hex"
             evidence.append("4-surface short cylinder -> drag")
-        elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops == 1 and mn / mx <= 0.55 and 10 <= sc <= 24:
+        elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops == 1 and mn / mx <= 0.55 and 6 <= sc <= 28:
             strategy = "spin_hex"
             evidence.append("axisymmetric recessed/hollow body -> cut-section spin")
-        elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops > 1 and mn / mx <= 0.55 and 10 <= sc <= 24:
+        elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops > 1 and mn / mx <= 0.55 and 6 <= sc <= 28:
             evidence.append("multi-hole thin ring/source section -> tetra")
-        elif is_axisymmetric_bbox and src_surf > 0 and mn / mx <= 0.55 and 10 <= sc <= 24:
+        elif is_axisymmetric_bbox and src_surf > 0 and mn / mx <= 0.55 and 6 <= sc <= 28:
             evidence.append("axisymmetric but source section has no inner loop -> tetra")
         elif slender > 15 and mn < 2.0:
             strategy = "tetra_plain"
@@ -1498,7 +1669,7 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         else:
             strategy = "tetra_plain"
             evidence.append("general")
-        if strategy == "tetra_plain":
+        if strategy in {"tetra_plain", "gear_aware_tetra"}:
             if sc >= TETRA_VERY_COMPLEX_SURFACE_COUNT:
                 min_elem_size = min(min_elem_size, TETRA_VERY_COMPLEX_MIN_ELEMENT_SIZE)
             elif sc >= TETRA_COMPLEX_SURFACE_COUNT:
@@ -1532,8 +1703,10 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
             "source_boundary_edge_count": int(f.get("source_boundary_edge_count", 0) or 0),
             "source_boundary_node_count": int(f.get("source_boundary_node_count", 0) or 0),
             "drag_axis": f.get("drag_axis", ""),
-            "gear_axis": f.get("drag_axis", ""),
+            "gear_axis": f.get("gear_axis", f.get("drag_axis", "")),
             "geometry_confirms_gear_teeth": strategy == "gear_aware_tetra",
+            "gear_tooth_surface_ids": gear_tooth_surface_ids if strategy == "gear_aware_tetra" else [],
+            "gear_tooth_surface_count": gear_tooth_count if strategy == "gear_aware_tetra" else 0,
             "surf_count": sc,
             "dims": {"dx": dx, "dy": dy, "dz": dz, "mn": mn, "md": md, "mx": mx},
             **spin_plan,
@@ -1942,6 +2115,112 @@ def generate_geometry_probe_tcl(
         "    }",
         "    return $best_surf",
         "}",
+        "proc mcp_gear_axis_from_bbox {solid_bb fallback_axis} {",
+        "    set dx [expr {abs([lindex $solid_bb 3] - [lindex $solid_bb 0])}]",
+        "    set dy [expr {abs([lindex $solid_bb 4] - [lindex $solid_bb 1])}]",
+        "    set dz [expr {abs([lindex $solid_bb 5] - [lindex $solid_bb 2])}]",
+        "    set dxy [expr {abs($dx - $dy) / max($dx, max($dy, 0.001))}]",
+        "    set dxz [expr {abs($dx - $dz) / max($dx, max($dz, 0.001))}]",
+        "    set dyz [expr {abs($dy - $dz) / max($dy, max($dz, 0.001))}]",
+        "    set best $dxy",
+        "    set axis \"z\"",
+        "    if {$dxz < $best} {set best $dxz; set axis \"y\"}",
+        "    if {$dyz < $best} {set best $dyz; set axis \"x\"}",
+        "    if {$best <= 0.18} {return $axis}",
+        "    return $fallback_axis",
+        "}",
+        "proc mcp_angle_span_deg {angles} {",
+        "    set n [llength $angles]",
+        "    if {$n <= 1} {return 0.0}",
+        "    set vals [lsort -real $angles]",
+        "    set max_gap 0.0",
+        "    for {set i 0} {$i < $n} {incr i} {",
+        "        set a [lindex $vals $i]",
+        "        if {$i == [expr {$n - 1}]} {",
+        "            set b [expr {[lindex $vals 0] + 360.0}]",
+        "        } else {",
+        "            set b [lindex $vals [expr {$i + 1}]]",
+        "        }",
+        "        set gap [expr {$b - $a}]",
+        "        if {$gap > $max_gap} {set max_gap $gap}",
+        "    }",
+        "    return [expr {360.0 - $max_gap}]",
+        "}",
+        "proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {",
+        "    if {$gear_axis eq \"x\"} {",
+        "        set ax_min 0; set ax_max 3; set r1_min 1; set r1_max 4; set r2_min 2; set r2_max 5",
+        "    } elseif {$gear_axis eq \"y\"} {",
+        "        set ax_min 1; set ax_max 4; set r1_min 0; set r1_max 3; set r2_min 2; set r2_max 5",
+        "    } else {",
+        "        set ax_min 2; set ax_max 5; set r1_min 0; set r1_max 3; set r2_min 1; set r2_max 4",
+        "    }",
+        "    set c1 [expr {([lindex $solid_bb $r1_min] + [lindex $solid_bb $r1_max]) / 2.0}]",
+        "    set c2 [expr {([lindex $solid_bb $r2_min] + [lindex $solid_bb $r2_max]) / 2.0}]",
+        "    set axis_len [expr {abs([lindex $solid_bb $ax_max] - [lindex $solid_bb $ax_min])}]",
+        "    set len1 [expr {abs([lindex $solid_bb $r1_max] - [lindex $solid_bb $r1_min])}]",
+        "    set len2 [expr {abs([lindex $solid_bb $r2_max] - [lindex $solid_bb $r2_min])}]",
+        "    set max_radial_span [expr {max($len1, $len2)}]",
+        "    set solid_rmax [expr {sqrt($len1*$len1 + $len2*$len2) / 2.0}]",
+        "    if {$solid_rmax <= 0.001} {return {}}",
+        "    *createmark surfaces 1 \"by solids\" $solid_id",
+        "    set all_surfs [hm_getmark surfaces 1]",
+        "    set high_count_gear [expr {[llength $all_surfs] >= 400}]",
+        "    set shaft_end_gear [expr {$axis_len > $max_radial_span * 2.5 && [llength $all_surfs] <= 120}]",
+        "    set candidates {}",
+        "    foreach surf_id $all_surfs {",
+        "        *createmark surfaces 2 $surf_id",
+        "        if {[catch {hm_getboundingbox surfaces 2 0 0 0} sbb] || [llength $sbb] < 6} {continue}",
+        "        set rmin 1.0e30",
+        "        set rmax -1.0",
+        "        set angles {}",
+        "        foreach v1 [list [lindex $sbb $r1_min] [lindex $sbb $r1_max]] {",
+        "            foreach v2 [list [lindex $sbb $r2_min] [lindex $sbb $r2_max]] {",
+        "                set d1 [expr {$v1 - $c1}]",
+        "                set d2 [expr {$v2 - $c2}]",
+        "                set rr [expr {sqrt($d1*$d1 + $d2*$d2)}]",
+        "                if {$rr < $rmin} {set rmin $rr}",
+        "                if {$rr > $rmax} {set rmax $rr}",
+        "                set ang [expr {atan2($d2, $d1) * 180.0 / acos(-1)}]",
+        "                if {$ang < 0} {set ang [expr {$ang + 360.0}]}",
+        "                lappend angles $ang",
+        "            }",
+        "        }",
+        "        set sc1 [expr {([lindex $sbb $r1_min] + [lindex $sbb $r1_max]) / 2.0}]",
+        "        set sc2 [expr {([lindex $sbb $r2_min] + [lindex $sbb $r2_max]) / 2.0}]",
+        "        set center_radius [expr {sqrt(($sc1-$c1)*($sc1-$c1) + ($sc2-$c2)*($sc2-$c2))}]",
+        "        set center_ratio [expr {$center_radius / $solid_rmax}]",
+        "        set outer_ratio [expr {$rmax / $solid_rmax}]",
+        "        set radial_span [expr {$rmax - $rmin}]",
+        "        set radial_span_ratio [expr {$radial_span / $solid_rmax}]",
+        "        set surf_axis_span [expr {abs([lindex $sbb $ax_max] - [lindex $sbb $ax_min])}]",
+        "        set surf_r1_span [expr {abs([lindex $sbb $r1_max] - [lindex $sbb $r1_min])}]",
+        "        set surf_r2_span [expr {abs([lindex $sbb $r2_max] - [lindex $sbb $r2_min])}]",
+        "        set axis_ratio [expr {$surf_axis_span / max($axis_len, 0.001)}]",
+        "        set local_radial_span [expr {max($surf_r1_span, $surf_r2_span)}]",
+        "        set local_span_ratio [expr {$local_radial_span / max($max_radial_span, 0.001)}]",
+        "        set angle_span [mcp_angle_span_deg $angles]",
+        "        set ax_center [expr {([lindex $sbb $ax_min] + [lindex $sbb $ax_max]) / 2.0}]",
+        "        set ax_center_ratio [expr {($ax_center - [lindex $solid_bb $ax_min]) / max($axis_len, 0.001)}]",
+        "        if {$shaft_end_gear} {",
+        "            if {($ax_center_ratio <= 0.15 || $ax_center_ratio >= 0.85) && $center_ratio >= 0.35 && $outer_ratio >= 0.45 && $axis_ratio >= 0.05 && $axis_ratio <= 0.16 && $local_span_ratio <= 0.16 && $angle_span <= 35.0 && $radial_span_ratio >= 0.03} {",
+        "                lappend candidates $surf_id",
+        "            }",
+        "        } elseif {$high_count_gear} {",
+        "            if {$center_ratio >= 0.60 && $outer_ratio >= 0.65 && $axis_ratio <= 0.12 && $local_span_ratio <= 0.14 && $angle_span <= 18.0 && $radial_span_ratio >= 0.04} {",
+        "                lappend candidates $surf_id",
+        "            }",
+        "        } else {",
+        "            set ordinary_local [expr {$center_ratio >= 0.50 && $outer_ratio >= 0.58 && $local_span_ratio <= 0.50 && $angle_span <= 80.0 && $radial_span_ratio >= 0.008 && $axis_ratio <= 0.55}]",
+        "            set ordinary_broad_flank [expr {$center_ratio >= 0.20 && $outer_ratio >= 0.58 && $radial_span_ratio >= 0.17 && $local_span_ratio <= 0.90 && $angle_span <= 190.0 && $axis_ratio <= 0.55}]",
+        "            set ordinary_end_sliver [expr {$center_ratio >= 0.48 && $outer_ratio >= 0.52 && $radial_span_ratio >= 0.025 && $local_span_ratio <= 0.08 && $angle_span <= 12.5 && $axis_ratio <= 0.03}]",
+        "            set ordinary_inner_flank [expr {$center_ratio >= 0.30 && $outer_ratio >= 0.44 && $radial_span_ratio >= 0.20 && $local_span_ratio <= 0.22 && $angle_span <= 62.0 && $axis_ratio <= 0.08}]",
+        "            if {$ordinary_local || $ordinary_broad_flank || $ordinary_end_sliver || $ordinary_inner_flank} {",
+        "                lappend candidates $surf_id",
+        "            }",
+        "        }",
+        "    }",
+        "    return $candidates",
+        "}",
         *solid_setup,
         'mcp_probe_line "MCP_PROBE_BEGIN solid_count=[llength $target_solids] probe_size=$probe_size"',
         "foreach sid $target_solids {",
@@ -1993,6 +2272,7 @@ def generate_geometry_probe_tcl(
         "        }",
         "    }",
         "    set drag_axis \"\"",
+        "    set gear_axis \"\"",
         "    set src_surf -1",
         "    set src_loop_count 0",
         "    set src_inner_loop_count 0",
@@ -2000,6 +2280,7 @@ def generate_geometry_probe_tcl(
         "    set src_boundary_node_count 0",
         "    if {$bbox_ok} {",
         "        if {$dx <= $dy && $dx <= $dz} {set drag_axis \"x\"} elseif {$dy <= $dx && $dy <= $dz} {set drag_axis \"y\"} else {set drag_axis \"z\"}",
+        "        set gear_axis [mcp_gear_axis_from_bbox $bb $drag_axis]",
         "        set src_surf [mcp_best_source_surface $sid $drag_axis $bb]",
         "        set loop_info [mcp_surface_loop_info $src_surf]",
         "        set src_loop_count [lindex $loop_info 0]",
@@ -2007,7 +2288,9 @@ def generate_geometry_probe_tcl(
         "        set src_boundary_node_count [lindex $loop_info 2]",
         "        if {$src_loop_count > 1} {set src_inner_loop_count [expr {$src_loop_count - 1}]}",
         "    }",
-        '    mcp_probe_line "MCP_PROBE_SOLID id=$sid exists=1 surf_count=$surf_count elem_count=[llength $new_elems] node_count=[llength $new_nodes] tri_count=$tri_count quad_count=$quad_count bbox_ok=$bbox_ok x0=[lindex $bb 0] y0=[lindex $bb 1] z0=[lindex $bb 2] x1=[lindex $bb 3] y1=[lindex $bb 4] z1=[lindex $bb 5] dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender src_surf=$src_surf drag_axis=$drag_axis src_loops=$src_loop_count src_inner_loops=$src_inner_loop_count src_boundary_edges=$src_boundary_edge_count src_boundary_nodes=$src_boundary_node_count"',
+        "    set gear_tooth_surfs [mcp_gear_tooth_surfaces $sid $gear_axis $bb]",
+        "    set gear_tooth_csv [join $gear_tooth_surfs \",\"]",
+        '    mcp_probe_line "MCP_PROBE_SOLID id=$sid exists=1 surf_count=$surf_count elem_count=[llength $new_elems] node_count=[llength $new_nodes] tri_count=$tri_count quad_count=$quad_count bbox_ok=$bbox_ok x0=[lindex $bb 0] y0=[lindex $bb 1] z0=[lindex $bb 2] x1=[lindex $bb 3] y1=[lindex $bb 4] z1=[lindex $bb 5] dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender src_surf=$src_surf drag_axis=$drag_axis gear_axis=$gear_axis gear_tooth_surfs=$gear_tooth_csv gear_tooth_count=[llength $gear_tooth_surfs] src_loops=$src_loop_count src_inner_loops=$src_inner_loop_count src_boundary_edges=$src_boundary_edge_count src_boundary_nodes=$src_boundary_node_count"',
         "    mcp_delete_elems $new_elems",
         "    mcp_delete_nodes $new_nodes",
         "}",
@@ -2837,9 +3120,18 @@ def generate_plain_tetra_tcl(
         '    if {($post_repair_fit_max_diff > $pre_repair_fit_tol && $repair_fit_ratio >= $repair_fit_degrade_ratio) || $repair_chord_degraded} {',
         '        set next_attempt [expr {$at + 1}]',
         '        if {$next_attempt < $retry_count} {',
-        '            puts "MCP_PT_WARN solid=$target_solid surface_fit_degraded_after_repair before=$pre_repair_fit_max_diff after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio limit=$repair_fit_degrade_ratio chord_before=$pre_repair_chord_dev_count chord_after=$post_repair_chord_dev_count chord_threshold=$surface_chord_dev_threshold attempt=$at action=retry_surface_mesh"',
-        '            mcp_delete_elems $shell_ids',
-        '            continue',
+        '            set next_cs [expr {max($elem_size_min, $elem_size * pow(0.90, $next_attempt))}]',
+        '            set next_mn_size [expr {max($min_size_min, $base_min_size * pow(0.80, $next_attempt))}]',
+        '            set next_max_size [expr {max($next_cs * 1.35, $next_mn_size + 0.05)}]',
+        '            set next_max_size [expr {min($next_max_size, max($next_mn_size + 0.05, $next_mn_size * $surface_max_to_min_ratio))}]',
+        '            set next_max_size [expr {max($next_max_size, $next_cs)}]',
+        '            set next_param_key [format "%.4f|%.4f|%.4f|%.4f|%.4f" $next_cs $next_mn_size $next_max_size $max_dev $effective_growth]',
+        '            if {$next_param_key ne $param_key} {',
+        '                puts "MCP_PT_WARN solid=$target_solid surface_fit_degraded_after_repair before=$pre_repair_fit_max_diff after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio limit=$repair_fit_degrade_ratio chord_before=$pre_repair_chord_dev_count chord_after=$post_repair_chord_dev_count chord_threshold=$surface_chord_dev_threshold attempt=$at action=retry_surface_mesh next_params=$next_param_key"',
+        '                mcp_delete_elems $shell_ids',
+        '                continue',
+        '            }',
+        '            puts "MCP_PT_WARN solid=$target_solid duplicate_retry_params_after_fit_degrade attempt=$at next_attempt=$next_attempt params=$next_param_key action=keep_current_surface_mesh"',
         '        }',
         '        puts "MCP_PT_WARN solid=$target_solid surface_fit_degraded_after_repair before=$pre_repair_fit_max_diff after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio limit=$repair_fit_degrade_ratio chord_before=$pre_repair_chord_dev_count chord_after=$post_repair_chord_dev_count chord_threshold=$surface_chord_dev_threshold attempt=$at action=final_no_replace_repair"',
         '        set fit_retry_bad_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold] [mcp_bad_shell_aspect_ids $shell_ids $fatal_surface_aspect_threshold]]',
@@ -3939,6 +4231,41 @@ def generate_cutsection_spin_hex_tcl(
         "    }",
         "    return $quads",
         "}",
+        "proc mcp_nodes_in_elems {elems} {",
+        "    array set seen {}",
+        "    set nodes {}",
+        "    foreach eid $elems {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=nodes} elem_nodes]} {continue}",
+        "        foreach nid $elem_nodes {",
+        "            if {![info exists seen($nid)]} {set seen($nid) 1; lappend nodes $nid}",
+        "        }",
+        "    }",
+        "    return $nodes",
+        "}",
+        "proc mcp_merge_coincident_nodes_in_elems {elems tol} {",
+        "    if {[llength $elems] == 0 || $tol <= 0} {return 0}",
+        "    array set keeper {}",
+        "    set merged 0",
+        "    set scale [expr {1.0 / $tol}]",
+        "    foreach nid [mcp_nodes_in_elems $elems] {",
+        "        if {[catch {hm_getvalue nodes id=$nid dataname=x} x]} {continue}",
+        "        if {[catch {hm_getvalue nodes id=$nid dataname=y} y]} {continue}",
+        "        if {[catch {hm_getvalue nodes id=$nid dataname=z} z]} {continue}",
+        "        set key [format \"%d,%d,%d\" [expr {int(floor($x*$scale + 0.5))}] [expr {int(floor($y*$scale + 0.5))}] [expr {int(floor($z*$scale + 0.5))}]]",
+        "        if {[info exists keeper($key)]} {",
+        "            set keep $keeper($key)",
+        "            if {$keep == $nid} {continue}",
+        "            if {[catch {*replacenodes $nid $keep 1 0} replace_err]} {",
+        "                puts \"MCP cut-section spin node_merge_warn move=$nid keep=$keep err=$replace_err\"",
+        "            } else {",
+        "                incr merged",
+        "            }",
+        "        } else {",
+        "            set keeper($key) $nid",
+        "        }",
+        "    }",
+        "    return $merged",
+        "}",
         "proc mcp_node_plane_dist {nid nx ny nz px py pz} {",
         "    set x [hm_getvalue nodes id=$nid dataname=x]",
         "    set y [hm_getvalue nodes id=$nid dataname=y]",
@@ -4070,6 +4397,7 @@ def generate_cutsection_spin_hex_tcl(
         "set final_source_surface -1",
         "set final_spin_density 0",
         "set final_section_size $elem_size",
+        "set final_merged_nodes 0",
         "set final_split_solids $target_solid",
         "set ::mcp_last_section_size $elem_size",
         "if {$delete_existing_component_elements} {",
@@ -4138,10 +4466,14 @@ def generate_cutsection_spin_hex_tcl(
         '                puts "MCP cut-section spin attempt failed: $spin_err"',
         "            } else {",
         "                set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
-        "                set hex_count [mcp_hex8_count $new_elems]",
         "                if {[llength $new_elems] > 0} {",
         "                    eval *createmark elems 1 $new_elems",
         "                    catch {*movemark elems 1 $target_component}",
+        "                    set merge_tol [expr {max(1.0e-6, min($::mcp_last_section_size * 1.0e-4, $plane_tol))}]",
+        "                    set merged_nodes [mcp_merge_coincident_nodes_in_elems $new_elems $merge_tol]",
+        "                    set final_merged_nodes $merged_nodes",
+        "                    puts \"MCP cut-section spin node_merge new3d=[llength $new_elems] merged=$merged_nodes tol=$merge_tol\"",
+        "                    set hex_count [mcp_hex8_count $new_elems]",
         "                    set hex_success 1",
         "                    set final_hex_count $hex_count",
         "                    set final_3d_count [llength $new_elems]",
@@ -4157,7 +4489,7 @@ def generate_cutsection_spin_hex_tcl(
         "    }",
         "}",
         'if {!$hex_success} { puts "MCP cut-section spin failed: tetra fallback removed_old_tetra_path=1" }',
-        'puts "MCP_SPIN_RESULT solid=$target_solid ok=$hex_success total3d=$final_3d_count hex8=$final_hex_count source_shells=$final_source_shell_count source_quads=$final_source_quad_count source_surface=$final_source_surface fallback_tetra=[expr {!$hex_success}] method=cutsection requested_size=$elem_size section_size=$final_section_size section_size_min=$section_size_min section_size_max=$section_size_max spin_density=$final_spin_density density_min=$spin_density_min density_max=$spin_density_max split_solids=<$final_split_solids>"',
+        'puts "MCP_SPIN_RESULT solid=$target_solid ok=$hex_success total3d=$final_3d_count hex8=$final_hex_count source_shells=$final_source_shell_count source_quads=$final_source_quad_count source_surface=$final_source_surface fallback_tetra=[expr {!$hex_success}] method=cutsection requested_size=$elem_size section_size=$final_section_size section_size_min=$section_size_min section_size_max=$section_size_max spin_density=$final_spin_density density_min=$spin_density_min density_max=$spin_density_max merged_nodes=$final_merged_nodes split_solids=<$final_split_solids>"',
         'catch {*endhistorystate "MCP cut-section spin hex"}',
     ]
     if output_hm_path:
@@ -4744,6 +5076,7 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     f"source_quads={item.get('source_quads', '未记录')}, "
                     f"total3d={item.get('total3d', '未记录')}, "
                     f"hex8={item.get('hex8', '未记录')}, "
+                    f"merged_nodes={item.get('merged_nodes', '未记录')}, "
                     f"fallback_tetra={item.get('fallback_tetra', False)}"
                 )
             else:
@@ -4769,6 +5102,20 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     f"target_vol_skew={item.get('target_vol_skew', '未记录')}, "
                     f"repair_vol_skew={item.get('repair_vol_skew', '未记录')}"
                 )
+                if strategy == "gear_aware_tetra":
+                    tooth_ids = item.get("gear_tooth_surface_ids", []) or []
+                    if isinstance(tooth_ids, (list, tuple)):
+                        tooth_text = ",".join(str(value) for value in tooth_ids)
+                    else:
+                        tooth_text = str(tooth_ids)
+                    if not tooth_text:
+                        tooth_text = "未识别"
+                    lines.append(
+                        "  - gear 齿面候选："
+                        f"axis={item.get('gear_axis', '未记录')}, "
+                        f"surface_count={item.get('gear_tooth_surface_count', 0)}, "
+                        f"surface_ids={tooth_text}"
+                    )
         lines.append("")
 
     lines.append("五、最终质量统计")

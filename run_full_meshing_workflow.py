@@ -45,6 +45,67 @@ def _write_json_if_enabled(enabled: bool, path: Path, payload: Any) -> str | Non
     return str(path)
 
 
+def _diag(path: Path | None, event: str, **payload: Any) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event,
+        **payload,
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        handle.flush()
+
+
+def _response_diag(response: dict[str, Any] | None, *, tail_chars: int = 2000) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        return {"success": False, "reason": "no_response"}
+    text = str(response.get("response", "") or response.get("stdout", "") or response.get("tail", ""))
+    err = str(response.get("error", "") or response.get("message", ""))
+    lower = f"{text}\n{err}".lower()
+    reason = "ok" if response.get("success") else "failed"
+    if "software caused connection abort" in lower or "connection abort" in lower:
+        reason = "hypermesh_connection_abort_or_crash"
+    elif "connection refused" in lower or "could not connect" in lower:
+        reason = "listener_not_available_or_hypermesh_closed"
+    elif "timed out" in lower or "timeout" in lower:
+        reason = "timeout_or_hypermesh_hang"
+    elif "mcp_async_error" in lower:
+        reason = "tcl_async_error"
+    elif "error" in lower and not response.get("success"):
+        reason = "tcl_or_hypermesh_error"
+    last_markers = [
+        line
+        for line in text.splitlines()
+        if line.startswith(("MCP_", "MCP_CONSOLE", "PROBE:", "DEBUG_PROBE"))
+    ]
+    return {
+        "success": response.get("success"),
+        "status": response.get("status"),
+        "reason": reason,
+        "message": response.get("message"),
+        "error": response.get("error"),
+        "elapsed_seconds": response.get("elapsed_seconds"),
+        "last_marker": last_markers[-1] if last_markers else "",
+        "tail": text[-tail_chars:] if text else "",
+    }
+
+
+def _exception_diag(exc: BaseException) -> dict[str, Any]:
+    text = str(exc)
+    lower = text.lower()
+    reason = "exception"
+    if "software caused connection abort" in lower or "connection abort" in lower:
+        reason = "hypermesh_connection_abort_or_crash"
+    elif "timed out" in lower or "timeout" in lower:
+        reason = "timeout_or_hypermesh_hang"
+    elif "connection refused" in lower or "could not connect" in lower:
+        reason = "listener_not_available_or_hypermesh_closed"
+    return {"reason": reason, "type": type(exc).__name__, "message": text}
+
+
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
 
@@ -1202,6 +1263,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
 
     output_path = Path(args.output).resolve() if args.output else OUTPUTS_DIR / f"full_mesh_{stamp}.hm"
     report_path = RUNS_DIR / f"workflow_report_{stamp}.txt"
+    diagnostic_log_path = RUNS_DIR / f"workflow_diagnostics_{stamp}.jsonl"
 
     workflow: dict[str, Any] = {
         "stamp": stamp,
@@ -1212,10 +1274,21 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "steps": {},
         "errors": [],
         "warnings": [],
+        "diagnostic_log_path": str(diagnostic_log_path),
     }
+    _diag(
+        diagnostic_log_path,
+        "workflow_start",
+        stamp=stamp,
+        host=args.host,
+        port=args.port,
+        output_hm_path=str(output_path),
+        note="Realtime diagnostic log for locating HyperMesh crash, timeout, Tcl error, or workflow failure causes.",
+    )
 
     _log(f"[1/6] Probe current HyperMesh model: {stamp}")
     probe_path = RUNS_DIR / f"workflow_probe_{stamp}.txt"
+    _diag(diagnostic_log_path, "probe_start", output_file=str(probe_path), timeout=args.probe_timeout)
     probe = hm.run_geometry_probe_gui(
         host=args.host,
         port=args.port,
@@ -1228,11 +1301,19 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "line_count": len(str(probe.get("probe_lines") or "").splitlines()),
         "debug_result": probe.get("_debug_result"),
     }
+    _diag(
+        diagnostic_log_path,
+        "probe_done",
+        output_file=str(probe_path),
+        line_count=workflow["steps"]["probe"]["line_count"],
+        **_response_diag(probe),
+    )
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_probe_response_{stamp}.json", probe)
     if not probe.get("success"):
         raise RuntimeError("Geometry probe failed. See probe output and console log.")
 
     _log("[2/6] Classify solids and execute Phase 2 finalization")
+    _diag(diagnostic_log_path, "classification_start", probe_file=str(probe_path))
     classification = hm.classify_all_solids_from_probe(probe.get("probe_lines", ""))
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_classification_{stamp}.json", classification)
     workflow["steps"]["classification"] = {
@@ -1241,9 +1322,17 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "strategy_counts": classification.get("strategy_counts"),
     }
     if not classification.get("success"):
+        _diag(diagnostic_log_path, "classification_failed", classification=classification)
         raise RuntimeError("Classification failed.")
+    _diag(
+        diagnostic_log_path,
+        "classification_done",
+        total_solids=classification.get("total_solids"),
+        strategy_counts=classification.get("strategy_counts"),
+    )
 
     results = classification["results"]
+    _diag(diagnostic_log_path, "existing_mesh_check_start", solid_count=len(results))
     existing_mesh = _detect_existing_mesh_by_solid(
         results,
         host=args.host,
@@ -1275,6 +1364,12 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         ],
     }
     workflow["steps"]["classification"]["skipped_existing_mesh_count"] = len(skipped_existing_mesh)
+    _diag(
+        diagnostic_log_path,
+        "existing_mesh_check_done",
+        skipped_count=len(skipped_existing_mesh),
+        skipped_solids=workflow["steps"]["existing_mesh_skip"]["skipped_solids"],
+    )
     if skipped_existing_mesh:
         skipped_text = ", ".join(
             f"{sid}({item.get('element_count', 0)} elems)"
@@ -1282,6 +1377,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         )
         _log(f"  - skipped existing-mesh solids: {skipped_text}")
 
+    _diag(diagnostic_log_path, "phase2_start", timeout=args.phase2_timeout)
     phase2 = hm.execute_tcl_gui(
         classification["phase2_finalize_script"],
         host=args.host,
@@ -1291,6 +1387,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     )
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_phase2_response_{stamp}.json", phase2)
     workflow["steps"]["phase2_finalize"] = phase2
+    _diag(diagnostic_log_path, "phase2_done", **_response_diag(phase2))
     if not phase2.get("success"):
         raise RuntimeError("Phase 2 finalization failed. See workflow_phase2_response JSON.")
 
@@ -1298,6 +1395,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     drag_solids = _build_drag_solids(active_results)
     drag_step: dict[str, Any] = {"count": len(drag_solids), "success": True}
     drag_response: dict[str, Any] | None = None
+    _diag(diagnostic_log_path, "drag_start", solid_count=len(drag_solids), solids=drag_solids)
     if drag_solids:
         drag = hm.generate_batched_drag_hex_tcl(
             solids=drag_solids,
@@ -1314,6 +1412,13 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         )
         drag_script_path = RUNS_DIR / f"workflow_drag_hex_{stamp}.tcl"
         drag_script_path.write_text(drag["script"], encoding="utf-8")
+        _diag(
+            diagnostic_log_path,
+            "drag_script_ready",
+            script_path=str(drag_script_path),
+            solid_count=len(drag_solids),
+            aspect_guard=args.drag_aspect_guard,
+        )
         start = time.time()
         drag_response = hm.execute_tcl_gui(
             drag["script"],
@@ -1339,6 +1444,13 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 "one_layer_fallback": _drag_one_layer_fallbacks(drag_solids, drag_response),
             }
         )
+        _diag(
+            diagnostic_log_path,
+            "drag_done",
+            script_path=str(drag_script_path),
+            one_layer_fallback=drag_step.get("one_layer_fallback", []),
+            **_response_diag(drag_response),
+        )
         if drag_step["one_layer_fallback"]:
             workflow["warnings"].append(
                 "警告：部分 drag 六面体实体在至少 3 层且 aspect<20 的策略下仍未通过，已改为 1 层 drag；详见中文报告。"
@@ -1353,9 +1465,11 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     spin_solids = _build_spin_solids(active_results)
     spin_step: dict[str, Any] = {"count": len(spin_solids), "completed": [], "fallback_to_tetra": [], "failed": []}
     spin_responses: dict[str, dict[str, Any]] = {}
+    _diag(diagnostic_log_path, "spin_start", solid_count=len(spin_solids), solids=spin_solids)
     for spin_solid in spin_solids:
         sid = int(spin_solid["solid_id"])
         try:
+            _diag(diagnostic_log_path, "spin_solid_start", solid_id=sid, solid=spin_solid)
             spin_size = float(args.spin_element_size or spin_solid.get("element_size") or args.drag_element_size)
             axis_point = spin_solid.get("spin_axis_point")
             split_normal = spin_solid.get("spin_split_plane_normal")
@@ -1382,6 +1496,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             )
             spin_script_path = RUNS_DIR / f"workflow_spin_hex_s{sid}_{stamp}.tcl"
             spin_script_path.write_text(spin["script"], encoding="utf-8")
+            _diag(diagnostic_log_path, "spin_script_ready", solid_id=sid, script_path=str(spin_script_path))
             start = time.time()
             spin_response = hm.execute_tcl_gui(
                 spin["script"],
@@ -1396,6 +1511,14 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             parsed = _parse_spin_results(response_text).get(str(sid), {})
             spin_response["parsed_result"] = parsed
             spin_responses[str(sid)] = spin_response
+            _diag(
+                diagnostic_log_path,
+                "spin_solid_done",
+                solid_id=sid,
+                parsed=parsed,
+                script_path=str(spin_script_path),
+                **_response_diag(spin_response),
+            )
             spun_3d_count = int(parsed.get("total3d") or parsed.get("hex8") or 0)
             if spin_response.get("success") and int(parsed.get("ok") or 0) == 1 and spun_3d_count > 0:
                 spin_step["completed"].append({"solid_id": sid, **parsed, "script_path": str(spin_script_path)})
@@ -1409,8 +1532,17 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 spin_step["fallback_to_tetra"].append(
                     {"solid_id": sid, **parsed, "fallback_solid_ids": fallback_ids, "script_path": str(spin_script_path)}
                 )
+                _diag(
+                    diagnostic_log_path,
+                    "spin_fallback_to_tetra",
+                    solid_id=sid,
+                    fallback_solid_ids=fallback_ids,
+                    parsed=parsed,
+                    reason="spin failed or produced no 3D elements; split solids promoted to tetra",
+                )
         except Exception as exc:
             spin_step["failed"].append({"solid_id": sid, "error": str(exc)})
+            _diag(diagnostic_log_path, "spin_solid_exception", solid_id=sid, **_exception_diag(exc))
             if str(sid) in active_results:
                 active_results[str(sid)]["strategy"] = "tetra_plain"
                 active_results[str(sid)].setdefault("evidence", []).append("spin exception -> tetra fallback")
@@ -1420,11 +1552,19 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_spin_hex_responses_{stamp}.json", spin_responses)
     spin_step["success"] = not spin_step["failed"]
     workflow["steps"]["spin_hex"] = spin_step
+    _diag(
+        diagnostic_log_path,
+        "spin_done",
+        completed=spin_step.get("completed", []),
+        fallback_to_tetra=spin_step.get("fallback_to_tetra", []),
+        failed=spin_step.get("failed", []),
+    )
 
     _log("[4/6] Run tetra batches")
     tetra_batches = _build_tetra_batches_from_results(active_results)
     plan_batches: list[dict[str, Any]] = []
     tetra_step: dict[str, Any] = {"batch_count": len(tetra_batches), "completed": [], "failed": []}
+    _diag(diagnostic_log_path, "tetra_start", batch_count=len(tetra_batches), batches=tetra_batches)
     for batch in tetra_batches:
         batch_index = int(batch["batch"])
         solid_ids = [int(value) for value in batch["solid_ids"]]
@@ -1450,6 +1590,14 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         script_path = RUNS_DIR / f"workflow_tetra_batch_{batch_index:02d}_{stamp}.tcl"
         log_path = RUNS_DIR / f"workflow_tetra_batch_{batch_index:02d}_{stamp}.log"
         script_path.write_text(generated["script"], encoding="utf-8")
+        _diag(
+            diagnostic_log_path,
+            "tetra_batch_script_ready",
+            batch=batch_index,
+            solid_ids=solid_ids,
+            script_path=str(script_path),
+            log_path=str(log_path),
+        )
         plan_batches.append(
             {
                 "batch": batch_index,
@@ -1475,6 +1623,17 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             RUNS_DIR / f"workflow_tetra_batch_{batch_index:02d}_response_{stamp}.json",
             result,
         )
+        async_tail = _read_text(log_path)[-4000:]
+        _diag(
+            diagnostic_log_path,
+            "tetra_batch_done",
+            batch=batch_index,
+            solid_ids=solid_ids,
+            async_log_path=str(log_path),
+            async_log_tail=async_tail,
+            response_path=tetra_response_path,
+            **_response_diag(result, tail_chars=4000),
+        )
         if result["status"] == "ok":
             tetra_step["completed"].append(batch_index)
         else:
@@ -1489,6 +1648,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             if not args.continue_on_error:
                 raise RuntimeError(f"Tetra batch {batch_index} failed: {result['status']}")
     workflow["steps"]["tetra"] = tetra_step
+    _diag(diagnostic_log_path, "tetra_done", completed=tetra_step["completed"], failed=tetra_step["failed"])
 
     plan = {
         "stamp": stamp,
@@ -1502,6 +1662,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_execution_plan_{stamp}.json", plan)
 
     _log("[5/6] Final save and element count")
+    _diag(diagnostic_log_path, "final_save_start", output_path=str(output_path), timeout=args.save_timeout)
     final_save = _final_save_and_count(
         output_path=output_path,
         host=args.host,
@@ -1510,8 +1671,10 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     )
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_final_save_response_{stamp}.json", final_save)
     workflow["steps"]["final_save"] = final_save
+    _diag(diagnostic_log_path, "final_save_done", output_path=str(output_path), **_response_diag(final_save))
 
     _log("[6/6] Parse repair summary")
+    _diag(diagnostic_log_path, "repair_summary_start", tetra_batches=plan_batches)
     repair_summary = _parse_repair_summary(plan)
     part_parameters = _build_part_parameter_report(
         results=active_results,
@@ -1523,6 +1686,13 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         args=args,
     )
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_repair_summary_{stamp}.json", repair_summary)
+    _diag(
+        diagnostic_log_path,
+        "repair_summary_done",
+        aggregate=repair_summary.get("repair_aggregate", {}),
+        tetra_attempted_count=repair_summary.get("tetra_attempted_count"),
+        tetra_failed_count=repair_summary.get("tetra_failed_count"),
+    )
     workflow["steps"]["repair_summary"] = {
         **repair_summary["repair_aggregate"],
         "tetra_attempted_count": repair_summary["tetra_attempted_count"],
@@ -1741,6 +1911,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "探测结果": str(probe_path),
             "中文报告": str(report_path),
             "最终模型": str(output_path),
+            "实时诊断日志": str(diagnostic_log_path),
         },
     }
     report = hm.write_chinese_meshing_workflow_report(report_data, output_path=str(report_path))
@@ -1767,6 +1938,15 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         workflow["steps"]["drag_one_layer_warning_popup"] = drag_popup
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_summary_{stamp}.json", workflow)
     _write_json_if_enabled(args.write_json, RUNS_DIR / "workflow_latest_summary.json", workflow)
+    _diag(
+        diagnostic_log_path,
+        "workflow_done",
+        success=workflow["success"],
+        errors=workflow["errors"],
+        warnings=workflow["warnings"],
+        report_path=workflow.get("report_path"),
+        output_hm_path=workflow.get("output_hm_path"),
+    )
     _log(f"Chinese report: {report.get('report_path')}")
     return workflow
 

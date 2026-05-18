@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import os
+import json
 import socket
 import subprocess
 import time
@@ -19,6 +20,7 @@ DEFAULT_HMBATCH = DEFAULT_HYPERMESH_DIR / "hmbatch.exe"
 DEFAULT_HW = DEFAULT_HYPERMESH_DIR / "hw.exe"
 DEFAULT_GUI_PORT = 47881
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
+GUI_REALTIME_DIAG_PATH = RUNS_DIR / "mcp_gui_realtime_diagnostics_latest.jsonl"
 
 HYPERMESH_MESHING_STRATEGY = """
 HyperMesh meshing strategy for this workstation:
@@ -547,6 +549,53 @@ def _mark_phase2_finalized_from_result(result: dict[str, Any]) -> None:
 def _ensure_runs_dir() -> Path:
     RUNS_DIR.mkdir(exist_ok=True)
     return RUNS_DIR
+
+
+def _append_gui_realtime_diag(event: str, **payload: Any) -> None:
+    try:
+        RUNS_DIR.mkdir(exist_ok=True)
+        record = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "event": event,
+            **payload,
+        }
+        with GUI_REALTIME_DIAG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            handle.flush()
+    except Exception:
+        pass
+
+
+def _script_diag_summary(script: str) -> dict[str, Any]:
+    markers = [
+        line.strip()
+        for line in str(script or "").splitlines()
+        if "MCP_" in line or line.strip().startswith(("puts", "*tetmesh", "*meshdragelements", "*meshspinelements"))
+    ]
+    return {
+        "script_chars": len(script or ""),
+        "script_lines": len(str(script or "").splitlines()),
+        "first_markers": markers[:8],
+        "last_markers": markers[-8:],
+    }
+
+
+def _gui_response_reason(result: dict[str, Any] | None) -> str:
+    if not isinstance(result, dict):
+        return "no_response"
+    text = str(result.get("response", "") or result.get("stdout", "") or result.get("error", "") or result.get("message", ""))
+    lower = text.lower()
+    if result.get("success"):
+        return "ok"
+    if "software caused connection abort" in lower or "connection abort" in lower:
+        return "hypermesh_connection_abort_or_crash"
+    if "connection refused" in lower or "could not connect" in lower:
+        return "listener_not_available_or_hypermesh_closed"
+    if "timed out" in lower or "timeout" in lower:
+        return "timeout_or_hypermesh_hang"
+    if "error" in lower:
+        return "tcl_or_hypermesh_error"
+    return "failed"
 
 
 def _write_run_script(script: str) -> Path:
@@ -4199,6 +4248,17 @@ def execute_tcl_gui(
     if not gui_script.endswith("\n"):
         gui_script += "\n"
 
+    diag_id = uuid.uuid4().hex[:10]
+    _append_gui_realtime_diag(
+        "execute_tcl_gui_start",
+        diag_id=diag_id,
+        host=host,
+        port=int(port),
+        timeout_seconds=timeout_seconds,
+        model_path=str(model) if model else None,
+        output_hm_path=output_hm_path,
+        **_script_diag_summary(gui_script),
+    )
     try:
         result = _run_hypermesh_gui_script(
             script=gui_script,
@@ -4207,8 +4267,24 @@ def execute_tcl_gui(
             timeout_seconds=timeout_seconds,
         )
         _mark_phase2_finalized_from_result(result)
+        _append_gui_realtime_diag(
+            "execute_tcl_gui_done",
+            diag_id=diag_id,
+            reason=_gui_response_reason(result),
+            success=result.get("success"),
+            message=result.get("message"),
+            error=result.get("error"),
+            response_tail=str(result.get("response", "") or result.get("stdout", ""))[-2500:],
+        )
         return result
     except OSError as exc:
+        _append_gui_realtime_diag(
+            "execute_tcl_gui_exception",
+            diag_id=diag_id,
+            reason=_gui_response_reason({"success": False, "error": str(exc)}),
+            exception_type=type(exc).__name__,
+            error=str(exc),
+        )
         return {
             "success": False,
             "host": host,
@@ -4268,6 +4344,19 @@ def execute_tcl_gui_async(
     job_id = f"job_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     log = _normalize_path(log_path) if log_path else (_ensure_runs_dir() / f"{job_id}.log")
     log.parent.mkdir(parents=True, exist_ok=True)
+    diag_id = uuid.uuid4().hex[:10]
+    _append_gui_realtime_diag(
+        "execute_tcl_gui_async_start",
+        diag_id=diag_id,
+        job_id=job_id,
+        log_path=str(log),
+        host=host,
+        port=int(port),
+        enqueue_timeout_seconds=enqueue_timeout_seconds,
+        model_path=str(model) if model else None,
+        output_hm_path=output_hm_path,
+        **_script_diag_summary(gui_script),
+    )
 
     try:
         result = _run_hypermesh_gui_script_async(
@@ -4277,6 +4366,15 @@ def execute_tcl_gui_async(
             host=host,
             port=port,
             timeout_seconds=enqueue_timeout_seconds,
+        )
+        _append_gui_realtime_diag(
+            "execute_tcl_gui_async_enqueued",
+            diag_id=diag_id,
+            job_id=job_id,
+            log_path=str(log),
+            reason=_gui_response_reason(result),
+            success=result.get("success"),
+            response_tail=str(result.get("response", ""))[-2500:],
         )
         return {
             "success": result.get("success", False),
@@ -4289,6 +4387,15 @@ def execute_tcl_gui_async(
             "next_step": "Call get_gui_async_job_status with this job_id/log_path.",
         }
     except OSError as exc:
+        _append_gui_realtime_diag(
+            "execute_tcl_gui_async_exception",
+            diag_id=diag_id,
+            job_id=job_id,
+            log_path=str(log),
+            reason=_gui_response_reason({"success": False, "error": str(exc)}),
+            exception_type=type(exc).__name__,
+            error=str(exc),
+        )
         return {
             "success": False,
             "queued": False,
@@ -4350,6 +4457,15 @@ puts "MCP_ASYNC_STATUS job=$_mcp_job status=$_mcp_status log=$_mcp_log"
         status = "running"
     elif "MCP_ASYNC_QUEUED" in log_text:
         status = "queued"
+
+    _append_gui_realtime_diag(
+        "get_gui_async_job_status",
+        job_id=job_id,
+        status=status,
+        log_path=str(resolved_log) if resolved_log else None,
+        gui_reason=_gui_response_reason(gui_result),
+        log_tail=log_text[-2500:],
+    )
 
     return {
         "success": gui_result.get("success", False) or bool(log_text),

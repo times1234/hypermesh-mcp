@@ -232,6 +232,8 @@ TETRA_CRASH_GUARD_SHELL_ELEMENTS = 150000
 TETRA_DIRECT_TETMESH_SURFACE_COUNT_LIMIT = 50
 TETRA_FATAL_SURFACE_ASPECT = 2000.0
 TETRA_SURFACE_CHORD_DEV = 0.1
+GEAR_TOOTH_DEFAULT_SIZE_SCALE = 0.70
+GEAR_TOOTH_PREVIEW_COMPONENT = "__mcp_gear_tooth_preview"
 
 # Generated-script boundary markers used by _meshing_rule_violation
 MCP_SCRIPT_BEGIN = "# MCP_SCRIPT_BEGIN"
@@ -240,6 +242,7 @@ TRUSTED_MESHING_GENERATORS = {
     "generate_surface_automesh_tcl",
     "generate_plain_tetra_tcl",
     "generate_batched_plain_tetra_tcl",
+    "generate_gear_tooth_preview_tcl",
     "generate_guarded_drag_hex_tcl",
     "generate_batched_drag_hex_tcl",
     "generate_cutsection_spin_hex_tcl",
@@ -247,6 +250,7 @@ TRUSTED_MESHING_GENERATORS = {
 TRUSTED_NON_MESHING_GENERATORS = {
     "generate_phase2_finalize_tcl",
     "generate_finalize_components_tcl",
+    "generate_delete_gear_tooth_preview_tcl",
 }
 TRUSTED_GENERATORS = TRUSTED_MESHING_GENERATORS | TRUSTED_NON_MESHING_GENERATORS
 
@@ -891,6 +895,7 @@ def _spin_params_from_probe(facts: dict[str, Any]) -> dict[str, Any]:
 
 def _gear_reason_from_probe(facts: dict[str, Any]) -> str | None:
     """Return a gear classification reason from geometry facts only."""
+    min_repeated_tooth_faces = 12
     sc = int(facts.get("surf_count", 0) or 0)
     dx, dy, dz = float(facts.get("dx", 0) or 0), float(facts.get("dy", 0) or 0), float(facts.get("dz", 0) or 0)
     dims = sorted([dx, dy, dz])
@@ -902,11 +907,62 @@ def _gear_reason_from_probe(facts: dict[str, Any]) -> str | None:
     md_mx = md / mx
     mn_md = mn / md
     mx_md = mx / md
+    tooth_count = int(facts.get("gear_tooth_count", 0) or 0)
+    tooth_density = tooth_count / max(sc, 1)
+    src_inner_loops = int(facts.get("source_inner_loop_count", 0) or 0)
+    src_boundary_nodes = int(facts.get("source_boundary_node_count", 0) or 0)
 
-    if src_surf <= 0 and sc >= 100 and md_mx >= 0.95 and 0.18 <= mn_mx <= 0.50:
-        return "gear disk/body: high surface count, circular two-axis envelope, moderate thickness"
-    if src_surf <= 0 and sc >= 180 and md_mx >= 0.70 and mn_mx >= 0.70:
-        return "gear rounded/chamfer body: very high surface count around a compact gear envelope"
+    # Small closed gears can have too few separate side surfaces for the
+    # tooth-face probe to count them, but their source section exposes a dense
+    # looped boundary. Keep this path narrow so ordinary flanges stay out.
+    if 70 <= sc <= 100 and src_surf > 0 and md_mx >= 0.95 and 0.30 <= mn_mx <= 0.42 and src_inner_loops >= 3 and src_boundary_nodes >= 100:
+        return "gear small looped circular repeated-boundary body"
+
+    # Source-based gears should expose one repeated tooth ring. Multi-inner-loop
+    # source sections are usually housings/covers with circular arrays of ribs,
+    # bosses, or holes; they can produce many repeated faces but are not gears.
+    dense_thin_repeated_ring = (
+        tooth_count >= min_repeated_tooth_faces
+        and tooth_density >= 0.70
+        and md_mx >= 0.95
+        and mn_mx <= 0.30
+    )
+    if src_surf > 0 and src_inner_loops > 2 and not dense_thin_repeated_ring:
+        return None
+
+    # Internal ring gears are thin circular rings with a single dense repeated
+    # inner boundary. Their tooth faces sit on the inside, so the usual outer
+    # band density is lower than for external gears.
+    if src_surf > 0 and sc >= 180 and tooth_count >= 40 and md_mx >= 0.95 and 0.10 <= mn_mx <= 0.22 and src_inner_loops == 1 and src_boundary_nodes >= 200:
+        return "gear internal ring: single dense repeated inner tooth ring"
+
+    # Small sun gears can be compact and closed enough that the surface probe is
+    # conservative. The source boundary still carries a dense single tooth loop.
+    if src_surf > 0 and 100 <= sc <= 170 and tooth_count >= min_repeated_tooth_faces and md_mx >= 0.95 and 0.38 <= mn_mx <= 0.46 and src_inner_loops == 1 and src_boundary_nodes >= 150:
+        return "gear compact sun: single dense repeated boundary body"
+
+    # Compact circular bodies are gear-like only when the tooth-band probe
+    # already sees a dense repeated band. A plain circular plate with many holes
+    # can otherwise look deceptively similar by bbox and surface count.
+    if sc >= 100 and tooth_count >= min_repeated_tooth_faces and tooth_density >= 0.45 and md_mx >= 0.95 and 0.12 <= mn_mx <= 0.35:
+        return "gear compact circular dense repeated-tooth body"
+
+    # Tooth candidates alone are not enough: large side plates can have many
+    # repeated ribs/chamfers. Keep this path limited to gear-like envelopes.
+    if sc >= 100 and tooth_count >= 40 and tooth_density >= 0.25 and md_mx >= 0.95 and 0.25 <= mn_mx <= 0.60:
+        return "gear thin circular repeated-tooth body"
+    if src_surf <= 0 and sc >= 100 and tooth_count >= 40 and tooth_density >= 0.20 and mn_mx >= 0.70 and md_mx >= 0.70 and mx_md <= 1.40:
+        return "gear thick near-round repeated-tooth body"
+    if sc >= 100 and tooth_count >= 40 and tooth_density >= 0.45 and 0.40 <= mn_mx <= 0.54 and 0.60 <= md_mx <= 0.75 and mx_md <= 1.60:
+        return "gear oblong repeated-tooth body"
+
+    if src_surf <= 0 and 40 <= sc <= 90 and tooth_count >= 20 and tooth_density >= 0.45 and mn_md >= 0.85 and mx_md <= 2.10:
+        return "gear compact no-source external gear: dense repeated tooth band"
+
+    if src_surf <= 0 and sc >= 100 and tooth_count >= 40 and tooth_density >= 0.45 and md_mx >= 0.95 and 0.18 <= mn_mx <= 0.50:
+        return "gear disk/body: circular envelope with dense repeated-tooth band"
+    if src_surf <= 0 and sc >= 180 and tooth_count >= 40 and tooth_density >= 0.25 and md_mx >= 0.70 and mn_mx >= 0.70:
+        return "gear rounded/chamfer body: compact envelope with repeated-tooth band"
     if src_surf <= 0 and 50 <= sc <= 90 and mn_md >= 0.95 and 3.5 <= mx_md <= 5.0:
         return "gear shaft/tooth-related slender body: repeated-feature surface count with round cross-section"
     return None
@@ -1433,6 +1489,8 @@ proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
     set len1 [expr {abs([lindex $solid_bb $r1_max] - [lindex $solid_bb $r1_min])}]
     set len2 [expr {abs([lindex $solid_bb $r2_max] - [lindex $solid_bb $r2_min])}]
     set max_radial_span [expr {max($len1, $len2)}]
+    set min_radial_span [expr {min($len1, $len2)}]
+    set radial_roundness [expr {$min_radial_span / max($max_radial_span, 0.001)}]
     set solid_rmax [expr {sqrt($len1*$len1 + $len2*$len2) / 2.0}]
     if {$solid_rmax <= 0.001} {return {}}
 
@@ -1440,6 +1498,10 @@ proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
     set all_surfs [hm_getmark surfaces 1]
     set high_count_gear [expr {[llength $all_surfs] >= 400}]
     set shaft_end_gear [expr {$axis_len > $max_radial_span * 2.5 && [llength $all_surfs] <= 120}]
+    set compact_no_source_gear [expr {$axis_len > $max_radial_span * 1.30 && $axis_len <= $max_radial_span * 2.20 && $radial_roundness >= 0.85 && [llength $all_surfs] >= 40 && [llength $all_surfs] <= 90}]
+    set small_loop_gear [expr {$axis_len <= $max_radial_span * 0.38 && [llength $all_surfs] >= 70 && [llength $all_surfs] <= 100}]
+    set full_thickness_compact_gear [expr {$axis_len <= $max_radial_span * 0.46 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 300}]
+    set compact_thin_gear [expr {$axis_len <= $max_radial_span * 0.35 && [llength $all_surfs] <= 300}]
     set candidates {}
     foreach surf_id $all_surfs {
         *createmark surfaces 2 $surf_id
@@ -1479,7 +1541,27 @@ proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
         # Tooth faces are local repeated flank/top/root faces. The center radius
         # prevents inner holes/slots from being selected just because their bbox
         # corners reach outward.
-        if {$shaft_end_gear} {
+        if {$small_loop_gear} {
+            if {$center_ratio >= 0.60 && $outer_ratio >= 0.68 && $axis_ratio >= 0.55 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.14 && $angle_span <= 18.0} {
+                lappend candidates $surf_id
+            }
+        } elseif {$compact_thin_gear || $full_thickness_compact_gear} {
+            set compact_full_span [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.66 && $axis_ratio >= 0.80 && $local_span_ratio <= 0.12 && $angle_span <= 10.0 && $radial_span_ratio >= 0.0}]
+            set compact_flank_band [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.66 && $axis_ratio >= 0.35 && $axis_ratio <= 0.55 && $local_span_ratio <= 0.08 && $angle_span <= 8.0 && $radial_span_ratio >= 0.0}]
+            set compact_full_tooth_band [expr {$full_thickness_compact_gear && $center_ratio >= 0.55 && $outer_ratio >= 0.60 && $axis_ratio >= 0.70 && $local_span_ratio <= 0.22 && $angle_span <= 26.0 && $radial_span_ratio >= 0.0}]
+            set compact_thick_tooth_band [expr {$full_thickness_compact_gear && $axis_len > $max_radial_span * 0.36 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 170 && $center_ratio >= 0.50 && $outer_ratio >= 0.55 && $axis_ratio >= 0.65 && $local_span_ratio <= 0.30 && $angle_span <= 35.0 && $radial_span_ratio >= 0.0}]
+            set compact_oblique_tooth_band [expr {$full_thickness_compact_gear && $axis_len > $max_radial_span * 0.36 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 170 && $radial_roundness >= 0.95 && $outer_ratio >= 0.45 && $axis_ratio >= 0.05 && $local_span_ratio <= 0.95 && $angle_span <= 125.0}]
+            if {$compact_full_span || $compact_flank_band || $compact_full_tooth_band || $compact_thick_tooth_band || $compact_oblique_tooth_band} {
+                lappend candidates $surf_id
+            }
+        } elseif {$compact_no_source_gear} {
+            set compact_no_source_outer_flank [expr {$center_ratio >= 0.58 && $outer_ratio >= 0.63 && $axis_ratio >= 0.50 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.30 && $angle_span <= 35.0 && $radial_span_ratio >= 0.008}]
+            set compact_no_source_root_flank [expr {$center_ratio >= 0.49 && $outer_ratio >= 0.52 && $axis_ratio >= 0.50 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.18 && $angle_span <= 22.0 && $radial_span_ratio >= 0.03}]
+            set compact_no_source_tip_sliver [expr {$center_ratio >= 0.70 && $outer_ratio >= 0.70 && $axis_ratio >= 0.50 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.05 && $angle_span <= 6.0}]
+            if {$compact_no_source_outer_flank || $compact_no_source_root_flank || $compact_no_source_tip_sliver} {
+                lappend candidates $surf_id
+            }
+        } elseif {$shaft_end_gear} {
             if {($ax_center_ratio <= 0.15 || $ax_center_ratio >= 0.85) && $center_ratio >= 0.35 && $outer_ratio >= 0.45 && $axis_ratio >= 0.05 && $axis_ratio <= 0.16 && $local_span_ratio <= 0.16 && $angle_span <= 35.0 && $radial_span_ratio >= 0.03} {
                 lappend candidates $surf_id
             }
@@ -1488,11 +1570,17 @@ proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
                 lappend candidates $surf_id
             }
         } else {
-            set ordinary_local [expr {$center_ratio >= 0.50 && $outer_ratio >= 0.58 && $local_span_ratio <= 0.50 && $angle_span <= 80.0 && $radial_span_ratio >= 0.008 && $axis_ratio <= 0.55}]
-            set ordinary_broad_flank [expr {$center_ratio >= 0.20 && $outer_ratio >= 0.58 && $radial_span_ratio >= 0.17 && $local_span_ratio <= 0.90 && $angle_span <= 190.0 && $axis_ratio <= 0.55}]
+            if {$radial_roundness < 0.70} {
+                set ordinary_local [expr {$center_ratio >= 0.54 && $outer_ratio >= 0.55 && $local_span_ratio <= 0.075 && $angle_span <= 8.0 && $radial_span_ratio >= 0.0 && $radial_span_ratio <= 0.080 && $axis_ratio >= 0.08 && $axis_ratio <= 0.25}]
+                set ordinary_root_local [expr {$center_ratio >= 0.535 && $outer_ratio >= 0.545 && $local_span_ratio <= 0.025 && $angle_span <= 4.0 && $radial_span_ratio >= 0.0 && $radial_span_ratio <= 0.080 && $axis_ratio >= 0.08 && $axis_ratio <= 0.25}]
+                set ordinary_mid_flank 0
+            } else {
+                set ordinary_local [expr {$center_ratio >= 0.58 && $outer_ratio >= 0.63 && $local_span_ratio <= 0.30 && $angle_span <= 35.0 && $radial_span_ratio >= 0.008 && $axis_ratio <= 0.65}]
+                set ordinary_mid_flank [expr {$center_ratio >= 0.49 && $outer_ratio >= 0.52 && $local_span_ratio <= 0.30 && $angle_span <= 40.0 && $axis_ratio <= 0.50}]
+                set ordinary_root_local 0
+            }
             set ordinary_end_sliver [expr {$center_ratio >= 0.48 && $outer_ratio >= 0.52 && $radial_span_ratio >= 0.025 && $local_span_ratio <= 0.08 && $angle_span <= 12.5 && $axis_ratio <= 0.03}]
-            set ordinary_inner_flank [expr {$center_ratio >= 0.30 && $outer_ratio >= 0.44 && $radial_span_ratio >= 0.20 && $local_span_ratio <= 0.22 && $angle_span <= 62.0 && $axis_ratio <= 0.08}]
-            if {$ordinary_local || $ordinary_broad_flank || $ordinary_end_sliver || $ordinary_inner_flank} {
+            if {$ordinary_local || $ordinary_root_local || $ordinary_mid_flank || $ordinary_end_sliver} {
                 lappend candidates $surf_id
             }
         }
@@ -1593,7 +1681,11 @@ _GLOBAL_CLASSIFICATION_RESULTS = {}
 _GLOBAL_PHASE2_FINALIZED = False
 
 @mcp.tool()
-def classify_all_solids_from_probe(probe_lines, visual_observations=None):
+def classify_all_solids_from_probe(
+    probe_lines,
+    visual_observations=None,
+    use_gear_tooth_refinement: bool = True,
+):
     """MANDATORY Phase 2: classify every probed solid from probe_lines."""
     global _GLOBAL_CLASSIFICATION_RESULTS, _GLOBAL_PHASE2_FINALIZED
     results = {}
@@ -1628,9 +1720,13 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         min_elem_size = 0.5
         src_surf = f.get("source_surface_id", -1)
         source_inner_loops = int(f.get("source_inner_loop_count", 0) or 0)
-        gear_reason = _gear_reason_from_probe(f)
-        gear_tooth_surface_ids = _probe_int_list_value(f.get("gear_tooth_surfs") or f.get("gear_tooth_surface_ids"))
-        gear_tooth_count = int(f.get("gear_tooth_count", len(gear_tooth_surface_ids)) or 0)
+        gear_reason = _gear_reason_from_probe(f) if use_gear_tooth_refinement else None
+        gear_tooth_surface_ids = (
+            _probe_int_list_value(f.get("gear_tooth_surfs") or f.get("gear_tooth_surface_ids"))
+            if use_gear_tooth_refinement
+            else []
+        )
+        gear_tooth_count = int(f.get("gear_tooth_count", len(gear_tooth_surface_ids)) or 0) if use_gear_tooth_refinement else 0
         
         if gear_reason:
             strategy = "gear_aware_tetra"
@@ -1691,6 +1787,7 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
         spin_plan = _spin_params_from_probe(f) if strategy == "spin_hex" else {}
         results[str(sid)] = {
             "solid_id": sid, "strategy": strategy, "component_name": name,
+            "raw_probe_line": stripped,
             "element_size": round(elem_size, 2),
             "min_element_size": round(min_elem_size, 3),
             "max_shell_elements_before_tetmesh": max_shell_before_tetmesh,
@@ -1705,6 +1802,10 @@ def classify_all_solids_from_probe(probe_lines, visual_observations=None):
             "drag_axis": f.get("drag_axis", ""),
             "gear_axis": f.get("gear_axis", f.get("drag_axis", "")),
             "geometry_confirms_gear_teeth": strategy == "gear_aware_tetra",
+            "gear_detection_enabled": bool(use_gear_tooth_refinement),
+            "gear_probe_reason": gear_reason or "",
+            "gear_probe_tooth_surface_ids": gear_tooth_surface_ids,
+            "gear_probe_tooth_surface_count": gear_tooth_count,
             "gear_tooth_surface_ids": gear_tooth_surface_ids if strategy == "gear_aware_tetra" else [],
             "gear_tooth_surface_count": gear_tooth_count if strategy == "gear_aware_tetra" else 0,
             "surf_count": sc,
@@ -2160,12 +2261,18 @@ def generate_geometry_probe_tcl(
         "    set len1 [expr {abs([lindex $solid_bb $r1_max] - [lindex $solid_bb $r1_min])}]",
         "    set len2 [expr {abs([lindex $solid_bb $r2_max] - [lindex $solid_bb $r2_min])}]",
         "    set max_radial_span [expr {max($len1, $len2)}]",
+        "    set min_radial_span [expr {min($len1, $len2)}]",
+        "    set radial_roundness [expr {$min_radial_span / max($max_radial_span, 0.001)}]",
         "    set solid_rmax [expr {sqrt($len1*$len1 + $len2*$len2) / 2.0}]",
         "    if {$solid_rmax <= 0.001} {return {}}",
         "    *createmark surfaces 1 \"by solids\" $solid_id",
         "    set all_surfs [hm_getmark surfaces 1]",
         "    set high_count_gear [expr {[llength $all_surfs] >= 400}]",
         "    set shaft_end_gear [expr {$axis_len > $max_radial_span * 2.5 && [llength $all_surfs] <= 120}]",
+        "    set compact_no_source_gear [expr {$axis_len > $max_radial_span * 1.30 && $axis_len <= $max_radial_span * 2.20 && $radial_roundness >= 0.85 && [llength $all_surfs] >= 40 && [llength $all_surfs] <= 90}]",
+        "    set small_loop_gear [expr {$axis_len <= $max_radial_span * 0.38 && [llength $all_surfs] >= 70 && [llength $all_surfs] <= 100}]",
+        "    set full_thickness_compact_gear [expr {$axis_len <= $max_radial_span * 0.46 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 300}]",
+        "    set compact_thin_gear [expr {$axis_len <= $max_radial_span * 0.35 && [llength $all_surfs] <= 300}]",
         "    set candidates {}",
         "    foreach surf_id $all_surfs {",
         "        *createmark surfaces 2 $surf_id",
@@ -2201,7 +2308,27 @@ def generate_geometry_probe_tcl(
         "        set angle_span [mcp_angle_span_deg $angles]",
         "        set ax_center [expr {([lindex $sbb $ax_min] + [lindex $sbb $ax_max]) / 2.0}]",
         "        set ax_center_ratio [expr {($ax_center - [lindex $solid_bb $ax_min]) / max($axis_len, 0.001)}]",
-        "        if {$shaft_end_gear} {",
+        "        if {$small_loop_gear} {",
+        "            if {$center_ratio >= 0.60 && $outer_ratio >= 0.68 && $axis_ratio >= 0.55 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.14 && $angle_span <= 18.0} {",
+        "                lappend candidates $surf_id",
+        "            }",
+        "        } elseif {$compact_thin_gear || $full_thickness_compact_gear} {",
+        "            set compact_full_span [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.66 && $axis_ratio >= 0.80 && $local_span_ratio <= 0.12 && $angle_span <= 10.0 && $radial_span_ratio >= 0.0}]",
+        "            set compact_flank_band [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.66 && $axis_ratio >= 0.35 && $axis_ratio <= 0.55 && $local_span_ratio <= 0.08 && $angle_span <= 8.0 && $radial_span_ratio >= 0.0}]",
+        "            set compact_full_tooth_band [expr {$full_thickness_compact_gear && $center_ratio >= 0.55 && $outer_ratio >= 0.60 && $axis_ratio >= 0.70 && $local_span_ratio <= 0.22 && $angle_span <= 26.0 && $radial_span_ratio >= 0.0}]",
+        "            set compact_thick_tooth_band [expr {$full_thickness_compact_gear && $axis_len > $max_radial_span * 0.36 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 170 && $center_ratio >= 0.50 && $outer_ratio >= 0.55 && $axis_ratio >= 0.65 && $local_span_ratio <= 0.30 && $angle_span <= 35.0 && $radial_span_ratio >= 0.0}]",
+        "            set compact_oblique_tooth_band [expr {$full_thickness_compact_gear && $axis_len > $max_radial_span * 0.36 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 170 && $radial_roundness >= 0.95 && $outer_ratio >= 0.45 && $axis_ratio >= 0.05 && $local_span_ratio <= 0.95 && $angle_span <= 125.0}]",
+        "            if {$compact_full_span || $compact_flank_band || $compact_full_tooth_band || $compact_thick_tooth_band || $compact_oblique_tooth_band} {",
+        "                lappend candidates $surf_id",
+        "            }",
+        "        } elseif {$compact_no_source_gear} {",
+        "            set compact_no_source_outer_flank [expr {$center_ratio >= 0.58 && $outer_ratio >= 0.63 && $axis_ratio >= 0.50 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.30 && $angle_span <= 35.0 && $radial_span_ratio >= 0.008}]",
+        "            set compact_no_source_root_flank [expr {$center_ratio >= 0.49 && $outer_ratio >= 0.52 && $axis_ratio >= 0.50 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.18 && $angle_span <= 22.0 && $radial_span_ratio >= 0.03}]",
+        "            set compact_no_source_tip_sliver [expr {$center_ratio >= 0.70 && $outer_ratio >= 0.70 && $axis_ratio >= 0.50 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.05 && $angle_span <= 6.0}]",
+        "            if {$compact_no_source_outer_flank || $compact_no_source_root_flank || $compact_no_source_tip_sliver} {",
+        "                lappend candidates $surf_id",
+        "            }",
+        "        } elseif {$shaft_end_gear} {",
         "            if {($ax_center_ratio <= 0.15 || $ax_center_ratio >= 0.85) && $center_ratio >= 0.35 && $outer_ratio >= 0.45 && $axis_ratio >= 0.05 && $axis_ratio <= 0.16 && $local_span_ratio <= 0.16 && $angle_span <= 35.0 && $radial_span_ratio >= 0.03} {",
         "                lappend candidates $surf_id",
         "            }",
@@ -2210,11 +2337,17 @@ def generate_geometry_probe_tcl(
         "                lappend candidates $surf_id",
         "            }",
         "        } else {",
-        "            set ordinary_local [expr {$center_ratio >= 0.50 && $outer_ratio >= 0.58 && $local_span_ratio <= 0.50 && $angle_span <= 80.0 && $radial_span_ratio >= 0.008 && $axis_ratio <= 0.55}]",
-        "            set ordinary_broad_flank [expr {$center_ratio >= 0.20 && $outer_ratio >= 0.58 && $radial_span_ratio >= 0.17 && $local_span_ratio <= 0.90 && $angle_span <= 190.0 && $axis_ratio <= 0.55}]",
+        "            if {$radial_roundness < 0.70} {",
+        "                set ordinary_local [expr {$center_ratio >= 0.54 && $outer_ratio >= 0.55 && $local_span_ratio <= 0.075 && $angle_span <= 8.0 && $radial_span_ratio >= 0.0 && $radial_span_ratio <= 0.080 && $axis_ratio >= 0.08 && $axis_ratio <= 0.25}]",
+        "                set ordinary_root_local [expr {$center_ratio >= 0.535 && $outer_ratio >= 0.545 && $local_span_ratio <= 0.025 && $angle_span <= 4.0 && $radial_span_ratio >= 0.0 && $radial_span_ratio <= 0.080 && $axis_ratio >= 0.08 && $axis_ratio <= 0.25}]",
+        "                set ordinary_mid_flank 0",
+        "            } else {",
+        "                set ordinary_local [expr {$center_ratio >= 0.58 && $outer_ratio >= 0.63 && $local_span_ratio <= 0.30 && $angle_span <= 35.0 && $radial_span_ratio >= 0.008 && $axis_ratio <= 0.65}]",
+        "                set ordinary_mid_flank [expr {$center_ratio >= 0.49 && $outer_ratio >= 0.52 && $local_span_ratio <= 0.30 && $angle_span <= 40.0 && $axis_ratio <= 0.50}]",
+        "                set ordinary_root_local 0",
+        "            }",
         "            set ordinary_end_sliver [expr {$center_ratio >= 0.48 && $outer_ratio >= 0.52 && $radial_span_ratio >= 0.025 && $local_span_ratio <= 0.08 && $angle_span <= 12.5 && $axis_ratio <= 0.03}]",
-        "            set ordinary_inner_flank [expr {$center_ratio >= 0.30 && $outer_ratio >= 0.44 && $radial_span_ratio >= 0.20 && $local_span_ratio <= 0.22 && $angle_span <= 62.0 && $axis_ratio <= 0.08}]",
-        "            if {$ordinary_local || $ordinary_broad_flank || $ordinary_end_sliver || $ordinary_inner_flank} {",
+        "            if {$ordinary_local || $ordinary_root_local || $ordinary_mid_flank || $ordinary_end_sliver} {",
         "                lappend candidates $surf_id",
         "            }",
         "        }",
@@ -2569,6 +2702,15 @@ def generate_plain_tetra_tcl(
     min_element_size_min: float = 0.20,
     min_element_size_max: float = 0.50,
     delete_existing_component_elements: bool = True,
+    use_gear_tooth_refinement: bool = True,
+    gear_tooth_surface_ids: list[int] | None = None,
+    gear_tooth_element_size: float | None = None,
+    gear_tooth_element_size_min: float | None = None,
+    gear_tooth_element_size_max: float | None = None,
+    gear_tooth_min_element_size: float | None = None,
+    gear_tooth_min_element_size_min: float | None = None,
+    gear_tooth_min_element_size_max: float | None = None,
+    gear_tooth_feature_angle: float | None = None,
 ) -> dict[str, Any]:
     """Generate Tcl for surface-deviation R-trias plus tetra meshing on one solid."""
     if solid_id <= 0:
@@ -2594,6 +2736,37 @@ def generate_plain_tetra_tcl(
     comp = _tcl_escape_name(component_name)
     clamped_min = max(float(min_element_size_min), min(float(min_element_size), float(min_element_size_max)))
     clamped_size = max(float(element_size_min), min(float(element_size), float(element_size_max)))
+    raw_gear_tooth_ids = gear_tooth_surface_ids or []
+    safe_gear_tooth_ids: list[int] = []
+    for value in raw_gear_tooth_ids:
+        try:
+            sid_value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if sid_value > 0 and sid_value not in safe_gear_tooth_ids:
+            safe_gear_tooth_ids.append(sid_value)
+    default_tooth_size = clamped_size * GEAR_TOOTH_DEFAULT_SIZE_SCALE
+    default_tooth_min_size = clamped_min * GEAR_TOOTH_DEFAULT_SIZE_SCALE
+    tooth_size_min = float(gear_tooth_element_size_min) if gear_tooth_element_size_min is not None else default_tooth_size
+    tooth_size_max = float(gear_tooth_element_size_max) if gear_tooth_element_size_max is not None else tooth_size_min
+    tooth_min_size_min = float(gear_tooth_min_element_size_min) if gear_tooth_min_element_size_min is not None else default_tooth_min_size
+    tooth_min_size_max = float(gear_tooth_min_element_size_max) if gear_tooth_min_element_size_max is not None else tooth_min_size_min
+    if tooth_size_min <= 0 or tooth_size_max <= 0 or tooth_size_min > tooth_size_max:
+        raise ValueError("gear_tooth_element_size_min/max must be positive and min <= max.")
+    if tooth_min_size_min <= 0 or tooth_min_size_max <= 0 or tooth_min_size_min > tooth_min_size_max:
+        raise ValueError("gear_tooth_min_element_size_min/max must be positive and min <= max.")
+    requested_tooth_size = float(gear_tooth_element_size) if gear_tooth_element_size is not None else tooth_size_max
+    requested_tooth_min_size = float(gear_tooth_min_element_size) if gear_tooth_min_element_size is not None else tooth_min_size_max
+    if requested_tooth_size <= 0:
+        raise ValueError("gear_tooth_element_size must be > 0.")
+    if requested_tooth_min_size <= 0:
+        raise ValueError("gear_tooth_min_element_size must be > 0.")
+    tooth_clamped_size = max(tooth_size_min, min(requested_tooth_size, tooth_size_max))
+    tooth_clamped_min = max(tooth_min_size_min, min(requested_tooth_min_size, tooth_min_size_max))
+    tooth_feature_angle = float(gear_tooth_feature_angle) if gear_tooth_feature_angle is not None else float(feature_angle) * GEAR_TOOTH_DEFAULT_SIZE_SCALE
+    if tooth_feature_angle <= 0:
+        raise ValueError("gear_tooth_feature_angle must be > 0.")
+    gear_tooth_tcl_list = " ".join(str(value) for value in safe_gear_tooth_ids)
     lines = [
         "# HyperMesh MCP generated tetra script: surface deviation R-trias -> smooth-pyramid tetra",
         f"# MCP_RECOMMENDED_TIMEOUT_SECONDS={_estimate_tetra_timeout_seconds(surf_count=max_shell_elements_before_tetmesh, min_element_size=clamped_min, batch_size=1)}",
@@ -2606,6 +2779,15 @@ def generate_plain_tetra_tcl(
         f"set elem_size_max {float(element_size_max)}",
         f"set min_size_min {float(min_element_size_min)}",
         f"set min_size_max {float(min_element_size_max)}",
+        f"set use_gear_tooth_refinement {1 if use_gear_tooth_refinement and safe_gear_tooth_ids else 0}",
+        f"set gear_tooth_surfs_requested {{{gear_tooth_tcl_list}}}",
+        f"set gear_tooth_elem_size {tooth_clamped_size}",
+        f"set gear_tooth_elem_size_min {tooth_size_min}",
+        f"set gear_tooth_elem_size_max {tooth_size_max}",
+        f"set gear_tooth_min_size {tooth_clamped_min}",
+        f"set gear_tooth_min_size_min {tooth_min_size_min}",
+        f"set gear_tooth_min_size_max {tooth_min_size_max}",
+        f"set gear_tooth_feat_angle {tooth_feature_angle}",
         f"set max_dev {float(max_deviation)}",
         f"set feat_angle {float(feature_angle)}",
         f"set growth {float(growth_rate)}",
@@ -2947,7 +3129,10 @@ def generate_plain_tetra_tcl(
         'set complexity_min [expr {$min_size_max - min($min_size_span, max(0.0, ($surf_count - 20) / 100.0 * $min_size_span))}]',
         'set dim_min [expr {max($min_size_min, min($min_size_max, $min_dim/8.0))}]',
         'set base_min_size [expr {max($min_size_min, min($min_size_max, min($requested_min_size, min($complexity_min, $dim_min))))}]',
-        'puts "MCP_PT_START solid=$target_solid surf_count=$surf_count elem_size=$elem_size min_size=$base_min_size max_dev=$max_dev fit_tol_ratio=$fit_tol_ratio target_vol_skew=$target_vol_skew"',
+        'set gear_tooth_surfs [mcp_list_intersect $gear_tooth_surfs_requested $all_surfs]',
+        'if {!$use_gear_tooth_refinement} {set gear_tooth_surfs {}}',
+        'set gear_tooth_surface_count [llength $gear_tooth_surfs]',
+        'puts "MCP_PT_START solid=$target_solid surf_count=$surf_count elem_size=$elem_size min_size=$base_min_size max_dev=$max_dev fit_tol_ratio=$fit_tol_ratio target_vol_skew=$target_vol_skew gear_tooth_refinement=$use_gear_tooth_refinement gear_tooth_surfaces=$gear_tooth_surface_count gear_tooth_elem_size=$gear_tooth_elem_size gear_tooth_min_size=$gear_tooth_min_size gear_tooth_feat_angle=$gear_tooth_feat_angle"',
         'puts "MCP_CONSOLE solid=$target_solid stage=2d_start surf_count=$surf_count elem_size=$elem_size min_size=$base_min_size"',
         'if {!$allow_surface_mesh} {',
         '    puts "MCP_PT_STOP solid=$target_solid surface_mesh_disabled_for_high_risk_geometry before_surface_mesh"',
@@ -2968,6 +3153,10 @@ def generate_plain_tetra_tcl(
         '    set last_param_key $param_key',
         '    *createmark surfaces 1 "by solids" $target_solid',
         '    set all_surfs [hm_getmark surfaces 1]',
+        '    set gear_tooth_surfs [mcp_list_intersect $gear_tooth_surfs_requested $all_surfs]',
+        '    if {!$use_gear_tooth_refinement} {set gear_tooth_surfs {}}',
+        '    set body_surfs $all_surfs',
+        '    if {[llength $gear_tooth_surfs] > 0} {set body_surfs [mcp_list_subtract $all_surfs $gear_tooth_surfs]}',
         '    *createmark elems 1 "by surface" $all_surfs',
         '    set stale_shells [hm_getmark elems 1]',
         '    if {[llength $stale_shells] > 0} {',
@@ -2975,16 +3164,41 @@ def generate_plain_tetra_tcl(
         '        mcp_delete_elems $stale_shells',
         '    }',
         '    set before_surface_elems [mcp_all_elems]',
-        '    puts "MCP_PT_SURFACE_ATTEMPT solid=$target_solid attempt=$at size=$cs min=$mn_size max=$max_size growth=$effective_growth max_to_min_ratio=$surface_max_to_min_ratio"',
-        '    *createarray 3 0 0 0',
-        '    if {[catch {*defaultmeshsurf_growth 1 $cs 3 3 2 1 1 1 35 0 $mn_size $max_size $max_dev $feat_angle $effective_growth 1 3 1 0} surf_err]} {',
-        '        puts "MCP_PT_WARN solid=$target_solid surface_mesh_failed=$surf_err attempt=$at"',
+        '    set tooth_cs [expr {max($gear_tooth_elem_size_min, min($gear_tooth_elem_size_max, $gear_tooth_elem_size * pow(0.90, $at)))}]',
+        '    set tooth_mn_size [expr {max($gear_tooth_min_size_min, min($gear_tooth_min_size_max, $gear_tooth_min_size * pow(0.80, $at)))}]',
+        '    set tooth_max_size [expr {max($tooth_cs * 1.35, $tooth_mn_size + 0.05)}]',
+        '    set tooth_max_size [expr {min($tooth_max_size, max($tooth_mn_size + 0.05, $tooth_mn_size * $surface_max_to_min_ratio))}]',
+        '    set tooth_max_size [expr {max($tooth_max_size, $tooth_cs)}]',
+        '    puts "MCP_PT_SURFACE_ATTEMPT solid=$target_solid attempt=$at size=$cs min=$mn_size max=$max_size growth=$effective_growth max_to_min_ratio=$surface_max_to_min_ratio gear_tooth_surfaces=[llength $gear_tooth_surfs] gear_size=$tooth_cs gear_min=$tooth_mn_size gear_max=$tooth_max_size gear_feat_angle=$gear_tooth_feat_angle"',
+        '    set surface_mesh_failed 0',
+        '    set surface_mesh_error ""',
+        '    if {[llength $body_surfs] > 0} {',
+        '        eval *createmark surfaces 1 $body_surfs',
+        '        *createarray 3 0 0 0',
+        '        if {[catch {*defaultmeshsurf_growth 1 $cs 3 3 2 1 1 1 35 0 $mn_size $max_size $max_dev $feat_angle $effective_growth 1 3 1 0} surf_err]} {',
+        '            set surface_mesh_failed 1',
+        '            set surface_mesh_error $surf_err',
+        '        } else {',
+        '            catch {*storemeshtodatabase 1}',
+        '        }',
+        '    }',
+        '    if {!$surface_mesh_failed && [llength $gear_tooth_surfs] > 0} {',
+        '        eval *createmark surfaces 1 $gear_tooth_surfs',
+        '        *createarray 3 0 0 0',
+        '        if {[catch {*defaultmeshsurf_growth 1 $tooth_cs 3 3 2 1 1 1 35 0 $tooth_mn_size $tooth_max_size $max_dev $gear_tooth_feat_angle $effective_growth 1 3 1 0} tooth_err]} {',
+        '            set surface_mesh_failed 1',
+        '            set surface_mesh_error $tooth_err',
+        '        } else {',
+        '            catch {*storemeshtodatabase 1}',
+        '        }',
+        '    }',
+        '    if {$surface_mesh_failed} {',
+        '        puts "MCP_PT_WARN solid=$target_solid surface_mesh_failed=$surface_mesh_error attempt=$at"',
         '        *createmark elems 1 "by surface" $all_surfs',
         '        set failed_shells [hm_getmark elems 1]',
         '        mcp_delete_elems $failed_shells',
         '        continue',
         '    }',
-        '    *storemeshtodatabase 1',
         '    set shell_ids [mcp_list_subtract [mcp_all_elems] $before_surface_elems]',
         '    if {[llength $shell_ids] == 0} {',
         '        *createmark elems 1 "by surface" $all_surfs',
@@ -3363,6 +3577,14 @@ def generate_batched_plain_tetra_tcl(
     min_element_size_min: float = 0.20,
     min_element_size_max: float = 0.50,
     delete_existing_component_elements: bool = True,
+    use_gear_tooth_refinement: bool = True,
+    gear_tooth_element_size: float | None = None,
+    gear_tooth_element_size_min: float | None = None,
+    gear_tooth_element_size_max: float | None = None,
+    gear_tooth_min_element_size: float | None = None,
+    gear_tooth_min_element_size_min: float | None = None,
+    gear_tooth_min_element_size_max: float | None = None,
+    gear_tooth_feature_angle: float | None = None,
 ) -> dict[str, Any]:
     """Generate one compact Tcl script for a small batch of plain tetra solids."""
     if not solids:
@@ -3402,6 +3624,7 @@ def generate_batched_plain_tetra_tcl(
         allow_tet = bool(item.get("allow_tetmesh", True))
         allow_surf = bool(item.get("allow_surface_mesh", True))
         surf_count = int(item.get("surf_count", 0) or 0)
+        gear_tooth_ids = item.get("gear_tooth_surface_ids", []) or []
         dims = item.get("dims", {}) if isinstance(item.get("dims", {}), dict) else {}
         diagonal = float((float(dims.get("dx", 0)) ** 2 + float(dims.get("dy", 0)) ** 2 + float(dims.get("dz", 0)) ** 2) ** 0.5)
         recommended_timeout = _estimate_tetra_timeout_seconds(
@@ -3437,6 +3660,15 @@ def generate_batched_plain_tetra_tcl(
             min_element_size_min=min_element_size_min,
             min_element_size_max=min_element_size_max,
             delete_existing_component_elements=delete_existing_component_elements,
+            use_gear_tooth_refinement=use_gear_tooth_refinement and str(item.get("strategy", "")) == "gear_aware_tetra",
+            gear_tooth_surface_ids=gear_tooth_ids,
+            gear_tooth_element_size=gear_tooth_element_size,
+            gear_tooth_element_size_min=gear_tooth_element_size_min,
+            gear_tooth_element_size_max=gear_tooth_element_size_max,
+            gear_tooth_min_element_size=gear_tooth_min_element_size,
+            gear_tooth_min_element_size_min=gear_tooth_min_element_size_min,
+            gear_tooth_min_element_size_max=gear_tooth_min_element_size_max,
+            gear_tooth_feature_angle=gear_tooth_feature_angle,
         )
         one_lines = _unwrap_generated_tcl(script_obj["script"]).splitlines()
         proc_start = next((i for i, line in enumerate(one_lines) if line.startswith("proc mcp_all_elems")), None)
@@ -3481,6 +3713,231 @@ def generate_batched_plain_tetra_tcl(
             "Execute this script with execute_tcl_gui using at least "
             f"{max_timeout} seconds timeout. Keep high-risk solids in separate batches."
         ),
+    }
+
+
+def _classification_results_dict(classification_results: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    if classification_results is None:
+        return dict(_GLOBAL_CLASSIFICATION_RESULTS)
+    if isinstance(classification_results, dict) and isinstance(classification_results.get("results"), dict):
+        return classification_results["results"]
+    if isinstance(classification_results, dict):
+        return classification_results
+    return {}
+
+
+@mcp.tool()
+def write_gear_tooth_recognition_report(
+    classification_results: dict[str, Any] | None = None,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Write a compact gear/tooth recognition report for debugging missed or false detections."""
+    results = _classification_results_dict(classification_results)
+    if output_path:
+        path = Path(output_path)
+    else:
+        RUNS_DIR.mkdir(exist_ok=True)
+        path = RUNS_DIR / f"gear_tooth_recognition_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    lines: list[str] = [
+        "Gear/tooth recognition diagnostics",
+        f"time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"solid_count: {len(results)}",
+        "",
+    ]
+    for key, item in sorted(results.items(), key=lambda pair: int(pair[0]) if str(pair[0]).isdigit() else str(pair[0])):
+        sid = item.get("solid_id", key)
+        strategy = item.get("strategy", "")
+        dims = item.get("dims", {}) if isinstance(item.get("dims"), dict) else {}
+        probe_tooth_ids = item.get("gear_probe_tooth_surface_ids", item.get("gear_tooth_surface_ids", [])) or []
+        final_tooth_ids = item.get("gear_tooth_surface_ids", []) or []
+        evidence = item.get("evidence", []) or []
+        lines.append(f"solid={sid} component={item.get('component_name', '')} strategy={strategy}")
+        lines.append(
+            "  geometry: "
+            f"surf_count={item.get('surf_count', '')} "
+            f"dx={dims.get('dx', '')} dy={dims.get('dy', '')} dz={dims.get('dz', '')} "
+            f"mn={dims.get('mn', '')} md={dims.get('md', '')} mx={dims.get('mx', '')}"
+        )
+        lines.append(
+            "  source: "
+            f"surface={item.get('source_surface_id', '')} "
+            f"loops={item.get('source_loop_count', '')} "
+            f"inner_loops={item.get('source_inner_loop_count', '')} "
+            f"boundary_edges={item.get('source_boundary_edge_count', '')} "
+            f"boundary_nodes={item.get('source_boundary_node_count', '')}"
+        )
+        lines.append(
+            "  gear: "
+            f"enabled={item.get('gear_detection_enabled', True)} "
+            f"axis={item.get('gear_axis', '')} "
+            f"reason={item.get('gear_probe_reason', '') or ('accepted' if strategy == 'gear_aware_tetra' else 'not_gear')}"
+        )
+        lines.append(
+            "  tooth_probe: "
+            f"count={item.get('gear_probe_tooth_surface_count', len(probe_tooth_ids))} "
+            f"ids={','.join(str(value) for value in probe_tooth_ids) if probe_tooth_ids else ''}"
+        )
+        lines.append(
+            "  tooth_final: "
+            f"count={item.get('gear_tooth_surface_count', len(final_tooth_ids))} "
+            f"ids={','.join(str(value) for value in final_tooth_ids) if final_tooth_ids else ''}"
+        )
+        if evidence:
+            lines.append("  evidence: " + " | ".join(str(value) for value in evidence))
+        raw_probe_line = item.get("raw_probe_line", "")
+        if raw_probe_line:
+            lines.append("  raw_probe: " + str(raw_probe_line))
+        lines.append("")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return {
+        "success": True,
+        "output_path": str(path),
+        "solid_count": len(results),
+        "gear_count": sum(1 for item in results.values() if item.get("strategy") == "gear_aware_tetra"),
+    }
+
+
+@mcp.tool()
+def generate_gear_tooth_preview_tcl(
+    classification_results: dict[str, Any] | None = None,
+    element_size: float = 1.05,
+    min_element_size: float = 0.35,
+    max_deviation: float = 0.05,
+    feature_angle: float = 10.5,
+    growth_rate: float = 1.2,
+    component_name: str = GEAR_TOOTH_PREVIEW_COMPONENT,
+    delete_existing_preview: bool = True,
+) -> dict[str, Any]:
+    """Generate Tcl that meshes only recognized gear tooth surfaces into a temporary preview component."""
+    if element_size <= 0:
+        raise ValueError("element_size must be > 0.")
+    if min_element_size <= 0:
+        raise ValueError("min_element_size must be > 0.")
+    if feature_angle <= 0:
+        raise ValueError("feature_angle must be > 0.")
+    results = _classification_results_dict(classification_results)
+    gear_items = [
+        item for item in results.values()
+        if item.get("strategy") == "gear_aware_tetra" and item.get("gear_tooth_surface_ids")
+    ]
+    preview_comp = _tcl_escape_name(component_name or GEAR_TOOTH_PREVIEW_COMPONENT)
+    lines = [
+        "# HyperMesh MCP generated gear tooth preview script",
+        f"set preview_component {{{preview_comp}}}",
+        f"set preview_element_size {float(element_size)}",
+        f"set preview_min_size {float(min_element_size)}",
+        f"set preview_max_size {max(float(element_size) * 1.35, float(min_element_size) + 0.05)}",
+        f"set preview_max_dev {float(max_deviation)}",
+        f"set preview_feat_angle {float(feature_angle)}",
+        f"set preview_growth {float(growth_rate)}",
+        "proc mcp_all_elems {} {",
+        '    *createmark elems 1 "all"',
+        "    return [hm_getmark elems 1]",
+        "}",
+        "proc mcp_list_subtract {a b} {",
+        "    array set seen {}",
+        "    foreach x $b {set seen($x) 1}",
+        "    set out {}",
+        "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
+        "    return $out",
+        "}",
+        "proc mcp_delete_elems {ids} {",
+        "    if {[llength $ids] == 0} {return}",
+        "    eval *createmark elems 1 $ids",
+        "    catch {*deletemark elems 1}",
+        "    eval *createmark elements 1 $ids",
+        "    catch {*deletemark elements 1}",
+        "}",
+        "proc mcp_ensure_component {comp color} {",
+        "    if {[catch {hm_entityinfo exist comps $comp -byname} exists]} {set exists 0}",
+        "    if {!$exists} {catch {*createentity comps name=$comp color=$color}}",
+        "}",
+        "mcp_ensure_component $preview_component 13",
+        "if {" + ("1" if delete_existing_preview else "0") + "} {",
+        '    *createmark elems 1 "by comp" "$preview_component"',
+        "    set old_preview [hm_getmark elems 1]",
+        "    if {[llength $old_preview] > 0} {mcp_delete_elems $old_preview}",
+        "    puts \"MCP_GEAR_TOOTH_PREVIEW_CLEANUP removed=[llength $old_preview] component=$preview_component\"",
+        "}",
+        "*currentcollector components \"$preview_component\"",
+        'puts "MCP_GEAR_TOOTH_PREVIEW_BEGIN gear_count=' + str(len(gear_items)) + '"',
+    ]
+    total_surfaces = 0
+    for item in sorted(gear_items, key=lambda value: int(value.get("solid_id", 0) or 0)):
+        sid = int(item.get("solid_id", 0) or 0)
+        surf_ids = []
+        for value in item.get("gear_tooth_surface_ids", []) or []:
+            try:
+                surf_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if surf_id > 0:
+                surf_ids.append(surf_id)
+        if not surf_ids:
+            continue
+        total_surfaces += len(surf_ids)
+        surf_text = " ".join(str(value) for value in surf_ids)
+        lines.extend([
+            f"set preview_surfs {{{surf_text}}}",
+            "set before_preview [mcp_all_elems]",
+            "eval *createmark surfaces 1 $preview_surfs",
+            "*createarray 3 0 0 0",
+            "if {[catch {*defaultmeshsurf_growth 1 $preview_element_size 3 3 2 1 1 1 35 0 $preview_min_size $preview_max_size $preview_max_dev $preview_feat_angle $preview_growth 1 3 1 0} preview_err]} {",
+            f"    puts \"MCP_GEAR_TOOTH_PREVIEW_WARN solid={sid} mesh_failed=$preview_err surfaces=[llength $preview_surfs]\"",
+            "} else {",
+            "    catch {*storemeshtodatabase 1}",
+            "}",
+            "set after_preview [mcp_all_elems]",
+            "set new_preview [mcp_list_subtract $after_preview $before_preview]",
+            "if {[llength $new_preview] > 0} {eval *createmark elems 1 $new_preview; catch {*movemark elems 1 \"$preview_component\"}}",
+            f"puts \"MCP_GEAR_TOOTH_PREVIEW solid={sid} component={item.get('component_name', '')} surfaces=[llength $preview_surfs] elems=[llength $new_preview]\"",
+        ])
+    lines.append(f'puts "MCP_GEAR_TOOTH_PREVIEW_DONE gear_count={len(gear_items)} surface_count={total_surfaces} component=$preview_component"')
+    return {
+        "success": True,
+        "script": _wrap_generated_tcl("generate_gear_tooth_preview_tcl", "\n".join(lines)),
+        "gear_count": len(gear_items),
+        "surface_count": total_surfaces,
+        "component_name": component_name,
+    }
+
+
+@mcp.tool()
+def generate_delete_gear_tooth_preview_tcl(
+    component_name: str = GEAR_TOOTH_PREVIEW_COMPONENT,
+) -> dict[str, Any]:
+    """Generate Tcl that deletes only the temporary gear-tooth preview mesh component."""
+    preview_comp = _tcl_escape_name(component_name or GEAR_TOOTH_PREVIEW_COMPONENT)
+    lines = [
+        "# HyperMesh MCP generated gear tooth preview cleanup script",
+        f"set preview_component {{{preview_comp}}}",
+        "proc mcp_delete_elems {ids} {",
+        "    if {[llength $ids] == 0} {return}",
+        "    eval *createmark elems 1 $ids",
+        "    catch {*deletemark elems 1}",
+        "    eval *createmark elements 1 $ids",
+        "    catch {*deletemark elements 1}",
+        "}",
+        'if {[catch {hm_entityinfo exist comps $preview_component -byname} exists] || !$exists} {',
+        '    puts "MCP_GEAR_TOOTH_PREVIEW_DELETE_DONE component=$preview_component removed=0 exists=0"',
+        "} else {",
+        '    *createmark elems 1 "by comp" "$preview_component"',
+        "    set preview_ids [hm_getmark elems 1]",
+        "    set removed [llength $preview_ids]",
+        "    if {$removed > 0} {mcp_delete_elems $preview_ids}",
+        '    *createmark elems 1 "by comp" "$preview_component"',
+        "    if {[hm_marklength elems 1] == 0} {",
+        '        *createmark components 1 "$preview_component"',
+        "        catch {*deletemark components 1}",
+        "    }",
+        '    puts "MCP_GEAR_TOOTH_PREVIEW_DELETE_DONE component=$preview_component removed=$removed exists=1"',
+        "}",
+    ]
+    return {
+        "success": True,
+        "script": _wrap_generated_tcl("generate_delete_gear_tooth_preview_tcl", "\n".join(lines)),
+        "component_name": component_name,
     }
 
 
@@ -5016,6 +5473,14 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
             ("tetra_fit_tolerance_ratio", "tetra 贴合容差比例"),
             ("tetra_target_vol_skew", "tetra 生成目标 vol skew"),
             ("tetra_repair_vol_skew", "tetra 修复后 vol skew 上限"),
+            ("use_gear_tooth_refinement", "启用齿面加厚/加密模型"),
+            ("gear_tooth_element_size", "齿面 tetra 目标尺寸"),
+            ("gear_tooth_element_size_min", "齿面 tetra 目标尺寸下限"),
+            ("gear_tooth_element_size_max", "齿面 tetra 目标尺寸上限"),
+            ("gear_tooth_min_element_size", "齿面 tetra 最小尺寸"),
+            ("gear_tooth_min_element_size_min", "齿面 tetra 最小尺寸下限"),
+            ("gear_tooth_min_element_size_max", "齿面 tetra 最小尺寸上限"),
+            ("gear_tooth_feature_angle", "齿面特征角"),
         )
         for key, label in parameter_labels:
             if key in parameters:
@@ -5115,6 +5580,15 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                         f"axis={item.get('gear_axis', '未记录')}, "
                         f"surface_count={item.get('gear_tooth_surface_count', 0)}, "
                         f"surface_ids={tooth_text}"
+                    )
+                    lines.append(
+                        "  - gear 齿面加密参数："
+                        f"enabled={item.get('use_gear_tooth_refinement', '未记录')}, "
+                        f"target={item.get('gear_tooth_element_size', '未记录')}, "
+                        f"target_limit={item.get('gear_tooth_element_size_min', '未记录')}..{item.get('gear_tooth_element_size_max', '未记录')}, "
+                        f"min={item.get('gear_tooth_min_element_size', '未记录')}, "
+                        f"min_limit={item.get('gear_tooth_min_element_size_min', '未记录')}..{item.get('gear_tooth_min_element_size_max', '未记录')}, "
+                        f"feature_angle={item.get('gear_tooth_feature_angle', '未记录')}"
                     )
         lines.append("")
 

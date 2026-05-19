@@ -32,6 +32,12 @@ namespace eval ::hm_mcp_launcher {
     variable tetra_fit_tolerance_ratio 0.01
     variable tetra_target_vol_skew 0.70
     variable tetra_repair_vol_skew 0.99
+    variable use_gear_tooth_refinement 1
+    variable gear_tooth_element_size_min 1.05
+    variable gear_tooth_element_size_max 1.05
+    variable gear_tooth_min_element_size_min 0.35
+    variable gear_tooth_min_element_size_max 0.35
+    variable gear_tooth_feature_angle 10.5
     variable spin_section_element_size_min 0.20
     variable spin_section_element_size_max 1.50
     variable spin_density_min 12
@@ -223,6 +229,10 @@ proc ::hm_mcp_launcher::normalize_mesh_parameters {} {
     variable tetra_element_size_max
     variable tetra_min_element_size_min
     variable tetra_min_element_size_max
+    variable gear_tooth_element_size_min
+    variable gear_tooth_element_size_max
+    variable gear_tooth_min_element_size_min
+    variable gear_tooth_min_element_size_max
     variable spin_section_element_size_min
     variable spin_section_element_size_max
     variable spin_density_min
@@ -231,6 +241,8 @@ proc ::hm_mcp_launcher::normalize_mesh_parameters {} {
     normalize_pair drag_element_size_min drag_element_size_max 0.5 1.5
     normalize_pair tetra_element_size_min tetra_element_size_max 1.5 2.0
     normalize_pair tetra_min_element_size_min tetra_min_element_size_max 0.20 0.50
+    normalize_pair gear_tooth_element_size_min gear_tooth_element_size_max 1.05 1.05
+    normalize_pair gear_tooth_min_element_size_min gear_tooth_min_element_size_max 0.35 0.35
     normalize_pair spin_section_element_size_min spin_section_element_size_max 0.20 1.50
     normalize_pair spin_density_min spin_density_max 12 240
     set spin_density_min [expr {int(round($spin_density_min))}]
@@ -238,7 +250,7 @@ proc ::hm_mcp_launcher::normalize_mesh_parameters {} {
     append_log "尺寸限制：drag=$drag_element_size_min..$drag_element_size_max, tetra目标=$tetra_element_size_min..$tetra_element_size_max, tetra最小=$tetra_min_element_size_min..$tetra_min_element_size_max, spin截面=$spin_section_element_size_min..$spin_section_element_size_max, spin份数=$spin_density_min..$spin_density_max\n"
 }
 
-proc ::hm_mcp_launcher::build_command {} {
+proc ::hm_mcp_launcher::build_command {{mode full}} {
     variable project_dir
     variable python_exe
     variable host
@@ -260,6 +272,12 @@ proc ::hm_mcp_launcher::build_command {} {
     variable tetra_fit_tolerance_ratio
     variable tetra_target_vol_skew
     variable tetra_repair_vol_skew
+    variable use_gear_tooth_refinement
+    variable gear_tooth_element_size_min
+    variable gear_tooth_element_size_max
+    variable gear_tooth_min_element_size_min
+    variable gear_tooth_min_element_size_max
+    variable gear_tooth_feature_angle
     variable spin_section_element_size_min
     variable spin_section_element_size_max
     variable spin_density_min
@@ -304,7 +322,14 @@ proc ::hm_mcp_launcher::build_command {} {
         --tetra-growth-rate $tetra_growth_rate \
         --tetra-fit-tolerance-ratio $tetra_fit_tolerance_ratio \
         --tetra-target-vol-skew $tetra_target_vol_skew \
-        --tetra-repair-vol-skew $tetra_repair_vol_skew]
+        --tetra-repair-vol-skew $tetra_repair_vol_skew \
+        --gear-tooth-element-size $gear_tooth_element_size_max \
+        --gear-tooth-element-size-min $gear_tooth_element_size_min \
+        --gear-tooth-element-size-max $gear_tooth_element_size_max \
+        --gear-tooth-min-element-size $gear_tooth_min_element_size_max \
+        --gear-tooth-min-element-size-min $gear_tooth_min_element_size_min \
+        --gear-tooth-min-element-size-max $gear_tooth_min_element_size_max \
+        --gear-tooth-feature-angle $gear_tooth_feature_angle]
     if {$continue_on_error} {
         lappend cmd --continue-on-error
     } else {
@@ -312,6 +337,16 @@ proc ::hm_mcp_launcher::build_command {} {
     }
     if {$drag_aspect_guard} {
         lappend cmd --drag-aspect-guard
+    }
+    if {$use_gear_tooth_refinement} {
+        lappend cmd --use-gear-tooth-refinement
+    } else {
+        lappend cmd --no-gear-tooth-refinement
+    }
+    if {$mode eq "gear_preview"} {
+        lappend cmd --gear-tooth-preview-only
+    } elseif {$mode eq "delete_gear_preview"} {
+        lappend cmd --delete-gear-tooth-preview
     }
     return $cmd
 }
@@ -406,7 +441,7 @@ proc ::hm_mcp_launcher::poll_log {} {
     }
 }
 
-proc ::hm_mcp_launcher::start_workflow {} {
+proc ::hm_mcp_launcher::start_workflow {{mode full}} {
     variable project_dir
     variable auto_listener
     variable port
@@ -424,7 +459,13 @@ proc ::hm_mcp_launcher::start_workflow {} {
 
     ensure_directories
     set current_stamp [make_stamp]
-    set current_log [file normalize [file join $project_dir runs "panel_workflow_$current_stamp.log"]]
+    if {$mode eq "gear_preview"} {
+        set current_log [file normalize [file join $project_dir runs "panel_gear_tooth_preview_$current_stamp.log"]]
+    } elseif {$mode eq "delete_gear_preview"} {
+        set current_log [file normalize [file join $project_dir runs "panel_delete_gear_tooth_preview_$current_stamp.log"]]
+    } else {
+        set current_log [file normalize [file join $project_dir runs "panel_workflow_$current_stamp.log"]]
+    }
     set last_log_size 0
     set last_pid_check_ms 0
     replace_log ""
@@ -442,7 +483,7 @@ proc ::hm_mcp_launcher::start_workflow {} {
         append_log "连接成功：$listener_path\n当前端口：$port\n"
     }
 
-    set cmd [build_command]
+    set cmd [build_command $mode]
     set old_pwd [pwd]
     set_status "正在启动后台划分流程"
     append_log "正在启动后台划分流程...\n日志文件：$current_log\n\n"
@@ -611,6 +652,13 @@ proc ::hm_mcp_launcher::build_ui {} {
     add_row $w.root.main.right 5 "tetra 贴合比例" ::hm_mcp_launcher::tetra_fit_tolerance_ratio ""
     add_row $w.root.main.right 6 "目标 vol skew" ::hm_mcp_launcher::tetra_target_vol_skew ""
     add_row $w.root.main.right 7 "修复 vol skew" ::hm_mcp_launcher::tetra_repair_vol_skew ""
+    ttk::checkbutton $w.root.main.right.gearrefine -text "启用齿面加厚/加密模型" -variable ::hm_mcp_launcher::use_gear_tooth_refinement -style HMCheck.TCheckbutton
+    grid $w.root.main.right.gearrefine -row 9 -column 0 -columnspan 3 -sticky w -pady {7 0}
+    add_row $w.root.main.right 10 "齿面tetra下限" ::hm_mcp_launcher::gear_tooth_element_size_min "默认=上限，固定尺寸"
+    add_row $w.root.main.right 11 "齿面tetra上限" ::hm_mcp_launcher::gear_tooth_element_size_max "默认=下限，固定尺寸"
+    add_row $w.root.main.right 12 "齿面最小下限" ::hm_mcp_launcher::gear_tooth_min_element_size_min "默认=上限，固定最小尺寸"
+    add_row $w.root.main.right 13 "齿面最小上限" ::hm_mcp_launcher::gear_tooth_min_element_size_max "默认=下限，固定最小尺寸"
+    add_row $w.root.main.right 14 "齿面特征角" ::hm_mcp_launcher::gear_tooth_feature_angle "默认比普通tetra小30%"
 
     ttk::labelframe $w.root.logbox -text "运行日志" -padding 12 -style HMSection.TLabelframe
     grid $w.root.logbox -row 5 -column 0 -sticky nsew -pady {0 10}
@@ -639,10 +687,14 @@ proc ::hm_mcp_launcher::build_ui {} {
         }
     }
     ttk::button $w.root.actions.run -text "开始划分" -style HM.TButton -command ::hm_mcp_launcher::start_workflow
+    ttk::button $w.root.actions.gearpreview -text "只划分齿面网格" -style HM.TButton -command {::hm_mcp_launcher::start_workflow gear_preview}
+    ttk::button $w.root.actions.deletegearpreview -text "删除齿面网格" -style HM.TButton -command {::hm_mcp_launcher::start_workflow delete_gear_preview}
     ttk::button $w.root.actions.stop -text "停止当前流程" -style HMStop.TButton -command ::hm_mcp_launcher::stop_workflow
     grid $w.root.actions.connect -row 0 -column 0 -padx {0 12}
     grid $w.root.actions.run -row 0 -column 1 -padx 12
-    grid $w.root.actions.stop -row 0 -column 2 -padx 12
+    grid $w.root.actions.gearpreview -row 0 -column 2 -padx 12
+    grid $w.root.actions.deletegearpreview -row 0 -column 3 -padx 12
+    grid $w.root.actions.stop -row 0 -column 4 -padx 12
 }
 
 ::hm_mcp_launcher::build_ui

@@ -888,7 +888,7 @@ def _promote_spin_fallback_solids_to_tetra(
         target["allow_tetmesh"] = True
         target["allow_surface_mesh"] = True
         active_results[str(fallback_id)] = target
-        results[str(fallback_id)] = target
+        results[str(fallback_id)] = dict(target)
     return fallback_ids
 
 
@@ -1017,6 +1017,14 @@ def _build_part_parameter_report(
                 "gear_axis": info.get("gear_axis", ""),
                 "gear_tooth_surface_count": info.get("gear_tooth_surface_count", 0),
                 "gear_tooth_surface_ids": info.get("gear_tooth_surface_ids", []),
+                "use_gear_tooth_refinement": args.use_gear_tooth_refinement,
+                "gear_tooth_element_size": args.gear_tooth_element_size,
+                "gear_tooth_element_size_min": args.gear_tooth_element_size_min,
+                "gear_tooth_element_size_max": args.gear_tooth_element_size_max,
+                "gear_tooth_min_element_size": args.gear_tooth_min_element_size,
+                "gear_tooth_min_element_size_min": args.gear_tooth_min_element_size_min,
+                "gear_tooth_min_element_size_max": args.gear_tooth_min_element_size_max,
+                "gear_tooth_feature_angle": args.gear_tooth_feature_angle,
             }
         )
 
@@ -1290,6 +1298,28 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         output_hm_path=str(output_path),
         note="Realtime diagnostic log for locating HyperMesh crash, timeout, Tcl error, or workflow failure causes.",
     )
+    if args.delete_gear_tooth_preview:
+        _log("[preview] Delete gear-tooth preview mesh")
+        generated_delete = hm.generate_delete_gear_tooth_preview_tcl()
+        script_path = RUNS_DIR / f"workflow_delete_gear_tooth_preview_{stamp}.tcl"
+        script_path.write_text(generated_delete["script"], encoding="utf-8")
+        start = time.time()
+        response = hm.execute_tcl_gui(
+            generated_delete["script"],
+            host=args.host,
+            port=args.port,
+            timeout_seconds=args.phase2_timeout,
+            enforce_meshing_rules=False,
+        )
+        response["elapsed_seconds"] = round(time.time() - start, 2)
+        workflow["steps"]["delete_gear_tooth_preview"] = {
+            "script_path": str(script_path),
+            "response": response,
+        }
+        workflow["success"] = bool(response.get("success"))
+        _diag(diagnostic_log_path, "delete_gear_tooth_preview_done", script_path=str(script_path), **_response_diag(response))
+        _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_delete_gear_tooth_preview_response_{stamp}.json", response)
+        return workflow
 
     _log(f"[1/6] Probe current HyperMesh model: {stamp}")
     probe_path = RUNS_DIR / f"workflow_probe_{stamp}.txt"
@@ -1319,8 +1349,17 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
 
     _log("[2/6] Classify solids and execute Phase 2 finalization")
     _diag(diagnostic_log_path, "classification_start", probe_file=str(probe_path))
-    classification = hm.classify_all_solids_from_probe(probe.get("probe_lines", ""))
+    classification = hm.classify_all_solids_from_probe(
+        probe.get("probe_lines", ""),
+        use_gear_tooth_refinement=args.use_gear_tooth_refinement,
+    )
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_classification_{stamp}.json", classification)
+    gear_diag_path = RUNS_DIR / f"gear_tooth_recognition_{stamp}.txt"
+    gear_diag = hm.write_gear_tooth_recognition_report(
+        classification_results=classification,
+        output_path=str(gear_diag_path),
+    )
+    workflow["steps"]["gear_tooth_recognition"] = gear_diag
     workflow["steps"]["classification"] = {
         "success": classification.get("success"),
         "total_solids": classification.get("total_solids"),
@@ -1334,6 +1373,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "classification_done",
         total_solids=classification.get("total_solids"),
         strategy_counts=classification.get("strategy_counts"),
+        gear_tooth_recognition_path=str(gear_diag_path),
     )
 
     results = classification["results"]
@@ -1395,6 +1435,55 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     _diag(diagnostic_log_path, "phase2_done", **_response_diag(phase2))
     if not phase2.get("success"):
         raise RuntimeError("Phase 2 finalization failed. See workflow_phase2_response JSON.")
+
+    if args.gear_tooth_preview_only:
+        _log("[preview] Mesh only recognized gear tooth surfaces")
+        generated_preview = hm.generate_gear_tooth_preview_tcl(
+            classification_results=classification,
+            element_size=args.gear_tooth_element_size,
+            min_element_size=args.gear_tooth_min_element_size,
+            max_deviation=args.tetra_max_deviation,
+            feature_angle=args.gear_tooth_feature_angle,
+            growth_rate=args.tetra_growth_rate,
+            delete_existing_preview=True,
+        )
+        preview_script_path = RUNS_DIR / f"workflow_gear_tooth_preview_{stamp}.tcl"
+        preview_script_path.write_text(generated_preview["script"], encoding="utf-8")
+        start = time.time()
+        preview_response = hm.execute_tcl_gui(
+            generated_preview["script"],
+            host=args.host,
+            port=args.port,
+            timeout_seconds=args.tetra_timeout,
+            enforce_meshing_rules=False,
+        )
+        preview_response["elapsed_seconds"] = round(time.time() - start, 2)
+        preview_response_path = _write_json_if_enabled(
+            args.write_json,
+            RUNS_DIR / f"workflow_gear_tooth_preview_response_{stamp}.json",
+            preview_response,
+        )
+        workflow["steps"]["gear_tooth_preview"] = {
+            "success": preview_response.get("success"),
+            "script_path": str(preview_script_path),
+            "response_path": preview_response_path,
+            "gear_count": generated_preview.get("gear_count", 0),
+            "surface_count": generated_preview.get("surface_count", 0),
+            "component_name": generated_preview.get("component_name"),
+        }
+        workflow["success"] = bool(preview_response.get("success"))
+        _diag(
+            diagnostic_log_path,
+            "gear_tooth_preview_done",
+            script_path=str(preview_script_path),
+            gear_count=generated_preview.get("gear_count", 0),
+            surface_count=generated_preview.get("surface_count", 0),
+            **_response_diag(preview_response),
+        )
+        _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_summary_{stamp}.json", workflow)
+        _write_json_if_enabled(args.write_json, RUNS_DIR / "workflow_latest_summary.json", workflow)
+        _log(f"Gear/tooth recognition: {gear_diag_path}")
+        return workflow
 
     _log("[3/6] Run drag-hex solids")
     drag_solids = _build_drag_solids(active_results)
@@ -1546,14 +1635,14 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                     reason="spin failed or produced no 3D elements; split solids promoted to tetra",
                 )
         except Exception as exc:
-            spin_step["failed"].append({"solid_id": sid, "error": str(exc)})
             _diag(diagnostic_log_path, "spin_solid_exception", solid_id=sid, **_exception_diag(exc))
-            if str(sid) in active_results:
-                active_results[str(sid)]["strategy"] = "tetra_plain"
-                active_results[str(sid)].setdefault("evidence", []).append("spin exception -> tetra fallback")
-            if str(sid) in results:
-                results[str(sid)]["strategy"] = "tetra_plain"
-                results[str(sid)].setdefault("evidence", []).append("spin exception -> tetra fallback")
+            fallback_ids = _promote_spin_fallback_solids_to_tetra(
+                parsed={},
+                spin_solid=spin_solid,
+                active_results=active_results,
+                results=results,
+            )
+            spin_step["failed"].append({"solid_id": sid, "fallback_solid_ids": fallback_ids, "error": str(exc)})
     _write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_spin_hex_responses_{stamp}.json", spin_responses)
     spin_step["success"] = not spin_step["failed"]
     workflow["steps"]["spin_hex"] = spin_step
@@ -1591,6 +1680,14 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             min_element_size_min=args.tetra_min_element_size_min,
             min_element_size_max=args.tetra_min_element_size_max,
             delete_existing_component_elements=True,
+            use_gear_tooth_refinement=args.use_gear_tooth_refinement,
+            gear_tooth_element_size=args.gear_tooth_element_size,
+            gear_tooth_element_size_min=args.gear_tooth_element_size_min,
+            gear_tooth_element_size_max=args.gear_tooth_element_size_max,
+            gear_tooth_min_element_size=args.gear_tooth_min_element_size,
+            gear_tooth_min_element_size_min=args.gear_tooth_min_element_size_min,
+            gear_tooth_min_element_size_max=args.gear_tooth_min_element_size_max,
+            gear_tooth_feature_angle=args.gear_tooth_feature_angle,
         )
         script_path = RUNS_DIR / f"workflow_tetra_batch_{batch_index:02d}_{stamp}.tcl"
         log_path = RUNS_DIR / f"workflow_tetra_batch_{batch_index:02d}_{stamp}.log"
@@ -1909,6 +2006,14 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "tetra_fit_tolerance_ratio": args.tetra_fit_tolerance_ratio,
             "tetra_target_vol_skew": args.tetra_target_vol_skew,
             "tetra_repair_vol_skew": args.tetra_repair_vol_skew,
+            "use_gear_tooth_refinement": args.use_gear_tooth_refinement,
+            "gear_tooth_element_size": args.gear_tooth_element_size,
+            "gear_tooth_element_size_min": args.gear_tooth_element_size_min,
+            "gear_tooth_element_size_max": args.gear_tooth_element_size_max,
+            "gear_tooth_min_element_size": args.gear_tooth_min_element_size,
+            "gear_tooth_min_element_size_min": args.gear_tooth_min_element_size_min,
+            "gear_tooth_min_element_size_max": args.gear_tooth_min_element_size_max,
+            "gear_tooth_feature_angle": args.gear_tooth_feature_angle,
         },
         "part_parameters": part_parameters,
         "skipped_existing_mesh": workflow["steps"].get("existing_mesh_skip", {}),
@@ -1917,6 +2022,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "中文报告": str(report_path),
             "最终模型": str(output_path),
             "实时诊断日志": str(diagnostic_log_path),
+            "齿轮齿面识别诊断": str(gear_diag_path),
         },
     }
     report = hm.write_chinese_meshing_workflow_report(report_data, output_path=str(report_path))
@@ -2003,6 +2109,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tetra-target-vol-skew", type=float, default=0.70)
     parser.add_argument("--tetra-repair-vol-skew", type=float, default=0.99)
     parser.add_argument("--tetra-pause-seconds", type=float, default=1.0)
+    parser.add_argument("--use-gear-tooth-refinement", dest="use_gear_tooth_refinement", action="store_true", default=True)
+    parser.add_argument("--no-gear-tooth-refinement", dest="use_gear_tooth_refinement", action="store_false")
+    parser.add_argument("--gear-tooth-element-size", type=float, default=1.05)
+    parser.add_argument("--gear-tooth-element-size-min", type=float, default=1.05)
+    parser.add_argument("--gear-tooth-element-size-max", type=float, default=1.05)
+    parser.add_argument("--gear-tooth-min-element-size", type=float, default=0.35)
+    parser.add_argument("--gear-tooth-min-element-size-min", type=float, default=0.35)
+    parser.add_argument("--gear-tooth-min-element-size-max", type=float, default=0.35)
+    parser.add_argument("--gear-tooth-feature-angle", type=float, default=10.5)
+    parser.add_argument("--gear-tooth-preview-only", action="store_true", help="Run probe/classify/rename/color, then mesh only recognized gear-tooth surfaces.")
+    parser.add_argument("--delete-gear-tooth-preview", action="store_true", help="Delete the temporary gear-tooth preview mesh component.")
     parser.add_argument("--write-json", action="store_true", help="Write detailed JSON debug files into runs/.")
     return parser
 
@@ -2026,6 +2143,34 @@ def main(argv: list[str] | None = None) -> int:
         args.drag_min_layers = 1
     if args.drag_aspect_threshold <= 0:
         args.drag_aspect_threshold = 20.0
+    if args.gear_tooth_element_size_min <= 0:
+        args.gear_tooth_element_size_min = 1.05
+    if args.gear_tooth_element_size_max <= 0:
+        args.gear_tooth_element_size_max = args.gear_tooth_element_size_min
+    if args.gear_tooth_element_size_min > args.gear_tooth_element_size_max:
+        args.gear_tooth_element_size_min, args.gear_tooth_element_size_max = (
+            args.gear_tooth_element_size_max,
+            args.gear_tooth_element_size_min,
+        )
+    args.gear_tooth_element_size = min(
+        max(args.gear_tooth_element_size, args.gear_tooth_element_size_min),
+        args.gear_tooth_element_size_max,
+    )
+    if args.gear_tooth_min_element_size_min <= 0:
+        args.gear_tooth_min_element_size_min = 0.35
+    if args.gear_tooth_min_element_size_max <= 0:
+        args.gear_tooth_min_element_size_max = args.gear_tooth_min_element_size_min
+    if args.gear_tooth_min_element_size_min > args.gear_tooth_min_element_size_max:
+        args.gear_tooth_min_element_size_min, args.gear_tooth_min_element_size_max = (
+            args.gear_tooth_min_element_size_max,
+            args.gear_tooth_min_element_size_min,
+        )
+    args.gear_tooth_min_element_size = min(
+        max(args.gear_tooth_min_element_size, args.gear_tooth_min_element_size_min),
+        args.gear_tooth_min_element_size_max,
+    )
+    if args.gear_tooth_feature_angle <= 0:
+        args.gear_tooth_feature_angle = 10.5
     try:
         summary = run_workflow(args)
     except Exception as exc:

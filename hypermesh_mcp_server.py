@@ -2793,6 +2793,10 @@ def generate_plain_tetra_tcl(
         f"set growth {float(growth_rate)}",
         f"set max_shell_before_tetmesh {int(max_shell_elements_before_tetmesh)}",
         f"set crash_guard_shell_limit {int(TETRA_CRASH_GUARD_SHELL_ELEMENTS)}",
+        "set surface_repair_timeout_ms 300000",
+        "set conservative_repair_shell_limit 80000",
+        "set conservative_repair_bad_aspect_limit 500",
+        "set ultra_conservative_repair_bad_aspect_limit 2000",
         f"set allow_tetmesh {1 if allow_tetmesh else 0}",
         f"set allow_surface_mesh {1 if allow_surface_mesh else 0}",
         f"set fit_tol_ratio {float(fit_tolerance_ratio)}",
@@ -3251,6 +3255,23 @@ def generate_plain_tetra_tcl(
         '    set initial_aspect_bad_count [llength $bad_aspect_ids]',
         '    set repair_at 0',
         '    set repair_path_label "standard"',
+        '    set repair_start_ms [clock milliseconds]',
+        '    set repair_timed_out 0',
+        '    set conservative_2d_repair 0',
+        '    set ultra_conservative_2d_repair 0',
+        '    set bad_aspect_count_now [llength $bad_aspect_ids]',
+        '    if {$shell_count > $crash_guard_shell_limit || $bad_aspect_count_now > $ultra_conservative_repair_bad_aspect_limit} {',
+        '        set ultra_conservative_2d_repair 1',
+        '        set conservative_2d_repair 1',
+        '        set repair_at 3',
+        '        set repair_path_label "ultra_conservative_suspected_overlap_replace_only"',
+        '        puts "MCP_PT_WARN solid=$target_solid suspected_overlap_or_broken_surface mode=ultra_conservative shell_count=$shell_count bad_aspect=$bad_aspect_count_now extreme_aspect=$fatal_aspect_count skip_triangle_cleanup=1 skip_smooth=1 skip_local_remesh=1 timeout_ms=$surface_repair_timeout_ms"',
+        '    } elseif {$shell_count > $conservative_repair_shell_limit || $bad_aspect_count_now > $conservative_repair_bad_aspect_limit || $fatal_aspect_count > 0} {',
+        '        set conservative_2d_repair 1',
+        '        set repair_at 2',
+        '        set repair_path_label "conservative_suspected_overlap_local_remesh_first"',
+        '        puts "MCP_PT_WARN solid=$target_solid suspected_overlap_or_broken_surface mode=conservative shell_count=$shell_count bad_aspect=$bad_aspect_count_now extreme_aspect=$fatal_aspect_count skip_triangle_cleanup=1 skip_smooth=1 timeout_ms=$surface_repair_timeout_ms"',
+        '    }',
         '    set sliver_fast_count 0',
         '    if {[llength $bad_aspect_ids] > 0} {',
         '        set sliver_min_edge_limit [expr {max(0.0001, $mn_size * 0.50)}]',
@@ -3262,6 +3283,15 @@ def generate_plain_tetra_tcl(
         '        }',
         '    }',
         '    while {[llength $bad_aspect_ids] > 0 && $repair_at < 4} {',
+        '        set repair_elapsed_ms [expr {[clock milliseconds] - $repair_start_ms}]',
+        '        if {$repair_elapsed_ms > $surface_repair_timeout_ms} {',
+        '            set repair_timed_out 1',
+        '            set repair_path_label "${repair_path_label}_timeout"',
+        '            puts "MCP_PT_STOP solid=$target_solid surface_repair_timeout elapsed_ms=$repair_elapsed_ms timeout_ms=$surface_repair_timeout_ms shell_count=$shell_count remaining_aspect=[llength $bad_aspect_ids] keep_repaired_surface_mesh=1"',
+        '            break',
+        '        }',
+        '        if {$ultra_conservative_2d_repair && $repair_at < 3} {set repair_at 3}',
+        '        if {$conservative_2d_repair && !$ultra_conservative_2d_repair && $repair_at < 2} {set repair_at 2}',
         '        eval *createmark elems 1 $bad_aspect_ids',
         '        set before_repair_count [llength $bad_aspect_ids]',
         '        if {$repair_at == 0} {',
@@ -3297,9 +3327,24 @@ def generate_plain_tetra_tcl(
         '            set repair_path_label "smart_replace_after_local_remesh"',
         '            set next_repair_at 3',
         '        }',
+        '        set repair_elapsed_ms [expr {[clock milliseconds] - $repair_start_ms}]',
+        '        if {$repair_elapsed_ms > $surface_repair_timeout_ms && $next_repair_at < 4} {',
+        '            set repair_timed_out 1',
+        '            set repair_path_label "${repair_path_label}_timeout"',
+        '            puts "MCP_PT_STOP solid=$target_solid surface_repair_timeout elapsed_ms=$repair_elapsed_ms timeout_ms=$surface_repair_timeout_ms shell_count=$shell_count remaining_aspect=$after_repair_count keep_repaired_surface_mesh=1"',
+        '            break',
+        '        }',
         '        set repair_at $next_repair_at',
         '    }',
-        '    if {[llength $bad_aspect_ids] > 0} {',
+        '    if {!$repair_timed_out && [llength $bad_aspect_ids] > 0} {',
+        '        set repair_elapsed_ms [expr {[clock milliseconds] - $repair_start_ms}]',
+        '        if {$repair_elapsed_ms > $surface_repair_timeout_ms} {',
+        '            set repair_timed_out 1',
+        '            set repair_path_label "${repair_path_label}_timeout"',
+        '            puts "MCP_PT_STOP solid=$target_solid surface_repair_timeout elapsed_ms=$repair_elapsed_ms timeout_ms=$surface_repair_timeout_ms shell_count=$shell_count remaining_aspect=[llength $bad_aspect_ids] keep_repaired_surface_mesh=1"',
+        '        }',
+        '    }',
+        '    if {!$repair_timed_out && [llength $bad_aspect_ids] > 0} {',
         '        eval *createmark elems 1 $bad_aspect_ids',
         '        set before_repair_count [llength $bad_aspect_ids]',
         '        puts "MCP_PT_INFO solid=$target_solid aspect_repair=replace_nodes_extra count=[llength $bad_aspect_ids]"',
@@ -3349,7 +3394,7 @@ def generate_plain_tetra_tcl(
         '        }',
         '        puts "MCP_PT_WARN solid=$target_solid surface_fit_degraded_after_repair before=$pre_repair_fit_max_diff after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio limit=$repair_fit_degrade_ratio chord_before=$pre_repair_chord_dev_count chord_after=$post_repair_chord_dev_count chord_threshold=$surface_chord_dev_threshold attempt=$at action=final_no_replace_repair"',
         '        set fit_retry_bad_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold] [mcp_bad_shell_aspect_ids $shell_ids $fatal_surface_aspect_threshold]]',
-        '        if {[llength $fit_retry_bad_ids] > 0} {',
+        '        if {[llength $fit_retry_bad_ids] > 0 && !$conservative_2d_repair && !$repair_timed_out} {',
         '            eval *createmark elems 1 $fit_retry_bad_ids',
         '            set before_repair_count [llength $fit_retry_bad_ids]',
         '            puts "MCP_PT_INFO solid=$target_solid aspect_repair=fit_degrade_final_no_replace count=$before_repair_count"',
@@ -3360,6 +3405,8 @@ def generate_plain_tetra_tcl(
         '            set fit_retry_after_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold] $fatal_aspect_ids]',
         '            puts "MCP_PT_INFO solid=$target_solid aspect_repair_after before=$before_repair_count after=[llength $fit_retry_after_ids] threshold=$surface_aspect_threshold"',
         '            set repair_path_label "${repair_path_label}_fit_no_replace"',
+        '        } elseif {[llength $fit_retry_bad_ids] > 0} {',
+        '            puts "MCP_PT_WARN solid=$target_solid aspect_repair=fit_degrade_final_no_replace_skipped reason=conservative_or_timeout count=[llength $fit_retry_bad_ids] conservative=$conservative_2d_repair timeout=$repair_timed_out"',
         '        }',
         '        set shell_ids [mcp_shells_on_surfaces $all_surfs]',
         '        set shell_count [llength $shell_ids]',
@@ -3401,6 +3448,13 @@ def generate_plain_tetra_tcl(
         '    puts "MCP_CONSOLE solid=$target_solid stage=2d_result initial_bad=$initial_aspect_bad_count final_bad=$unfixed_aspect_report repair_path=$repair_path_label shell_count=$shell_count"',
         '    if {$unfixed_aspect_report > 0} {',
         '        puts "MCP_PT_WARN solid=$target_solid aspect_unfixed=$unfixed_aspect_report continue_to_tetmesh_keep_surface_mesh=1"',
+        '    }',
+        '    if {$repair_timed_out} {',
+        '        puts "MCP_PT_STOP solid=$target_solid surface_repair_timeout_skip_tetmesh shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report timeout_ms=$surface_repair_timeout_ms keep_repaired_surface_mesh=1"',
+        '        puts "MCP_CONSOLE solid=$target_solid stage=3d_skip reason=surface_repair_timeout shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report timeout_ms=$surface_repair_timeout_ms"',
+        '        set kept_surface_shell_count $shell_count',
+        '        set ok 0',
+        '        break',
         '    }',
         '    if {$shell_count > $crash_guard_shell_limit} {',
         '        puts "MCP_PT_STOP solid=$target_solid crash_guard_skip_tetmesh shell_count=$shell_count limit=$crash_guard_shell_limit unfixed_aspect=$unfixed_aspect_report keep_repaired_surface_mesh=1"',
@@ -5645,6 +5699,8 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
     lines.append(f"极端 2D aspect 触发时剩余 2D aspect 不合格单元数量：{_mcp_fmt_int(repair_agg.get('extreme_aspect_unfixed_aspect_count', 0))}")
     lines.append(f"因 2D 修复后贴合度下降跳过 tetra 的实体数量：{_mcp_fmt_int(repair_agg.get('surface_fit_degraded_keep_surface_mesh_count', 0))}")
     lines.append(f"贴合度下降触发时剩余 2D aspect 不合格单元数量：{_mcp_fmt_int(repair_agg.get('surface_fit_degraded_unfixed_aspect_count', 0))}")
+    lines.append(f"因 2D 修复超时跳过 tetra 的实体数量：{_mcp_fmt_int(repair_agg.get('surface_repair_timeout_keep_surface_mesh_count', 0))}")
+    lines.append(f"2D 修复超时时剩余 2D aspect 不合格单元数量：{_mcp_fmt_int(repair_agg.get('surface_repair_timeout_unfixed_aspect_count', 0))}")
     lines.append("")
 
     lines.append("八、按实体修复过程")
@@ -5657,6 +5713,7 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
             or int(_extreme_surface_aspect(info, "initial_count") or 0) > 0
             or int(_extreme_surface_aspect(info, "count") or 0) > 0
             or int(info.get("surface_fit_degraded_keep_surface_mesh") or 0) > 0
+            or int(info.get("surface_repair_timeout_keep_surface_mesh") or 0) > 0
             or int(info.get("vol_skew_initial_bad") or 0) > 0
             or int(info.get("vol_skew_final_bad") or 0) > 0
         )
@@ -5711,6 +5768,14 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     )
             if info.get("local_remesh_new_shells") is not None:
                 lines.append(f"  - local_remesh_new_shells={_mcp_fmt_int(info.get('local_remesh_new_shells'))}")
+            if int(info.get("surface_repair_timeout_keep_surface_mesh") or 0) > 0:
+                timeout_seconds = float(info.get("surface_repair_timeout_ms") or 0) / 1000.0
+                lines.append(
+                    "  - 2D 修复超时保护："
+                    f"timeout={timeout_seconds:g}s，"
+                    f"shell_count={_mcp_fmt_int(info.get('surface_repair_timeout_shell_count', 0))}，"
+                    "已保留当前 2D 面网格并跳过 tetra。"
+                )
             if info.get("vol_skew_initial_bad") is not None or info.get("vol_skew_final_bad") is not None:
                 lines.append(
                     f"  - 3D vol skew: 初始不合格={_mcp_fmt_int(info.get('vol_skew_initial_bad', 0))}, "
@@ -5777,6 +5842,15 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     f"shell_count={_mcp_fmt_int(info.get('surface_fit_shell_count', 0))}, "
                     f"剩余 aspect 不合格={_mcp_fmt_int(info.get('final_bad', 0))}"
                 )
+            if int(info.get("surface_repair_timeout_keep_surface_mesh") or 0) > 0:
+                lines.append(
+                    "  - 结果：2D 修复超过保护时间，未进入 3D tetra，已保留当前 2D 面网格。"
+                )
+                lines.append(
+                    f"  - 2D 修复超时：timeout={_mcp_fmt_int(info.get('surface_repair_timeout_ms', 0))} ms, "
+                    f"shell_count={_mcp_fmt_int(info.get('surface_repair_timeout_shell_count', 0))}, "
+                    f"剩余 aspect 不合格={_mcp_fmt_int(info.get('final_bad', 0))}"
+                )
     lines.append("")
 
     lines.append("九、失败和异常记录")
@@ -5796,6 +5870,13 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     "- tetra 防崩保护："
                     f"{_mcp_fmt_int(item.get('solid_count', 0))} 个实体未进入 tetra，"
                     f"已保留修复后的 2D 面网格；剩余 aspect 不合格数="
+                    f"{_mcp_fmt_int(item.get('unfixed_aspect', 0))}"
+                )
+            elif item.get("status") == "surface_repair_timeout_keep_surface_mesh":
+                lines.append(
+                    "- 2D 修复超时保护："
+                    f"{_mcp_fmt_int(item.get('solid_count', 0))} 个实体未进入 tetra，"
+                    f"已保留当前 2D 面网格；剩余 aspect 不合格数="
                     f"{_mcp_fmt_int(item.get('unfixed_aspect', 0))}"
                 )
             else:

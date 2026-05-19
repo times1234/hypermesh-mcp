@@ -358,6 +358,22 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
                 continue
 
             match = re.search(
+                r"MCP_PT_STOP solid=(\d+) surface_repair_timeout_skip_tetmesh shell_count=(\d+) "
+                r"final_aspect_bad=(\d+) timeout_ms=(\d+) keep_repaired_surface_mesh=1",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["surface_repair_timeout_keep_surface_mesh"] = 1
+                repair.setdefault(sid, {})["surface_repair_timeout_shell_count"] = int(match.group(2))
+                repair[sid]["final_bad"] = int(match.group(3))
+                repair[sid]["surface_repair_timeout_ms"] = int(match.group(4))
+                repair.setdefault(sid, {})["vol_skew_initial_bad"] = 0
+                repair.setdefault(sid, {})["vol_skew_final_bad"] = 0
+                repair.setdefault(sid, {})["tetra_not_attempted_reason"] = "surface_repair_timeout_skip_tetmesh"
+                continue
+
+            match = re.search(
                 r"MCP_PT_STOP solid=(\d+) extreme_aspect_skip_tetmesh shell_count=(\d+) "
                 r"final_aspect_bad=(\d+) extreme_aspect=(\d+) threshold=([0-9.eE+-]+) keep_repaired_surface_mesh=1",
                 line,
@@ -652,6 +668,8 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "extreme_aspect_unfixed_aspect_count": 0,
         "surface_fit_degraded_keep_surface_mesh_count": 0,
         "surface_fit_degraded_unfixed_aspect_count": 0,
+        "surface_repair_timeout_keep_surface_mesh_count": 0,
+        "surface_repair_timeout_unfixed_aspect_count": 0,
     }
     for item in repair.values():
         aggregate["initial_bad"] += int(item.get("initial_bad") or 0)
@@ -701,6 +719,11 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         )
         if int(item.get("surface_fit_degraded_keep_surface_mesh") or 0) > 0:
             aggregate["surface_fit_degraded_unfixed_aspect_count"] += int(item.get("final_bad") or 0)
+        aggregate["surface_repair_timeout_keep_surface_mesh_count"] += int(
+            item.get("surface_repair_timeout_keep_surface_mesh") or 0
+        )
+        if int(item.get("surface_repair_timeout_keep_surface_mesh") or 0) > 0:
+            aggregate["surface_repair_timeout_unfixed_aspect_count"] += int(item.get("final_bad") or 0)
         for step in (
             "triangle_cleanup",
             "smooth_5",
@@ -1810,6 +1833,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     surface_fit_degraded_count = int(
         repair_summary["repair_aggregate"].get("surface_fit_degraded_keep_surface_mesh_count") or 0
     )
+    surface_repair_timeout_count = int(
+        repair_summary["repair_aggregate"].get("surface_repair_timeout_keep_surface_mesh_count") or 0
+    )
     surface_backup_failed_count = int(
         repair_summary["repair_aggregate"].get("surface_backup_failed_keep_surface_mesh_count") or 0
     )
@@ -1854,6 +1880,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             or int(info.get("crash_guard_keep_surface_mesh") or 0) > 0
             or int(info.get("extreme_aspect_keep_surface_mesh") or 0) > 0
             or int(info.get("surface_fit_degraded_keep_surface_mesh") or 0) > 0
+            or int(info.get("surface_repair_timeout_keep_surface_mesh") or 0) > 0
         ):
             rolled_back_solids.append(
                 {
@@ -1864,8 +1891,10 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                     "crash_guard": int(info.get("crash_guard_keep_surface_mesh") or 0),
                     "extreme_aspect_guard": int(info.get("extreme_aspect_keep_surface_mesh") or 0),
                     "surface_fit_degraded": int(info.get("surface_fit_degraded_keep_surface_mesh") or 0),
+                    "surface_repair_timeout": int(info.get("surface_repair_timeout_keep_surface_mesh") or 0),
                     "crash_guard_shell_count": int(info.get("crash_guard_shell_count") or 0),
                     "crash_guard_limit": int(info.get("crash_guard_limit") or 0),
+                    "surface_repair_timeout_ms": int(info.get("surface_repair_timeout_ms") or 0),
                 }
             )
     if rollback_count:
@@ -1879,6 +1908,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 if not item.get("crash_guard")
                 and not item.get("extreme_aspect_guard")
                 and not item.get("surface_fit_degraded")
+                and not item.get("surface_repair_timeout")
             ],
         }
         workflow["errors"].append(rollback_error)
@@ -1919,6 +1949,17 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             ],
         }
         workflow["errors"].append(fit_error)
+    if surface_repair_timeout_count:
+        timeout_error = {
+            "step": "tetra_quality",
+            "status": "surface_repair_timeout_keep_surface_mesh",
+            "solid_count": surface_repair_timeout_count,
+            "unfixed_aspect": repair_summary["repair_aggregate"].get(
+                "surface_repair_timeout_unfixed_aspect_count", 0
+            ),
+            "solids": [item for item in rolled_back_solids if item.get("surface_repair_timeout")],
+        }
+        workflow["errors"].append(timeout_error)
     if surface_backup_failed_count:
         backup_error = {
             "step": "tetra_quality",

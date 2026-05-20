@@ -392,6 +392,36 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
 
             match = re.search(
                 r"MCP_PT_STOP solid=(\d+) surface_fit_degraded_after_repair "
+                r"reason=(\S+) bbox_before=([0-9.eE+-]+) bbox_after=([0-9.eE+-]+) fit_tol=([0-9.eE+-]+) "
+                r"ratio=([0-9.eE+-]+) limit=([0-9.eE+-]+) "
+                r"chord_max_before=([0-9.eE+-]+) chord_max_after=([0-9.eE+-]+) "
+                r"chord_delta=([0-9.eE+-]+) chord_delta_limit=([0-9.eE+-]+) "
+                r"action=keep_surface_no_tetra "
+                r"shell_count=(\d+) final_aspect_bad=(\d+) keep_repaired_surface_mesh=1",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                repair.setdefault(sid, {})["surface_fit_degraded_keep_surface_mesh"] = 1
+                repair[sid]["surface_fit_degrade_reason"] = match.group(2)
+                repair[sid]["surface_fit_before"] = float(match.group(3))
+                repair[sid]["surface_fit_after"] = float(match.group(4))
+                repair[sid]["surface_fit_tolerance"] = float(match.group(5))
+                repair[sid]["surface_fit_ratio"] = float(match.group(6))
+                repair[sid]["surface_fit_ratio_limit"] = float(match.group(7))
+                repair[sid]["surface_chord_dev_max_before"] = float(match.group(8))
+                repair[sid]["surface_chord_dev_max_after"] = float(match.group(9))
+                repair[sid]["surface_chord_dev_delta"] = float(match.group(10))
+                repair[sid]["surface_chord_dev_delta_limit"] = float(match.group(11))
+                repair[sid]["surface_fit_shell_count"] = int(match.group(12))
+                repair[sid]["final_bad"] = int(match.group(13))
+                repair.setdefault(sid, {})["vol_skew_initial_bad"] = 0
+                repair.setdefault(sid, {})["vol_skew_final_bad"] = 0
+                repair.setdefault(sid, {})["tetra_not_attempted_reason"] = "surface_fit_degraded_after_repair"
+                continue
+
+            match = re.search(
+                r"MCP_PT_STOP solid=(\d+) surface_fit_degraded_after_repair "
                 r"before=([0-9.eE+-]+) after=([0-9.eE+-]+) fit_tol=([0-9.eE+-]+) "
                 r"ratio=([0-9.eE+-]+) limit=([0-9.eE+-]+) "
                 r"(?:chord_before=(\d+) chord_after=(\d+) chord_threshold=([0-9.eE+-]+) )?"
@@ -1035,6 +1065,7 @@ def _build_part_parameter_report(
                 "feature_angle": args.tetra_feature_angle,
                 "growth_rate": args.tetra_growth_rate,
                 "fit_tolerance_ratio": actual.get("fit_tolerance_ratio", args.tetra_fit_tolerance_ratio),
+                "chord_dev_degrade_delta": args.tetra_chord_dev_degrade_delta,
                 "target_vol_skew": actual.get("target_vol_skew", args.tetra_target_vol_skew),
                 "repair_vol_skew": args.tetra_repair_vol_skew,
                 "gear_axis": info.get("gear_axis", ""),
@@ -1191,19 +1222,25 @@ def _isolate_rolled_back_solids(
         info = repair_by_solid.get(sid, {})
         total_2d_bad = int(info.get("final_bad") or 0)
         shell_count = int(info.get("surface_fit_shell_count") or info.get("pre_tetra_surface_shell_count") or 0)
+        reason = str(info.get("surface_fit_degrade_reason") or "")
+        details = [
+            f"修复后 2D 不合格数量（aspect > 10）：{total_2d_bad}",
+            f"2D 总网格数：{shell_count}",
+            f"最大 chord dev 修复前：{info.get('surface_chord_dev_max_before', 0)}",
+            f"最大 chord dev 修复后：{info.get('surface_chord_dev_max_after', 0)}",
+            f"最大 chord dev 增量：{info.get('surface_chord_dev_delta', 0)}",
+        ]
+        if "bbox" in reason:
+            details.extend(
+                [
+                    f"bbox 修复前最大偏差：{info.get('surface_fit_before', 0)}",
+                    f"bbox 修复后最大偏差：{info.get('surface_fit_after', 0)}",
+                ]
+            )
         message_lines.extend(
             _solid_line(
                 item,
-                [
-                    f"修复后 2D 不合格数量（aspect > 10）：{total_2d_bad}",
-                    f"2D 总网格数：{shell_count}",
-                    f"贴合度修复前最大偏差：{info.get('surface_fit_before', 0)}",
-                    f"贴合度修复后最大偏差：{info.get('surface_fit_after', 0)}",
-                    f"贴合容差：{info.get('surface_fit_tolerance', 0)}",
-                    f"下降倍率：{info.get('surface_fit_ratio', 0)}",
-                    f"chord dev 前后不合格数：{int(info.get('surface_chord_dev_before_bad') or 0)} -> {int(info.get('surface_chord_dev_after_bad') or 0)}",
-                    f"chord dev 阈值：{info.get('surface_chord_dev_threshold', getattr(hm, 'TETRA_SURFACE_CHORD_DEV', 0.1))}",
-                ],
+                details,
             )
         )
 
@@ -1697,6 +1734,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             fit_tolerance_ratio=args.tetra_fit_tolerance_ratio,
             target_vol_skew=args.tetra_target_vol_skew,
             repair_vol_skew=args.tetra_repair_vol_skew,
+            chord_dev_degrade_delta=args.tetra_chord_dev_degrade_delta,
             element_size_min=args.tetra_element_size_min,
             element_size_max=args.tetra_element_size_max,
             min_element_size_min=args.tetra_min_element_size_min,
@@ -2044,6 +2082,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "tetra_feature_angle": args.tetra_feature_angle,
             "tetra_growth_rate": args.tetra_growth_rate,
             "tetra_fit_tolerance_ratio": args.tetra_fit_tolerance_ratio,
+            "tetra_chord_dev_degrade_delta": args.tetra_chord_dev_degrade_delta,
             "tetra_target_vol_skew": args.tetra_target_vol_skew,
             "tetra_repair_vol_skew": args.tetra_repair_vol_skew,
             "use_gear_tooth_refinement": args.use_gear_tooth_refinement,
@@ -2131,33 +2170,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spin-element-size", type=float, default=1.0)
     parser.add_argument("--spin-retry-count", type=int, default=2)
     parser.add_argument("--spin-angle-degrees", type=float, default=360.0)
-    parser.add_argument("--spin-density", type=int, default=240, help="Deprecated alias for --spin-density-max.")
-    parser.add_argument("--spin-density-min", type=int, default=12)
+    parser.add_argument("--spin-density", type=int, default=160, help="Deprecated alias for --spin-density-max.")
+    parser.add_argument("--spin-density-min", type=int, default=60)
     parser.add_argument("--spin-density-max", type=int, default=None)
     parser.add_argument("--spin-section-element-size-min", type=float, default=0.2)
     parser.add_argument("--spin-section-element-size-max", type=float, default=1.5)
     parser.add_argument("--tetra-element-size", type=float, default=1.5)
     parser.add_argument("--tetra-element-size-min", type=float, default=1.5)
     parser.add_argument("--tetra-element-size-max", type=float, default=2.0)
-    parser.add_argument("--tetra-min-element-size", type=float, default=0.5)
-    parser.add_argument("--tetra-min-element-size-min", type=float, default=0.20)
-    parser.add_argument("--tetra-min-element-size-max", type=float, default=0.50)
-    parser.add_argument("--tetra-max-deviation", type=float, default=0.05)
-    parser.add_argument("--tetra-feature-angle", type=float, default=15.0)
+    parser.add_argument("--tetra-min-element-size", type=float, default=0.6)
+    parser.add_argument("--tetra-min-element-size-min", type=float, default=0.4)
+    parser.add_argument("--tetra-min-element-size-max", type=float, default=0.6)
+    parser.add_argument("--tetra-max-deviation", type=float, default=0.1)
+    parser.add_argument("--tetra-feature-angle", type=float, default=30.0)
     parser.add_argument("--tetra-growth-rate", type=float, default=1.23)
     parser.add_argument("--tetra-fit-tolerance-ratio", type=float, default=0.01)
+    parser.add_argument("--tetra-chord-dev-degrade-delta", type=float, default=0.20)
     parser.add_argument("--tetra-target-vol-skew", type=float, default=0.70)
     parser.add_argument("--tetra-repair-vol-skew", type=float, default=0.99)
     parser.add_argument("--tetra-pause-seconds", type=float, default=1.0)
     parser.add_argument("--use-gear-tooth-refinement", dest="use_gear_tooth_refinement", action="store_true", default=True)
     parser.add_argument("--no-gear-tooth-refinement", dest="use_gear_tooth_refinement", action="store_false")
-    parser.add_argument("--gear-tooth-element-size", type=float, default=1.05)
-    parser.add_argument("--gear-tooth-element-size-min", type=float, default=1.05)
-    parser.add_argument("--gear-tooth-element-size-max", type=float, default=1.05)
-    parser.add_argument("--gear-tooth-min-element-size", type=float, default=0.35)
-    parser.add_argument("--gear-tooth-min-element-size-min", type=float, default=0.35)
-    parser.add_argument("--gear-tooth-min-element-size-max", type=float, default=0.35)
-    parser.add_argument("--gear-tooth-feature-angle", type=float, default=10.5)
+    parser.add_argument("--gear-tooth-element-size", type=float, default=1.6)
+    parser.add_argument("--gear-tooth-element-size-min", type=float, default=1.2)
+    parser.add_argument("--gear-tooth-element-size-max", type=float, default=1.6)
+    parser.add_argument("--gear-tooth-min-element-size", type=float, default=0.3)
+    parser.add_argument("--gear-tooth-min-element-size-min", type=float, default=0.2)
+    parser.add_argument("--gear-tooth-min-element-size-max", type=float, default=0.3)
+    parser.add_argument("--gear-tooth-feature-angle", type=float, default=15.0)
     parser.add_argument("--gear-tooth-preview-only", action="store_true", help="Run probe/classify/rename/color, then mesh only recognized gear-tooth surfaces.")
     parser.add_argument("--delete-gear-tooth-preview", action="store_true", help="Delete the temporary gear-tooth preview mesh component.")
     parser.add_argument("--write-json", action="store_true", help="Write detailed JSON debug files into runs/.")
@@ -2184,7 +2224,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.drag_aspect_threshold <= 0:
         args.drag_aspect_threshold = 20.0
     if args.gear_tooth_element_size_min <= 0:
-        args.gear_tooth_element_size_min = 1.05
+        args.gear_tooth_element_size_min = 1.2
     if args.gear_tooth_element_size_max <= 0:
         args.gear_tooth_element_size_max = args.gear_tooth_element_size_min
     if args.gear_tooth_element_size_min > args.gear_tooth_element_size_max:
@@ -2197,7 +2237,7 @@ def main(argv: list[str] | None = None) -> int:
         args.gear_tooth_element_size_max,
     )
     if args.gear_tooth_min_element_size_min <= 0:
-        args.gear_tooth_min_element_size_min = 0.35
+        args.gear_tooth_min_element_size_min = 0.2
     if args.gear_tooth_min_element_size_max <= 0:
         args.gear_tooth_min_element_size_max = args.gear_tooth_min_element_size_min
     if args.gear_tooth_min_element_size_min > args.gear_tooth_min_element_size_max:
@@ -2210,7 +2250,7 @@ def main(argv: list[str] | None = None) -> int:
         args.gear_tooth_min_element_size_max,
     )
     if args.gear_tooth_feature_angle <= 0:
-        args.gear_tooth_feature_angle = 10.5
+        args.gear_tooth_feature_angle = 15.0
     try:
         summary = run_workflow(args)
     except Exception as exc:

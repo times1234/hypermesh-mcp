@@ -244,11 +244,12 @@ source "D:/tools/hypermesh-mcp-server/launch_meshing_workflow_panel.tcl"
 - `drag 贴合比例`：六面体贴合度检查比例。
 - `drag 重试次数`：六面体失败后的重试次数。
 - `tetra目标下限 / tetra目标上限`：控制 tetra 目标尺寸自动计算后的允许范围，默认是 `1.5..2.0`。
-- `tetra最小下限 / tetra最小上限`：控制 tetra 最小尺寸自动计算后的允许范围，默认是 `0.20..0.50`。
+- `tetra最小下限 / tetra最小上限`：控制 tetra 最小尺寸自动计算后的允许范围，默认是 `0.4..0.6`。
 - `tetra 最大偏差`：四面体面网格贴合几何的最大偏差。
 - `tetra 特征角`：四面体面网格保留特征的角度。
 - `tetra 增长率`：四面体网格尺寸过渡速度。
 - `tetra 贴合比例`：四面体贴合度检查比例。
+- `最大 chord dev 下降值`：2D 修复后最大 chord dev 相对修复前允许增加的上限，默认 `0.2`；超过则按贴合度恶化退回。
 - `目标 vol skew`：四面体生成时使用的体单元质量目标。
 - `修复 vol skew`：四面体质量修复后接受的上限。
 
@@ -435,9 +436,9 @@ generate_batched_plain_tetra_tcl(...)
 
 ```python
 default_element_size: float = 1.5
-default_min_element_size: float = 0.5
-max_deviation: float = 0.05
-feature_angle: float = 15
+default_min_element_size: float = 0.6
+max_deviation: float = 0.1
+feature_angle: float = 30
 growth_rate: float = 1.23
 fit_tolerance_ratio: float = 0.01
 target_vol_skew: float = 0.70
@@ -487,9 +488,9 @@ generate_plain_tetra_tcl(...)
 当前参数：
 
 ```python
-min_element_size: float = 0.5
-max_deviation: float = 0.05
-feature_angle: float = 15
+min_element_size: float = 0.6
+max_deviation: float = 0.1
+feature_angle: float = 30
 growth_rate: float = 1.23
 fit_tolerance_ratio: float = 0.01
 target_vol_skew: float = 0.70
@@ -525,7 +526,7 @@ clamped_size = max(1.5, min(float(element_size), 2.0))
 
 含义：
 
-- `clamped_min` 把最小尺寸限制在 `0.20..0.50`。
+- `clamped_min` 把最小尺寸限制在 `0.4..0.6`。
 - `clamped_size` 把目标尺寸限制在 `1.5..2.0`。
 
 如果你想允许 tetra 面网格更细，可以改这里的 `1.5` 下限，例如：
@@ -658,6 +659,9 @@ if {$fit_diff > $fit_tol} {set fit_ok 0}
 - `$cs * 0.25`：按当前网格尺寸给一个基础贴合容差。
 - `$solid_diag * $fit_tol_ratio`：按实体对角线给一个比例容差。
 - 两者取较大值作为最终贴合容差。
+
+2D 修复后的退回判断还会检查 HyperMesh 原生 chord dev 的最大值。流程会在修复前后分别估算最大 chord dev，
+如果 `修复后最大值 - 修复前最大值` 大于 `最大 chord dev 下降值`（默认 `0.2`），即使 bbox 没有触发，也会进入贴合度恶化退回路径。
 
 如果贴合检查过严，可以小幅调大 `fit_tolerance_ratio`，位置见第 6.1。
 

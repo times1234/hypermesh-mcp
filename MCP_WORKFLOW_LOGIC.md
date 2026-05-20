@@ -148,6 +148,8 @@ Phase 2 的核心是 `classify_all_solids_from_probe`。它只根据 Phase 1 的
 - 源面的内部孔数量是否少。
 - 源面边界是否适合做全四边形面网格。
 
+`surf_count == 6` 的简单恒截面实体或单内环短圆环优先走 drag。这里不要求厚径比特别薄，只要 `mn / mx` 不超过约 `0.58` 且源面明确即可；这样 s3/s5/s7 这类简单圆盘不会误走 cut-section spin。
+
 drag 的前提是源面能划出全 quad，否则后续 drag 生成 hex 的质量和完整性都很难保证。
 
 ### 3.3 spin_hex 分类原理
@@ -282,6 +284,8 @@ area_est = section_minor * section_major
 min_shells = clamp(ceil(area_est / (section_size * section_size * 4)), 2, 80)
 ```
 
+对很小的真实切截面，`section_minor <= 3` 且 `section_major <= 6` 时，最少 shell 数上限会放宽到 `4`。仍然要求截面 shell 节点贴在切平面容差内，避免把侧壁或端面误当成旋转截面；这个保护用于 s27/s28 这类切面很小但确实可 spin 的环形件。
+
 旋转份数按半径自适应：
 
 ```text
@@ -330,28 +334,24 @@ tetra_min_size = clamp(
 
 #### gear_aware_tetra 齿面尺寸
 
-齿面默认比普通 tetra 小 30%，即使用比例：
+默认齿面目标尺寸范围：
 
 ```text
-gear_tooth_scale = 0.70
+tooth_size_min = 1.2
+tooth_size_max = 1.6
 ```
 
-默认齿面目标尺寸：
+默认齿面最小尺寸范围：
 
 ```text
-default_tooth_size = tetra_size * 0.70
-```
-
-默认齿面最小尺寸：
-
-```text
-default_tooth_min_size = tetra_min_size * 0.70
+tooth_min_size_min = 0.2
+tooth_min_size_max = 0.3
 ```
 
 默认齿面特征角：
 
 ```text
-default_tooth_feature_angle = feature_angle * 0.70
+default_tooth_feature_angle = 15
 ```
 
 如果离线弹窗或 agent 参数传入齿面尺寸范围，则实际使用：
@@ -435,7 +435,7 @@ spin 旋转份数按半径智能判断：
 - 先根据最大旋转半径估算周长。
 - 用周长除以截面目标尺寸得到建议份数。
 - 再夹在 `spin_density_min` 和 `spin_density_max` 之间。
-- 离线弹窗中可以设置旋转份数上下限。
+- 默认旋转份数下限为 `60`，上限为 `160`；离线弹窗中可以设置旋转份数上下限。
 
 如果 spin 失败或生成结果不满足要求，代码会把该 solid 重新纳入 tetra 队列。为了避免之前出现的“solid 被切成两半后只划一半”的问题，失败回退时会尽量恢复或合并到可继续 tetra 的状态。
 
@@ -455,9 +455,9 @@ spin 旋转份数按半径智能判断：
 tetra 的默认表面网格参数来自离线弹窗或 CLI：
 
 - 目标尺寸范围默认约 `1.5` 到 `2.0`。
-- 最小尺寸范围默认约 `0.20` 到 `0.50`。
-- surface deviation 默认约 `0.05`。
-- feature angle 默认约 `15`。
+- 最小尺寸范围默认约 `0.4` 到 `0.6`。
+- surface deviation 默认约 `0.1`。
+- feature angle 默认约 `30`。
 - growth rate 默认约 `1.23`。
 
 对于复杂实体，会按 surface 数量降低最小尺寸并降低允许进入 tetra 的 shell 数量，减少 HyperMesh 卡死或崩溃风险。
@@ -497,9 +497,12 @@ tetra 的默认表面网格参数来自离线弹窗或 CLI：
    - 如果修复后 bbox 偏差明显变大，认为贴合度下降。
 
 2. chordal deviation 检测
-   - 使用 HyperMesh 原生命令检测 chordal deviation。
-   - 当前阈值约 `0.1`。
-   - 修复后如果 chordal deviation 不合格数量明显增加，也认为贴合风险上升。
+   - 使用 HyperMesh 原生 `*elementtestchordaldeviation` 检测 chordal deviation。
+   - 修复前后分别估算 shell 的最大 chord dev。
+   - 如果 `修复后最大 chord dev - 修复前最大 chord dev > 0.2`，认为贴合风险上升。
+
+离线面板中的 `tetra 最大偏差` 仍然对应 HyperMesh 生成 2D 面网格时的 `max_dev`。
+`最大 chord dev 下降值` 是额外的修复退回阈值，默认 `0.2`，只用于判断修复后是否恶化。
 
 如果 2D 修复后贴合度明显下降：
 

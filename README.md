@@ -50,7 +50,8 @@ their `MCP_SCRIPT_BEGIN` / `MCP_SCRIPT_END` markers are intact. For example,
 - `generate_surface_automesh_tcl`: generate simple surface automesh Tcl.
 - `generate_plain_tetra_tcl`: generate the only supported tetra path:
   surface-deviation R-trias, 2D fit/quality checks, tetra generation, and
-  volume-quality repair.
+  volume-quality repair. The 2D repair rollback checks both bbox fit and
+  HyperMesh-native maximum chord dev increase.
 - `generate_guarded_drag_hex_tcl`: generate guarded drag-hex Tcl.
 - `get_cutsection_spin_workflow`: explain the generic cut-section spin workflow.
 - `generate_cutsection_spin_hex_tcl`: generate cut-section spin Tcl for stepped or recessed revolved solids.
@@ -295,9 +296,8 @@ Current important workflow switches:
 - `--delete-gear-tooth-preview` deletes the temporary tooth-preview mesh.
 - `--gear-tooth-element-size-min/max`,
   `--gear-tooth-min-element-size-min/max`, and
-  `--gear-tooth-feature-angle` control tooth-local sizing. Defaults are fixed
-  `1.05`, fixed `0.35`, and `10.5`, which are 30% smaller than the ordinary
-  tetra defaults.
+  `--gear-tooth-feature-angle` control tooth-local sizing. Defaults are
+  `1.2..1.6`, `0.2..0.3`, and `15`.
 - `--spin-section-element-size-min/max` controls the cut-section 2D mesh size
   used before spin.
 - `--drag-aspect-guard` enables the drag minimum-three-layer/aspect guard from

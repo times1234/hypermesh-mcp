@@ -24,24 +24,25 @@ namespace eval ::hm_mcp_launcher {
 
     variable tetra_element_size_min 1.5
     variable tetra_element_size_max 2.0
-    variable tetra_min_element_size_min 0.20
-    variable tetra_min_element_size_max 0.50
-    variable tetra_max_deviation 0.05
-    variable tetra_feature_angle 15.0
+    variable tetra_min_element_size_min 0.4
+    variable tetra_min_element_size_max 0.6
+    variable tetra_max_deviation 0.1
+    variable tetra_feature_angle 30
     variable tetra_growth_rate 1.23
     variable tetra_fit_tolerance_ratio 0.01
+    variable tetra_chord_dev_degrade_delta 0.20
     variable tetra_target_vol_skew 0.70
     variable tetra_repair_vol_skew 0.99
     variable use_gear_tooth_refinement 1
-    variable gear_tooth_element_size_min 1.05
-    variable gear_tooth_element_size_max 1.05
-    variable gear_tooth_min_element_size_min 0.35
-    variable gear_tooth_min_element_size_max 0.35
-    variable gear_tooth_feature_angle 10.5
+    variable gear_tooth_element_size_min 1.2
+    variable gear_tooth_element_size_max 1.6
+    variable gear_tooth_min_element_size_min 0.2
+    variable gear_tooth_min_element_size_max 0.3
+    variable gear_tooth_feature_angle 15
     variable spin_section_element_size_min 0.20
     variable spin_section_element_size_max 1.50
-    variable spin_density_min 12
-    variable spin_density_max 240
+    variable spin_density_min 60
+    variable spin_density_max 160
 
     variable probe_timeout 180
     variable phase2_timeout 120
@@ -240,11 +241,11 @@ proc ::hm_mcp_launcher::normalize_mesh_parameters {} {
 
     normalize_pair drag_element_size_min drag_element_size_max 0.5 1.5
     normalize_pair tetra_element_size_min tetra_element_size_max 1.5 2.0
-    normalize_pair tetra_min_element_size_min tetra_min_element_size_max 0.20 0.50
-    normalize_pair gear_tooth_element_size_min gear_tooth_element_size_max 1.05 1.05
-    normalize_pair gear_tooth_min_element_size_min gear_tooth_min_element_size_max 0.35 0.35
+    normalize_pair tetra_min_element_size_min tetra_min_element_size_max 0.4 0.6
+    normalize_pair gear_tooth_element_size_min gear_tooth_element_size_max 1.2 1.6
+    normalize_pair gear_tooth_min_element_size_min gear_tooth_min_element_size_max 0.2 0.3
     normalize_pair spin_section_element_size_min spin_section_element_size_max 0.20 1.50
-    normalize_pair spin_density_min spin_density_max 12 240
+    normalize_pair spin_density_min spin_density_max 60 160
     set spin_density_min [expr {int(round($spin_density_min))}]
     set spin_density_max [expr {int(round($spin_density_max))}]
     append_log "尺寸限制：drag=$drag_element_size_min..$drag_element_size_max, tetra目标=$tetra_element_size_min..$tetra_element_size_max, tetra最小=$tetra_min_element_size_min..$tetra_min_element_size_max, spin截面=$spin_section_element_size_min..$spin_section_element_size_max, spin份数=$spin_density_min..$spin_density_max\n"
@@ -270,6 +271,7 @@ proc ::hm_mcp_launcher::build_command {{mode full}} {
     variable tetra_feature_angle
     variable tetra_growth_rate
     variable tetra_fit_tolerance_ratio
+    variable tetra_chord_dev_degrade_delta
     variable tetra_target_vol_skew
     variable tetra_repair_vol_skew
     variable use_gear_tooth_refinement
@@ -321,6 +323,7 @@ proc ::hm_mcp_launcher::build_command {{mode full}} {
         --tetra-feature-angle $tetra_feature_angle \
         --tetra-growth-rate $tetra_growth_rate \
         --tetra-fit-tolerance-ratio $tetra_fit_tolerance_ratio \
+        --tetra-chord-dev-degrade-delta $tetra_chord_dev_degrade_delta \
         --tetra-target-vol-skew $tetra_target_vol_skew \
         --tetra-repair-vol-skew $tetra_repair_vol_skew \
         --gear-tooth-element-size $gear_tooth_element_size_max \
@@ -641,24 +644,26 @@ proc ::hm_mcp_launcher::build_ui {} {
 
     ttk::labelframe $w.root.main.right -text "质量和修复参数" -padding 12 -style HMSection.TLabelframe
     grid $w.root.main.right -row 0 -column 1 -sticky nsew -padx {8 0}
-    grid columnconfigure $w.root.main.right 1 -weight 1
+    grid columnconfigure $w.root.main.right 1 -weight 0 -minsize 92
+    grid columnconfigure $w.root.main.right 2 -weight 1
     ttk::checkbutton $w.root.main.right.dragaspect -text "drag三层" -variable ::hm_mcp_launcher::drag_aspect_guard -style HMCheck.TCheckbutton
-    grid $w.root.main.right.dragaspect -row 8 -column 0 -columnspan 3 -sticky w -pady {7 0}
+    grid $w.root.main.right.dragaspect -row 9 -column 0 -columnspan 3 -sticky w -pady {7 0}
     add_row $w.root.main.right 0 "drag 贴合比例" ::hm_mcp_launcher::drag_fit_tolerance_ratio "越小越严格"
     add_row $w.root.main.right 1 "drag 重试次数" ::hm_mcp_launcher::drag_retry_count ""
-    add_row $w.root.main.right 2 "tetra 最大偏差" ::hm_mcp_launcher::tetra_max_deviation ""
+    add_row $w.root.main.right 2 "tetra 最大偏差" ::hm_mcp_launcher::tetra_max_deviation "用于 HyperMesh 生成 2D 面网格的 max_dev"
     add_row $w.root.main.right 3 "tetra 特征角" ::hm_mcp_launcher::tetra_feature_angle ""
     add_row $w.root.main.right 4 "tetra 增长率" ::hm_mcp_launcher::tetra_growth_rate ""
     add_row $w.root.main.right 5 "tetra 贴合比例" ::hm_mcp_launcher::tetra_fit_tolerance_ratio ""
-    add_row $w.root.main.right 6 "目标 vol skew" ::hm_mcp_launcher::tetra_target_vol_skew ""
-    add_row $w.root.main.right 7 "修复 vol skew" ::hm_mcp_launcher::tetra_repair_vol_skew ""
+    add_row $w.root.main.right 6 "最大 chord dev 下降值" ::hm_mcp_launcher::tetra_chord_dev_degrade_delta "修复后最大 chord dev 增量超过此值则退回"
+    add_row $w.root.main.right 7 "目标 vol skew" ::hm_mcp_launcher::tetra_target_vol_skew ""
+    add_row $w.root.main.right 8 "修复 vol skew" ::hm_mcp_launcher::tetra_repair_vol_skew ""
     ttk::checkbutton $w.root.main.right.gearrefine -text "启用齿面加厚/加密模型" -variable ::hm_mcp_launcher::use_gear_tooth_refinement -style HMCheck.TCheckbutton
-    grid $w.root.main.right.gearrefine -row 9 -column 0 -columnspan 3 -sticky w -pady {7 0}
-    add_row $w.root.main.right 10 "齿面tetra下限" ::hm_mcp_launcher::gear_tooth_element_size_min "默认=上限，固定尺寸"
-    add_row $w.root.main.right 11 "齿面tetra上限" ::hm_mcp_launcher::gear_tooth_element_size_max "默认=下限，固定尺寸"
-    add_row $w.root.main.right 12 "齿面最小下限" ::hm_mcp_launcher::gear_tooth_min_element_size_min "默认=上限，固定最小尺寸"
-    add_row $w.root.main.right 13 "齿面最小上限" ::hm_mcp_launcher::gear_tooth_min_element_size_max "默认=下限，固定最小尺寸"
-    add_row $w.root.main.right 14 "齿面特征角" ::hm_mcp_launcher::gear_tooth_feature_angle "默认比普通tetra小30%"
+    grid $w.root.main.right.gearrefine -row 10 -column 0 -columnspan 3 -sticky w -pady {7 0}
+    add_row $w.root.main.right 11 "齿面tetra下限" ::hm_mcp_launcher::gear_tooth_element_size_min "默认=上限，固定尺寸"
+    add_row $w.root.main.right 12 "齿面tetra上限" ::hm_mcp_launcher::gear_tooth_element_size_max "默认=下限，固定尺寸"
+    add_row $w.root.main.right 13 "齿面最小下限" ::hm_mcp_launcher::gear_tooth_min_element_size_min "默认=上限，固定最小尺寸"
+    add_row $w.root.main.right 14 "齿面最小上限" ::hm_mcp_launcher::gear_tooth_min_element_size_max "默认=下限，固定最小尺寸"
+    add_row $w.root.main.right 15 "齿面特征角" ::hm_mcp_launcher::gear_tooth_feature_angle "默认比普通tetra小30%"
 
     ttk::labelframe $w.root.logbox -text "运行日志" -padding 12 -style HMSection.TLabelframe
     grid $w.root.logbox -row 5 -column 0 -sticky nsew -pady {0 10}

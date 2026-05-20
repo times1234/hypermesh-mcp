@@ -756,7 +756,7 @@ def _unwrap_generated_tcl(script: str) -> str:
 def _estimate_tetra_timeout_seconds(
     *,
     surf_count: int = 0,
-    min_element_size: float = 0.5,
+    min_element_size: float = 0.6,
     diagonal: float = 0.0,
     batch_size: int = 1,
 ) -> int:
@@ -1778,9 +1778,9 @@ def classify_all_solids_from_probe(
             evidence.append(gear_reason)
             if gear_tooth_surface_ids:
                 evidence.append(f"gear tooth/outer-band surface candidates: {gear_tooth_count}")
-        elif sc == 6 and mx > 0 and mn / mx < 0.40 and src_surf > 0 and source_inner_loops <= 1:
+        elif sc == 6 and mx > 0 and mn / mx <= 0.58 and src_surf > 0 and source_inner_loops <= 1:
             strategy = "drag_hex"
-            evidence.append("6-face thin -> drag")
+            evidence.append("6-face constant-section solid/ring -> drag")
         elif sc == 4 and mx > 0 and src_surf > 0 and cross_ratio >= 0.75 and mn / mx <= 0.60 and source_inner_loops <= 1:
             strategy = "drag_hex"
             evidence.append("4-surface short cylinder -> drag")
@@ -2756,9 +2756,9 @@ def generate_plain_tetra_tcl(
     component_name: str,
     element_size: float,
     output_hm_path: str | None = None,
-    min_element_size: float = 0.5,
-    max_deviation: float = 0.05,
-    feature_angle: float = 15,
+    min_element_size: float = 0.6,
+    max_deviation: float = 0.1,
+    feature_angle: float = 30,
     growth_rate: float = 1.23,
     max_shell_elements_before_tetmesh: int = TETRA_MAX_SHELL_ELEMENTS,
     allow_tetmesh: bool = True,
@@ -2766,20 +2766,21 @@ def generate_plain_tetra_tcl(
     fit_tolerance_ratio: float = 0.01,
     target_vol_skew: float = 0.70,
     repair_vol_skew: float = 0.99,
+    chord_dev_degrade_delta: float = 0.20,
     element_size_min: float = 1.5,
     element_size_max: float = 2.0,
-    min_element_size_min: float = 0.20,
-    min_element_size_max: float = 0.50,
+    min_element_size_min: float = 0.4,
+    min_element_size_max: float = 0.6,
     delete_existing_component_elements: bool = True,
     use_gear_tooth_refinement: bool = True,
     gear_tooth_surface_ids: list[int] | None = None,
-    gear_tooth_element_size: float | None = None,
-    gear_tooth_element_size_min: float | None = None,
-    gear_tooth_element_size_max: float | None = None,
-    gear_tooth_min_element_size: float | None = None,
-    gear_tooth_min_element_size_min: float | None = None,
-    gear_tooth_min_element_size_max: float | None = None,
-    gear_tooth_feature_angle: float | None = None,
+    gear_tooth_element_size: float | None = 1.6,
+    gear_tooth_element_size_min: float | None = 1.2,
+    gear_tooth_element_size_max: float | None = 1.6,
+    gear_tooth_min_element_size: float | None = 0.3,
+    gear_tooth_min_element_size_min: float | None = 0.2,
+    gear_tooth_min_element_size_max: float | None = 0.3,
+    gear_tooth_feature_angle: float | None = 15.0,
 ) -> dict[str, Any]:
     """Generate Tcl for surface-deviation R-trias plus tetra meshing on one solid."""
     if solid_id <= 0:
@@ -2792,6 +2793,8 @@ def generate_plain_tetra_tcl(
         raise ValueError("max_shell_elements_before_tetmesh must be > 0.")
     if fit_tolerance_ratio <= 0:
         raise ValueError("fit_tolerance_ratio must be > 0.")
+    if chord_dev_degrade_delta < 0:
+        raise ValueError("chord_dev_degrade_delta must be >= 0.")
     if not (0 < target_vol_skew <= 1):
         raise ValueError("target_vol_skew must be in (0, 1].")
     if not (0 < repair_vol_skew <= 1):
@@ -2875,6 +2878,7 @@ def generate_plain_tetra_tcl(
         "set surface_aspect_threshold 10.0",
         f"set fatal_surface_aspect_threshold {float(TETRA_FATAL_SURFACE_ASPECT)}",
         f"set surface_chord_dev_threshold {float(TETRA_SURFACE_CHORD_DEV)}",
+        f"set surface_chord_dev_degrade_delta {float(chord_dev_degrade_delta)}",
         "set surface_growth_limit 1.23",
         "set surface_max_to_min_ratio 6.0",
         "set retry_count 2",
@@ -2893,8 +2897,10 @@ def generate_plain_tetra_tcl(
         "set surface_fit_degraded_after 0.0",
         "set surface_fit_degraded_tol 0.0",
         "set surface_fit_degraded_ratio 0.0",
-        "set surface_fit_degraded_chord_before 0",
-        "set surface_fit_degraded_chord_after 0",
+        "set surface_fit_degraded_reason none",
+        "set surface_fit_degraded_chord_before 0.0",
+        "set surface_fit_degraded_chord_after 0.0",
+        "set surface_fit_degraded_chord_delta 0.0",
         "proc mcp_all_elems {} {",
         '    *createmark elems 1 "all"',
         "    return [hm_getmark elems 1]",
@@ -2930,6 +2936,14 @@ def generate_plain_tetra_tcl(
         "    if {[catch {hm_entityinfo exist comps $comp -byname} exists]} {set exists 0}",
         "    if {!$exists} {catch {*createentity comps name=$comp color=$color}}",
         "    return $comp",
+        "}",
+        "proc mcp_set_current_component {comp color} {",
+        "    mcp_ensure_component $comp $color",
+        "    if {[catch {*currentcollector components \"$comp\"} err]} {",
+        "        puts \"MCP_PT_WARN currentcollector_failed component=$comp error=$err\"",
+        "        return 0",
+        "    }",
+        "    return 1",
         "}",
         "proc mcp_delete_component_if_empty {comp} {",
         "    if {[catch {hm_entityinfo exist comps $comp -byname} exists] || !$exists} {return 0}",
@@ -3020,6 +3034,25 @@ def generate_plain_tetra_tcl(
         "    }",
         "    puts \"MCP_PT_WARN surface_chord_dev_native_test_failed=$err disabled=1\"",
         "    return {}",
+        "}",
+        "proc mcp_max_shell_chord_dev {ids} {",
+        "    if {[llength $ids] == 0} {return 0.0}",
+        "    set low 0.0",
+        "    set high 0.1",
+        "    set guard 0",
+        "    set bad [llength [mcp_bad_shell_chord_dev_ids $ids $high]]",
+        "    while {$bad > 0 && $guard < 30} {",
+        "        set low $high",
+        "        set high [expr {$high * 2.0}]",
+        "        set bad [llength [mcp_bad_shell_chord_dev_ids $ids $high]]",
+        "        incr guard",
+        "    }",
+        "    for {set i 0} {$i < 18} {incr i} {",
+        "        set mid [expr {($low + $high) / 2.0}]",
+        "        set bad [llength [mcp_bad_shell_chord_dev_ids $ids $mid]]",
+        "        if {$bad > 0} {set low $mid} else {set high $mid}",
+        "    }",
+        "    return $high",
         "}",
         "proc mcp_sliver_bad_shell_count {ids min_edge_limit aspect_fast_threshold} {",
         "    set count 0",
@@ -3151,10 +3184,10 @@ def generate_plain_tetra_tcl(
         "    mcp_delete_component_if_empty $backup_comp",
         "    mcp_ensure_component $backup_comp 61",
         "    set before [mcp_all_elems]",
-        "    *currentcollector components \"$backup_comp\"",
+        "    if {![mcp_set_current_component $backup_comp 61]} {return {}}",
         "    eval *createmark elems 1 $ids",
         "    set dup_rc [catch {*duplicatemark elems 1 1} dup_err]",
-        "    *currentcollector components \"$target_comp\"",
+        "    if {![mcp_set_current_component $target_comp 7]} {return {}}",
         "    if {$dup_rc} {puts \"MCP_PT_WARN surface_backup_duplicate_failed=$dup_err component=$backup_comp\"; return {}}",
         "    set copied [mcp_list_subtract [mcp_all_elems] $before]",
         "    if {[llength $copied] > 0} {eval *createmark elems 1 $copied; catch {*movemark elems 1 \"$backup_comp\"}}",
@@ -3166,7 +3199,7 @@ def generate_plain_tetra_tcl(
         "    set current_shells [mcp_list_subtract [mcp_shells_on_surfaces $all_surfs] $backup_ids]",
         "    if {[llength $current_shells] > 0} {mcp_delete_elems $current_shells}",
         "    set before [mcp_all_elems]",
-        "    *currentcollector components \"$target_comp\"",
+        "    if {![mcp_set_current_component $target_comp 7]} {return {}}",
         "    eval *createmark elems 1 $backup_ids",
         "    set dup_rc [catch {*duplicatemark elems 1 1} dup_err]",
         "    if {$dup_rc} {puts \"MCP_PT_WARN surface_backup_restore_failed=$dup_err component=$backup_comp\"; return {}}",
@@ -3176,7 +3209,7 @@ def generate_plain_tetra_tcl(
         "    mcp_delete_component_if_empty $backup_comp",
         "    return $restored",
         "}",
-        '*currentcollector components "$target_component"',
+        'if {![mcp_set_current_component $target_component 7]} { puts "MCP_PT_FAIL solid=$target_solid currentcollector_failed component=$target_component"; return }',
         'if {$delete_existing_component_elements} {',
         '    set removed_existing [mcp_delete_marked_component_elems $target_component]',
         '    if {$removed_existing > 0} {puts "MCP_PT_INFO solid=$target_solid removed_existing_component_elems=$removed_existing"}',
@@ -3306,9 +3339,8 @@ def generate_plain_tetra_tcl(
         '    set pre_repair_fit_tol $fit_tol',
         '    set pre_repair_fit_max_diff $fit_max_diff',
         '    set pre_repair_fit_max_index $fit_max_index',
-        '    set pre_repair_chord_dev_ids [mcp_bad_shell_chord_dev_ids $shell_ids $surface_chord_dev_threshold]',
-        '    set pre_repair_chord_dev_count [llength $pre_repair_chord_dev_ids]',
-        '    puts "MCP_PT_INFO solid=$target_solid surface_fit_before_repair max_diff=$pre_repair_fit_max_diff fit_tol=$pre_repair_fit_tol max_index=$pre_repair_fit_max_index chord_dev_bad=$pre_repair_chord_dev_count chord_dev_threshold=$surface_chord_dev_threshold attempt=$at"',
+        '    set pre_repair_chord_dev_max [mcp_max_shell_chord_dev $shell_ids]',
+        '    puts "MCP_PT_INFO solid=$target_solid surface_fit_before_repair max_diff=$pre_repair_fit_max_diff fit_tol=$pre_repair_fit_tol max_index=$pre_repair_fit_max_index chord_dev_max=$pre_repair_chord_dev_max chord_delta_limit=$surface_chord_dev_degrade_delta attempt=$at"',
         '    if {$shell_count > $max_shell_before_tetmesh} {',
         '        puts "MCP_PT_WARN solid=$target_solid shell_count=$shell_count exceeds_guard=$max_shell_before_tetmesh continuing_to_tetmesh"',
         '    }',
@@ -3441,11 +3473,14 @@ def generate_plain_tetra_tcl(
         '        if {$fit_diff > $post_repair_fit_max_diff} {set post_repair_fit_max_diff $fit_diff; set post_repair_fit_max_index $i}',
         '    }',
         '    set repair_fit_ratio [expr {$post_repair_fit_max_diff / max($pre_repair_fit_max_diff, 1.0e-9)}]',
-        '    set post_repair_chord_dev_ids [mcp_bad_shell_chord_dev_ids $shell_ids $surface_chord_dev_threshold]',
-        '    set post_repair_chord_dev_count [llength $post_repair_chord_dev_ids]',
-        '    set repair_chord_degraded [expr {$post_repair_chord_dev_count > $pre_repair_chord_dev_count}]',
-        '    puts "MCP_PT_INFO solid=$target_solid surface_fit_after_repair max_diff=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol max_index=$post_repair_fit_max_index before_max_diff=$pre_repair_fit_max_diff ratio=$repair_fit_ratio chord_dev_bad=$post_repair_chord_dev_count chord_dev_before=$pre_repair_chord_dev_count chord_dev_threshold=$surface_chord_dev_threshold chord_degraded=$repair_chord_degraded attempt=$at"',
-        '    if {($post_repair_fit_max_diff > $pre_repair_fit_tol && $repair_fit_ratio >= $repair_fit_degrade_ratio) || $repair_chord_degraded} {',
+        '    set post_repair_chord_dev_max [mcp_max_shell_chord_dev $shell_ids]',
+        '    set repair_chord_delta [expr {$post_repair_chord_dev_max - $pre_repair_chord_dev_max}]',
+        '    set repair_chord_degraded [expr {$repair_chord_delta > $surface_chord_dev_degrade_delta}]',
+        '    set repair_bbox_degraded [expr {$post_repair_fit_max_diff > $pre_repair_fit_tol && $repair_fit_ratio >= $repair_fit_degrade_ratio}]',
+        '    set repair_degrade_reason none',
+        '    if {$repair_bbox_degraded && $repair_chord_degraded} {set repair_degrade_reason bbox+chord} elseif {$repair_bbox_degraded} {set repair_degrade_reason bbox} elseif {$repair_chord_degraded} {set repair_degrade_reason chord}',
+        '    puts "MCP_PT_INFO solid=$target_solid surface_fit_after_repair reason=$repair_degrade_reason bbox_before=$pre_repair_fit_max_diff bbox_after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol max_index=$post_repair_fit_max_index ratio=$repair_fit_ratio chord_max_before=$pre_repair_chord_dev_max chord_max_after=$post_repair_chord_dev_max chord_delta=$repair_chord_delta chord_delta_limit=$surface_chord_dev_degrade_delta attempt=$at"',
+        '    if {$repair_bbox_degraded || $repair_chord_degraded} {',
         '        set next_attempt [expr {$at + 1}]',
         '        if {$next_attempt < $retry_count} {',
         '            set next_cs [expr {max($elem_size_min, $elem_size * pow(0.90, $next_attempt))}]',
@@ -3455,13 +3490,13 @@ def generate_plain_tetra_tcl(
         '            set next_max_size [expr {max($next_max_size, $next_cs)}]',
         '            set next_param_key [format "%.4f|%.4f|%.4f|%.4f|%.4f" $next_cs $next_mn_size $next_max_size $max_dev $effective_growth]',
         '            if {$next_param_key ne $param_key} {',
-        '                puts "MCP_PT_WARN solid=$target_solid surface_fit_degraded_after_repair before=$pre_repair_fit_max_diff after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio limit=$repair_fit_degrade_ratio chord_before=$pre_repair_chord_dev_count chord_after=$post_repair_chord_dev_count chord_threshold=$surface_chord_dev_threshold attempt=$at action=retry_surface_mesh next_params=$next_param_key"',
+        '                puts "MCP_PT_WARN solid=$target_solid surface_fit_degraded_after_repair reason=$repair_degrade_reason bbox_before=$pre_repair_fit_max_diff bbox_after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio limit=$repair_fit_degrade_ratio chord_max_before=$pre_repair_chord_dev_max chord_max_after=$post_repair_chord_dev_max chord_delta=$repair_chord_delta chord_delta_limit=$surface_chord_dev_degrade_delta attempt=$at action=retry_surface_mesh next_params=$next_param_key"',
         '                mcp_delete_elems $shell_ids',
         '                continue',
         '            }',
         '            puts "MCP_PT_WARN solid=$target_solid duplicate_retry_params_after_fit_degrade attempt=$at next_attempt=$next_attempt params=$next_param_key action=keep_current_surface_mesh"',
         '        }',
-        '        puts "MCP_PT_WARN solid=$target_solid surface_fit_degraded_after_repair before=$pre_repair_fit_max_diff after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio limit=$repair_fit_degrade_ratio chord_before=$pre_repair_chord_dev_count chord_after=$post_repair_chord_dev_count chord_threshold=$surface_chord_dev_threshold attempt=$at action=final_no_replace_repair"',
+        '        puts "MCP_PT_WARN solid=$target_solid surface_fit_degraded_after_repair reason=$repair_degrade_reason bbox_before=$pre_repair_fit_max_diff bbox_after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio limit=$repair_fit_degrade_ratio chord_max_before=$pre_repair_chord_dev_max chord_max_after=$post_repair_chord_dev_max chord_delta=$repair_chord_delta chord_delta_limit=$surface_chord_dev_degrade_delta attempt=$at action=final_no_replace_repair"',
         '        set fit_retry_bad_ids [mcp_list_subtract [mcp_bad_shell_aspect_ids $shell_ids $surface_aspect_threshold] [mcp_bad_shell_aspect_ids $shell_ids $fatal_surface_aspect_threshold]]',
         '        if {[llength $fit_retry_bad_ids] > 0 && !$conservative_2d_repair && !$repair_timed_out} {',
         '            eval *createmark elems 1 $fit_retry_bad_ids',
@@ -3492,20 +3527,25 @@ def generate_plain_tetra_tcl(
         '            if {$fit_diff > $post_repair_fit_max_diff} {set post_repair_fit_max_diff $fit_diff; set post_repair_fit_max_index $i}',
         '        }',
         '        set repair_fit_ratio [expr {$post_repair_fit_max_diff / max($pre_repair_fit_max_diff, 1.0e-9)}]',
-        '        set post_repair_chord_dev_ids [mcp_bad_shell_chord_dev_ids $shell_ids $surface_chord_dev_threshold]',
-        '        set post_repair_chord_dev_count [llength $post_repair_chord_dev_ids]',
-        '        set repair_chord_degraded [expr {$post_repair_chord_dev_count > $pre_repair_chord_dev_count}]',
-        '        puts "MCP_PT_INFO solid=$target_solid surface_fit_after_final_no_replace_repair max_diff=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol max_index=$post_repair_fit_max_index before_max_diff=$pre_repair_fit_max_diff ratio=$repair_fit_ratio chord_dev_bad=$post_repair_chord_dev_count chord_dev_before=$pre_repair_chord_dev_count chord_dev_threshold=$surface_chord_dev_threshold chord_degraded=$repair_chord_degraded attempt=$at"',
-        '        if {($post_repair_fit_max_diff > $pre_repair_fit_tol && $repair_fit_ratio >= $repair_fit_degrade_ratio) || $repair_chord_degraded} {',
+        '        set post_repair_chord_dev_max [mcp_max_shell_chord_dev $shell_ids]',
+        '        set repair_chord_delta [expr {$post_repair_chord_dev_max - $pre_repair_chord_dev_max}]',
+        '        set repair_chord_degraded [expr {$repair_chord_delta > $surface_chord_dev_degrade_delta}]',
+        '        set repair_bbox_degraded [expr {$post_repair_fit_max_diff > $pre_repair_fit_tol && $repair_fit_ratio >= $repair_fit_degrade_ratio}]',
+        '        set repair_degrade_reason none',
+        '        if {$repair_bbox_degraded && $repair_chord_degraded} {set repair_degrade_reason bbox+chord} elseif {$repair_bbox_degraded} {set repair_degrade_reason bbox} elseif {$repair_chord_degraded} {set repair_degrade_reason chord}',
+        '        puts "MCP_PT_INFO solid=$target_solid surface_fit_after_final_no_replace_repair reason=$repair_degrade_reason bbox_before=$pre_repair_fit_max_diff bbox_after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol max_index=$post_repair_fit_max_index ratio=$repair_fit_ratio chord_max_before=$pre_repair_chord_dev_max chord_max_after=$post_repair_chord_dev_max chord_delta=$repair_chord_delta chord_delta_limit=$surface_chord_dev_degrade_delta attempt=$at"',
+        '        if {$repair_bbox_degraded || $repair_chord_degraded} {',
         '            set surface_fit_degraded_keep_surface 1',
         '            set surface_fit_degraded_before $pre_repair_fit_max_diff',
         '            set surface_fit_degraded_after $post_repair_fit_max_diff',
         '            set surface_fit_degraded_tol $pre_repair_fit_tol',
         '            set surface_fit_degraded_ratio $repair_fit_ratio',
-        '            set surface_fit_degraded_chord_before $pre_repair_chord_dev_count',
-        '            set surface_fit_degraded_chord_after $post_repair_chord_dev_count',
+        '            set surface_fit_degraded_reason $repair_degrade_reason',
+        '            set surface_fit_degraded_chord_before $pre_repair_chord_dev_max',
+        '            set surface_fit_degraded_chord_after $post_repair_chord_dev_max',
+        '            set surface_fit_degraded_chord_delta $repair_chord_delta',
         '        } else {',
-        '            puts "MCP_PT_INFO solid=$target_solid surface_fit_degrade_recovered_after_final_no_replace before=$pre_repair_fit_max_diff after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio chord_before=$pre_repair_chord_dev_count chord_after=$post_repair_chord_dev_count chord_threshold=$surface_chord_dev_threshold attempt=$at"',
+        '            puts "MCP_PT_INFO solid=$target_solid surface_fit_degrade_recovered_after_final_no_replace bbox_before=$pre_repair_fit_max_diff bbox_after=$post_repair_fit_max_diff fit_tol=$pre_repair_fit_tol ratio=$repair_fit_ratio chord_max_before=$pre_repair_chord_dev_max chord_max_after=$post_repair_chord_dev_max chord_delta=$repair_chord_delta chord_delta_limit=$surface_chord_dev_degrade_delta attempt=$at"',
         '        }',
         '    }',
         '    set fatal_aspect_ids [mcp_bad_shell_aspect_ids $shell_ids $fatal_surface_aspect_threshold]',
@@ -3540,8 +3580,8 @@ def generate_plain_tetra_tcl(
         '        break',
         '    }',
         '    if {$surface_fit_degraded_keep_surface} {',
-        '        puts "MCP_PT_STOP solid=$target_solid surface_fit_degraded_after_repair before=$surface_fit_degraded_before after=$surface_fit_degraded_after fit_tol=$surface_fit_degraded_tol ratio=$surface_fit_degraded_ratio limit=$repair_fit_degrade_ratio chord_before=$surface_fit_degraded_chord_before chord_after=$surface_fit_degraded_chord_after chord_threshold=$surface_chord_dev_threshold action=keep_surface_no_tetra shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report keep_repaired_surface_mesh=1"',
-        '        puts "MCP_CONSOLE solid=$target_solid stage=3d_skip reason=surface_fit_degraded shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report fit_before=$surface_fit_degraded_before fit_after=$surface_fit_degraded_after fit_tol=$surface_fit_degraded_tol fit_ratio=$surface_fit_degraded_ratio chord_before=$surface_fit_degraded_chord_before chord_after=$surface_fit_degraded_chord_after chord_threshold=$surface_chord_dev_threshold"',
+        '        puts "MCP_PT_STOP solid=$target_solid surface_fit_degraded_after_repair reason=$surface_fit_degraded_reason bbox_before=$surface_fit_degraded_before bbox_after=$surface_fit_degraded_after fit_tol=$surface_fit_degraded_tol ratio=$surface_fit_degraded_ratio limit=$repair_fit_degrade_ratio chord_max_before=$surface_fit_degraded_chord_before chord_max_after=$surface_fit_degraded_chord_after chord_delta=$surface_fit_degraded_chord_delta chord_delta_limit=$surface_chord_dev_degrade_delta action=keep_surface_no_tetra shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report keep_repaired_surface_mesh=1"',
+        '        puts "MCP_CONSOLE solid=$target_solid stage=3d_skip reason=surface_fit_degraded degrade_reason=$surface_fit_degraded_reason shell_count=$shell_count final_aspect_bad=$unfixed_aspect_report bbox_before=$surface_fit_degraded_before bbox_after=$surface_fit_degraded_after chord_max_before=$surface_fit_degraded_chord_before chord_max_after=$surface_fit_degraded_chord_after chord_delta=$surface_fit_degraded_chord_delta chord_delta_limit=$surface_chord_dev_degrade_delta"',
         '        set kept_surface_shell_count $shell_count',
         '        set ok 0',
         '        break',
@@ -3688,26 +3728,27 @@ def generate_batched_plain_tetra_tcl(
     checkpoint_every_n_solids: int = 0,
     checkpoint_hm_path: str | None = None,
     default_element_size: float = 1.5,
-    default_min_element_size: float = 0.5,
-    max_deviation: float = 0.05,
-    feature_angle: float = 15,
+    default_min_element_size: float = 0.6,
+    max_deviation: float = 0.1,
+    feature_angle: float = 30,
     growth_rate: float = 1.23,
     fit_tolerance_ratio: float = 0.01,
     target_vol_skew: float = 0.70,
     repair_vol_skew: float = 0.99,
+    chord_dev_degrade_delta: float = 0.20,
     element_size_min: float = 1.5,
     element_size_max: float = 2.0,
-    min_element_size_min: float = 0.20,
-    min_element_size_max: float = 0.50,
+    min_element_size_min: float = 0.4,
+    min_element_size_max: float = 0.6,
     delete_existing_component_elements: bool = True,
     use_gear_tooth_refinement: bool = True,
-    gear_tooth_element_size: float | None = None,
-    gear_tooth_element_size_min: float | None = None,
-    gear_tooth_element_size_max: float | None = None,
-    gear_tooth_min_element_size: float | None = None,
-    gear_tooth_min_element_size_min: float | None = None,
-    gear_tooth_min_element_size_max: float | None = None,
-    gear_tooth_feature_angle: float | None = None,
+    gear_tooth_element_size: float | None = 1.6,
+    gear_tooth_element_size_min: float | None = 1.2,
+    gear_tooth_element_size_max: float | None = 1.6,
+    gear_tooth_min_element_size: float | None = 0.3,
+    gear_tooth_min_element_size_min: float | None = 0.2,
+    gear_tooth_min_element_size_max: float | None = 0.3,
+    gear_tooth_feature_angle: float | None = 15.0,
 ) -> dict[str, Any]:
     """Generate one compact Tcl script for a small batch of plain tetra solids."""
     if not solids:
@@ -3722,6 +3763,8 @@ def generate_batched_plain_tetra_tcl(
         raise ValueError("default_element_size must be > 0.")
     if default_min_element_size <= 0:
         raise ValueError("default_min_element_size must be > 0.")
+    if chord_dev_degrade_delta < 0:
+        raise ValueError("chord_dev_degrade_delta must be >= 0.")
 
     max_timeout = 300
     body_lines: list[str] = [
@@ -3778,6 +3821,7 @@ def generate_batched_plain_tetra_tcl(
             fit_tolerance_ratio=fit_tolerance_ratio,
             target_vol_skew=target_vol_skew,
             repair_vol_skew=repair_vol_skew,
+            chord_dev_degrade_delta=chord_dev_degrade_delta,
             element_size_min=element_size_min,
             element_size_max=element_size_max,
             min_element_size_min=min_element_size_min,
@@ -3795,7 +3839,15 @@ def generate_batched_plain_tetra_tcl(
         )
         one_lines = _unwrap_generated_tcl(script_obj["script"]).splitlines()
         proc_start = next((i for i, line in enumerate(one_lines) if line.startswith("proc mcp_all_elems")), None)
-        exec_start = next((i for i, line in enumerate(one_lines) if line.startswith('*currentcollector components')), None)
+        exec_start = next(
+            (
+                i
+                for i, line in enumerate(one_lines)
+                if line.startswith('*currentcollector components')
+                or line.startswith('if {![mcp_set_current_component $target_component')
+            ),
+            None,
+        )
         if proc_start is None or exec_start is None:
             raise RuntimeError("Could not compact generated tetra script.")
         if index == 0:
@@ -3924,11 +3976,11 @@ def write_gear_tooth_recognition_report(
 @mcp.tool()
 def generate_gear_tooth_preview_tcl(
     classification_results: dict[str, Any] | None = None,
-    element_size: float = 1.05,
-    min_element_size: float = 0.35,
-    max_deviation: float = 0.05,
-    feature_angle: float = 10.5,
-    growth_rate: float = 1.2,
+    element_size: float = 1.6,
+    min_element_size: float = 0.3,
+    max_deviation: float = 0.1,
+    feature_angle: float = 15.0,
+    growth_rate: float = 1.23,
     component_name: str = GEAR_TOOTH_PREVIEW_COMPONENT,
     delete_existing_preview: bool = True,
 ) -> dict[str, Any]:
@@ -4649,8 +4701,8 @@ def generate_cutsection_spin_hex_tcl(
     spin_axis: str = "x",
     spin_axis_point: list[float] | None = None,
     element_size: float = 0.7,
-    density: int = 240,
-    density_min: int = 12,
+    density: int = 160,
+    density_min: int = 60,
     density_max: int | None = None,
     section_element_size_min: float = 0.2,
     section_element_size_max: float = 1.5,
@@ -4792,6 +4844,19 @@ def generate_cutsection_spin_hex_tcl(
         "    eval *createmark elems 1 $elems",
         "    catch {*deletemark elems 1}",
         "}",
+        "proc mcp_ensure_component {comp color} {",
+        "    if {[catch {hm_entityinfo exist comps $comp -byname} exists]} {set exists 0}",
+        "    if {!$exists} {catch {*createentity comps name=$comp color=$color}}",
+        "    return $comp",
+        "}",
+        "proc mcp_set_current_component {comp color} {",
+        "    mcp_ensure_component $comp $color",
+        "    if {[catch {*currentcollector components \"$comp\"} err]} {",
+        "        puts \"MCP_SPIN_WARN currentcollector_failed component=$comp error=$err\"",
+        "        return 0",
+        "    }",
+        "    return 1",
+        "}",
         "proc mcp_hex8_count {elems} {",
         "    set hexes 0",
         "    foreach eid $elems {",
@@ -4868,6 +4933,7 @@ def generate_cutsection_spin_hex_tcl(
         "    set area_est [expr {$minor * $major}]",
         "    set min_shells [expr {int(ceil($area_est / max($chosen*$chosen*4.0, 1.0e-9)))}]",
         "    if {$min_shells < 2} {set min_shells 2}",
+        "    if {$minor <= 3.0 && $major <= 6.0 && $min_shells > 4} {set min_shells 4}",
         "    if {$min_shells > 80} {set min_shells 80}",
         "    return [list $chosen $minor $major $diag $min_shells]",
         "}",
@@ -4962,7 +5028,7 @@ def generate_cutsection_spin_hex_tcl(
         "    return {}",
         "}",
         'catch {*beginhistorystate "MCP cut-section spin hex"}',
-        '*currentcollector components "$target_component"',
+        'if {![mcp_set_current_component $target_component 7]} { puts "MCP_PT_FAIL solid=$target_solid currentcollector_failed component=$target_component"; return }',
         "set ::mcp_section_size_factors $section_size_factors",
         "set ::mcp_section_size_min $section_size_min",
         "set ::mcp_section_size_max $section_size_max",
@@ -5585,6 +5651,7 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
             ("tetra_feature_angle", "tetra 特征角"),
             ("tetra_growth_rate", "tetra 增长率"),
             ("tetra_fit_tolerance_ratio", "tetra 贴合容差比例"),
+            ("tetra_chord_dev_degrade_delta", "最大 chord dev 下降值"),
             ("tetra_target_vol_skew", "tetra 生成目标 vol skew"),
             ("tetra_repair_vol_skew", "tetra 修复后 vol skew 上限"),
             ("use_gear_tooth_refinement", "启用齿面加厚/加密模型"),
@@ -5678,6 +5745,7 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     f"feature_angle={item.get('feature_angle', '未记录')}, "
                     f"growth_rate={item.get('growth_rate', '未记录')}, "
                     f"fit_tolerance_ratio={item.get('fit_tolerance_ratio', '未记录')}, "
+                    f"chord_dev_degrade_delta={item.get('chord_dev_degrade_delta', '未记录')}, "
                     f"target_vol_skew={item.get('target_vol_skew', '未记录')}, "
                     f"repair_vol_skew={item.get('repair_vol_skew', '未记录')}"
                 )
@@ -5890,18 +5958,23 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                     "  - 结果：2D 修复后贴合度明显下降，已追加一次不含 replace_nodes 的保守修复；"
                     "仍不满足贴合度要求，未进入 3D tetra。"
                 )
-                lines.append(
-                    f"  - 贴合度：before={info.get('surface_fit_before', 0)}, "
-                    f"after={info.get('surface_fit_after', 0)}, "
-                    f"tol={info.get('surface_fit_tolerance', 0)}, "
-                    f"ratio={info.get('surface_fit_ratio', 0)}, "
-                    f"limit={info.get('surface_fit_ratio_limit', 0)}, "
-                    f"chord_dev={_mcp_fmt_int(info.get('surface_chord_dev_before_bad', 0))}"
-                    f"->{_mcp_fmt_int(info.get('surface_chord_dev_after_bad', 0))}, "
-                    f"chord_threshold={info.get('surface_chord_dev_threshold', TETRA_SURFACE_CHORD_DEV)}, "
-                    f"shell_count={_mcp_fmt_int(info.get('surface_fit_shell_count', 0))}, "
+                reason = str(info.get("surface_fit_degrade_reason") or "")
+                detail = (
+                    f"  - 最大 chord dev：before={info.get('surface_chord_dev_max_before', 0)}, "
+                    f"after={info.get('surface_chord_dev_max_after', 0)}, "
+                    f"delta={info.get('surface_chord_dev_delta', 0)}, "
+                    f"limit={info.get('surface_chord_dev_delta_limit', 0)}"
+                )
+                if "bbox" in reason:
+                    detail += (
+                        f"，bbox_before={info.get('surface_fit_before', 0)}, "
+                        f"bbox_after={info.get('surface_fit_after', 0)}"
+                    )
+                detail += (
+                    f"，shell_count={_mcp_fmt_int(info.get('surface_fit_shell_count', 0))}, "
                     f"剩余 aspect 不合格={_mcp_fmt_int(info.get('final_bad', 0))}"
                 )
+                lines.append(detail)
             if int(info.get("surface_repair_timeout_keep_surface_mesh") or 0) > 0:
                 lines.append(
                     "  - 结果：2D 修复超过保护时间，未进入 3D tetra，已保留当前 2D 面网格。"

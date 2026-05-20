@@ -100,6 +100,7 @@ hypermesh_mcp_server.py
 run_full_meshing_workflow.py
 requirements.txt
 wheels\
+install_offline_dependencies.bat
 OFFLINE_WORKFLOW_SOP.md
 README.md
 codex_mcp_config.example.json
@@ -107,6 +108,39 @@ codex_mcp_config.example.json
 
 `runs` 和 `outputs` 不是源码，复制时可以带上，也可以不带。没有这两个文件夹时，
 脚本运行过程中会重新生成。
+
+### 关于 `install_offline_dependencies.bat` 和路径约定
+
+离线包里包含的 `install_offline_dependencies.bat` 是专门给其他电脑离线部署用的快捷安装脚本。
+它不是网格划分逻辑的一部分，也不会改变 MCP 的分类、划分或修复策略。
+
+这个 bat 的作用是：
+
+1. 自动定位当前 bat 所在的项目目录。
+2. 优先寻找 `py -3.12`，找不到时再尝试 `python`。
+3. 检查 `requirements.txt` 和 `wheels` 文件夹是否存在。
+4. 确认 Python 版本是 3.12。
+5. 执行离线安装：
+
+   ```powershell
+   python -m pip install --no-index --find-links wheels -r requirements.txt
+   ```
+
+6. 安装后自动验证 `import mcp` 是否成功。
+
+所以在另一台无网络电脑上，如果已经安装了 Python 3.12 64-bit，并且整个项目文件夹里带着
+`wheels`，可以直接双击 `install_offline_dependencies.bat` 来安装依赖。
+
+文档和脚本中出现的 `E:\mcp\hypermesh-mcp-server`、`D:\tools\hypermesh-mcp-server`
+这类路径，是为了在其他电脑离线部署时给出一个固定示例或推荐放置位置。实际使用时：
+
+- 如果目标电脑也放在 `E:\mcp\hypermesh-mcp-server`，可以直接照抄文档命令。
+- 如果目标电脑放在别的位置，只需要把 `cd ...`、HyperMesh 里 `source ".../launch_meshing_workflow_panel.tcl"`
+  这些入口路径改成目标电脑上的真实路径。
+- `install_offline_dependencies.bat` 本身使用 `%~dp0` 自动取 bat 所在目录，因此不要求项目必须放在
+  `E:\mcp\hypermesh-mcp-server`。
+- 只有在需要脚本自动启动 HyperMesh、使用批处理模式或配置 AI agent MCP 启动脚本时，才需要关心代码或配置里的
+  `hmbatch.exe`、`hw.exe` 等 HyperMesh 安装路径。
 
 ### 在无网络电脑上安装依赖（无网络电脑的python版本与有网络电脑一样则该步骤可跳过）
 

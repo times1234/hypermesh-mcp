@@ -1009,27 +1009,50 @@ def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[st
     batches: list[dict[str, Any]] = []
     current: list[int] = []
     current_score = 0.0
+    current_group = ""
     batch_index = 1
-    for item in sorted(tetra, key=lambda value: int(value.get("solid_id", 0))):
+
+    def batch_reason(group: str) -> str:
+        if group == "gear":
+            return "gear-aware tetra batch"
+        return "low/medium-risk tetra batch"
+
+    def item_group(item: dict[str, Any]) -> str:
+        return "gear" if item.get("strategy") == "gear_aware_tetra" else "tetra"
+
+    for item in sorted(tetra, key=lambda value: (0 if value.get("strategy") == "gear_aware_tetra" else 1, int(value.get("solid_id", 0)))):
         sid = int(item.get("solid_id", 0))
         sc = int(item.get("surf_count", 0))
         score = risk_score(item)
+        group = item_group(item)
         high_risk = sc >= TETRA_VERY_COMPLEX_SURFACE_COUNT or score >= 20000
+        if current and group != current_group:
+            batches.append({
+                "batch": batch_index,
+                "solid_ids": current,
+                "reason": batch_reason(current_group),
+                "pause_seconds_after_batch": 5,
+            })
+            batch_index += 1
+            current = []
+            current_score = 0.0
+            current_group = ""
         if high_risk:
             if current:
                 batches.append({
                     "batch": batch_index,
                     "solid_ids": current,
-                    "reason": "low/medium-risk tetra batch",
+                    "reason": batch_reason(current_group),
                     "pause_seconds_after_batch": 5,
                 })
                 batch_index += 1
                 current = []
                 current_score = 0.0
+                current_group = ""
             batches.append({
                 "batch": batch_index,
                 "solid_ids": [sid],
-                "reason": "high-risk tetra solid; run alone, then save/cool down before the next tetra batch",
+                "reason": f"high-risk {batch_reason(group)}; run alone, then save/cool down before the next tetra batch",
                 "pause_seconds_after_batch": 10,
             })
             batch_index += 1
@@ -1038,19 +1061,21 @@ def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[st
             batches.append({
                 "batch": batch_index,
                 "solid_ids": current,
-                "reason": "low/medium-risk tetra batch",
+                "reason": batch_reason(current_group),
                 "pause_seconds_after_batch": 5,
             })
             batch_index += 1
             current = []
             current_score = 0.0
+            current_group = ""
         current.append(sid)
         current_score += score
+        current_group = group
     if current:
         batches.append({
             "batch": batch_index,
             "solid_ids": current,
-            "reason": "low/medium-risk tetra batch",
+            "reason": batch_reason(current_group),
             "pause_seconds_after_batch": 5,
         })
     return batches
@@ -3278,22 +3303,22 @@ def generate_plain_tetra_tcl(
         '    puts "MCP_PT_SURFACE_ATTEMPT solid=$target_solid attempt=$at size=$cs min=$mn_size max=$max_size growth=$effective_growth max_to_min_ratio=$surface_max_to_min_ratio gear_tooth_surfaces=[llength $gear_tooth_surfs] gear_size=$tooth_cs gear_min=$tooth_mn_size gear_max=$tooth_max_size gear_feat_angle=$gear_tooth_feat_angle"',
         '    set surface_mesh_failed 0',
         '    set surface_mesh_error ""',
-        '    if {[llength $body_surfs] > 0} {',
-        '        eval *createmark surfaces 1 $body_surfs',
-        '        *createarray 3 0 0 0',
-        '        if {[catch {*defaultmeshsurf_growth 1 $cs 3 3 2 1 1 1 35 0 $mn_size $max_size $max_dev $feat_angle $effective_growth 1 3 1 0} surf_err]} {',
-        '            set surface_mesh_failed 1',
-        '            set surface_mesh_error $surf_err',
-        '        } else {',
-        '            catch {*storemeshtodatabase 1}',
-        '        }',
-        '    }',
-        '    if {!$surface_mesh_failed && [llength $gear_tooth_surfs] > 0} {',
+        '    if {[llength $gear_tooth_surfs] > 0} {',
         '        eval *createmark surfaces 1 $gear_tooth_surfs',
         '        *createarray 3 0 0 0',
         '        if {[catch {*defaultmeshsurf_growth 1 $tooth_cs 3 3 2 1 1 1 35 0 $tooth_mn_size $tooth_max_size $max_dev $gear_tooth_feat_angle $effective_growth 1 3 1 0} tooth_err]} {',
         '            set surface_mesh_failed 1',
         '            set surface_mesh_error $tooth_err',
+        '        } else {',
+        '            catch {*storemeshtodatabase 1}',
+        '        }',
+        '    }',
+        '    if {!$surface_mesh_failed && [llength $body_surfs] > 0} {',
+        '        eval *createmark surfaces 1 $body_surfs',
+        '        *createarray 3 0 0 0',
+        '        if {[catch {*defaultmeshsurf_growth 1 $cs 3 3 2 1 1 1 35 0 $mn_size $max_size $max_dev $feat_angle $effective_growth 1 3 1 0} surf_err]} {',
+        '            set surface_mesh_failed 1',
+        '            set surface_mesh_error $surf_err',
         '        } else {',
         '            catch {*storemeshtodatabase 1}',
         '        }',

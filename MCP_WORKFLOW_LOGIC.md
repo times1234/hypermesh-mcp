@@ -214,9 +214,10 @@ Phase 3 是实际生成网格的阶段。顺序通常是：
 
 1. `drag_hex`
 2. `spin_hex`
-3. `tetra_plain` 和 `gear_aware_tetra`
+3. `gear_aware_tetra`
+4. `tetra_plain`
 
-drag 或 spin 失败的实体会回退到 tetra。
+drag 或 spin 失败的实体会回退到 tetra。tetra 队列中齿轮会优先成批执行；高风险实体仍会单独成批以降低 HyperMesh 崩溃风险。
 
 ### 4.0 尺寸计算公式总览
 
@@ -470,8 +471,8 @@ tetra 的默认表面网格参数来自离线弹窗或 CLI：
 
 1. Phase 1 识别齿面 surface。
 2. Phase 2 把实体分类为 `gear_aware_tetra`。
-3. Phase 3 对齿面和非齿面使用不同 2D 网格尺寸。
-4. 齿面尺寸默认比普通 tetra 小约 30%。
+3. Phase 3 在同一个实体内先划齿面 surface，再划非齿面 surface。
+4. 齿面和非齿面使用不同 2D 网格尺寸。
 5. 离线弹窗中可以单独设置：
    - 齿面 tetra 尺寸范围。
    - 齿面 tetra 最小尺寸范围。

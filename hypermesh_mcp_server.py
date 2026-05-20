@@ -941,6 +941,23 @@ def _gear_reason_from_probe(facts: dict[str, Any]) -> str | None:
     if src_surf > 0 and 100 <= sc <= 170 and tooth_count >= min_repeated_tooth_faces and md_mx >= 0.95 and 0.38 <= mn_mx <= 0.46 and src_inner_loops == 1 and src_boundary_nodes >= 150:
         return "gear compact sun: single dense repeated boundary body"
 
+    # Some bearing/cam-like thin circular parts expose one very dense source
+    # loop, but their repeated faces do not form a sufficiently dense tooth
+    # band. Real small gears in this size class have boundary-node/surface-count
+    # ratios near 1.0, while these false positives are much higher.
+    boundary_surface_density = src_boundary_nodes / max(sc, 1)
+    if (
+        src_surf > 0
+        and src_inner_loops == 1
+        and 120 <= sc <= 179
+        and 0.20 <= mn_mx <= 0.32
+        and md_mx >= 0.95
+        and src_boundary_nodes >= 240
+        and boundary_surface_density >= 1.45
+        and tooth_density < 0.70
+    ):
+        return None
+
     # Compact circular bodies are gear-like only when the tooth-band probe
     # already sees a dense repeated band. A plain circular plate with many holes
     # can otherwise look deceptively similar by bbox and surface count.

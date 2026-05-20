@@ -1536,6 +1536,7 @@ proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
         set radial_span [expr {$rmax - $rmin}]
         set radial_span_ratio [expr {$radial_span / $solid_rmax}]
         set center_nom_ratio [expr {$center_radius / $solid_rnom}]
+        set inner_nom_ratio [expr {$rmin / $solid_rnom}]
         set outer_nom_ratio [expr {$rmax / $solid_rnom}]
         set radial_span_nom_ratio [expr {$radial_span / $solid_rnom}]
         set surf_axis_span [expr {abs([lindex $sbb $ax_max] - [lindex $sbb $ax_min])}]
@@ -1559,8 +1560,8 @@ proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
             set high_count_external_tooth [expr {$center_ratio >= 0.66 && $outer_ratio >= 0.70 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.10 && $angle_span <= 16.0 && $radial_span_ratio <= 0.12}]
             set high_count_external_side [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.70 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.06 && $angle_span <= 10.0 && $radial_span_ratio >= 0.006 && $radial_span_ratio <= 0.08}]
             set high_count_radial_flank [expr {$axis_len > $max_radial_span * 0.18 && $center_ratio >= 0.62 && $outer_ratio >= 0.78 && $axis_ratio >= 0.08 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.18 && $angle_span <= 14.0 && $radial_span_ratio >= 0.08 && $radial_span_ratio <= 0.55}]
-            set high_count_nominal_outer_tip [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.78 && $outer_nom_ratio >= 0.92 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.30 && $angle_span <= 34.0 && $radial_span_nom_ratio <= 0.34}]
-            set high_count_nominal_outer_flank [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.64 && $outer_nom_ratio >= 0.90 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.48 && $angle_span <= 82.0 && $radial_span_nom_ratio >= 0.04 && $radial_span_nom_ratio <= 0.98}]
+            set high_count_nominal_outer_tip [expr {$axis_len > $max_radial_span * 0.18 && $center_ratio >= 0.62 && $center_nom_ratio >= 0.78 && $outer_nom_ratio >= 0.92 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.30 && $angle_span <= 34.0 && $radial_span_nom_ratio <= 0.34}]
+            set high_count_nominal_outer_flank [expr {$axis_len > $max_radial_span * 0.18 && $center_ratio >= 0.62 && $center_nom_ratio >= 0.64 && $inner_nom_ratio >= 0.62 && $outer_nom_ratio >= 0.90 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.48 && $angle_span <= 82.0 && $radial_span_nom_ratio >= 0.04 && $radial_span_nom_ratio <= 0.98}]
             set high_count_nominal_outer_axial_side [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.88 && $outer_nom_ratio >= 0.98 && $axis_ratio >= 0.015 && $axis_ratio <= 0.05 && $local_span_ratio <= 0.12 && $angle_span <= 14.0 && $radial_span_nom_ratio >= 0.10 && $radial_span_nom_ratio <= 0.22}]
             if {$high_count_external_tooth || $high_count_external_side || $high_count_radial_flank || $high_count_nominal_outer_tip || $high_count_nominal_outer_flank || $high_count_nominal_outer_axial_side} {
                 lappend candidates $surf_id
@@ -2330,6 +2331,7 @@ def generate_geometry_probe_tcl(
         "        set radial_span [expr {$rmax - $rmin}]",
         "        set radial_span_ratio [expr {$radial_span / $solid_rmax}]",
         "        set center_nom_ratio [expr {$center_radius / $solid_rnom}]",
+        "        set inner_nom_ratio [expr {$rmin / $solid_rnom}]",
         "        set outer_nom_ratio [expr {$rmax / $solid_rnom}]",
         "        set radial_span_nom_ratio [expr {$radial_span / $solid_rnom}]",
         "        set surf_axis_span [expr {abs([lindex $sbb $ax_max] - [lindex $sbb $ax_min])}]",
@@ -2349,8 +2351,8 @@ def generate_geometry_probe_tcl(
         "            set high_count_external_tooth [expr {$center_ratio >= 0.66 && $outer_ratio >= 0.70 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.10 && $angle_span <= 16.0 && $radial_span_ratio <= 0.12}]",
         "            set high_count_external_side [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.70 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.06 && $angle_span <= 10.0 && $radial_span_ratio >= 0.006 && $radial_span_ratio <= 0.08}]",
         "            set high_count_radial_flank [expr {$axis_len > $max_radial_span * 0.18 && $center_ratio >= 0.62 && $outer_ratio >= 0.78 && $axis_ratio >= 0.08 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.18 && $angle_span <= 14.0 && $radial_span_ratio >= 0.08 && $radial_span_ratio <= 0.55}]",
-        "            set high_count_nominal_outer_tip [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.78 && $outer_nom_ratio >= 0.92 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.30 && $angle_span <= 34.0 && $radial_span_nom_ratio <= 0.34}]",
-        "            set high_count_nominal_outer_flank [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.64 && $outer_nom_ratio >= 0.90 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.48 && $angle_span <= 82.0 && $radial_span_nom_ratio >= 0.04 && $radial_span_nom_ratio <= 0.98}]",
+        "            set high_count_nominal_outer_tip [expr {$axis_len > $max_radial_span * 0.18 && $center_ratio >= 0.62 && $center_nom_ratio >= 0.78 && $outer_nom_ratio >= 0.92 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.30 && $angle_span <= 34.0 && $radial_span_nom_ratio <= 0.34}]",
+        "            set high_count_nominal_outer_flank [expr {$axis_len > $max_radial_span * 0.18 && $center_ratio >= 0.62 && $center_nom_ratio >= 0.64 && $inner_nom_ratio >= 0.62 && $outer_nom_ratio >= 0.90 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.48 && $angle_span <= 82.0 && $radial_span_nom_ratio >= 0.04 && $radial_span_nom_ratio <= 0.98}]",
         "            set high_count_nominal_outer_axial_side [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.88 && $outer_nom_ratio >= 0.98 && $axis_ratio >= 0.015 && $axis_ratio <= 0.05 && $local_span_ratio <= 0.12 && $angle_span <= 14.0 && $radial_span_nom_ratio >= 0.10 && $radial_span_nom_ratio <= 0.22}]",
         "            if {$high_count_external_tooth || $high_count_external_side || $high_count_radial_flank || $high_count_nominal_outer_tip || $high_count_nominal_outer_flank || $high_count_nominal_outer_axial_side} {",
         "                lappend candidates $surf_id",

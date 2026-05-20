@@ -2,6 +2,9 @@
 
 Local MCP server for driving Altair HyperMesh with generated Tcl scripts.
 
+This README is agent-facing. Treat it as the current operating contract before
+calling tools, generating Tcl, or editing the workflow.
+
 The MCP is intentionally geometry-rule based. It does not assign mesh strategies
 by hard-coded component names from one model.
 
@@ -49,24 +52,28 @@ their `MCP_SCRIPT_BEGIN` / `MCP_SCRIPT_END` markers are intact. For example,
   surface-deviation R-trias, 2D fit/quality checks, tetra generation, and
   volume-quality repair.
 - `generate_guarded_drag_hex_tcl`: generate guarded drag-hex Tcl.
-- `generate_guarded_spin_hex_tcl`: generate guarded spin-hex Tcl for a known true section.
 - `get_cutsection_spin_workflow`: explain the generic cut-section spin workflow.
 - `generate_cutsection_spin_hex_tcl`: generate cut-section spin Tcl for stepped or recessed revolved solids.
 
 ## Generic Strategy Rules
 
 Use `classify_all_solids_from_probe` and geometry facts, not component names.
-The intended order is:
+The automatic workflow is probe-driven and uses this conceptual order:
 
-1. Try the structured hex route that matches the geometry: drag, spin, or
-   cut-section spin.
-2. Validate that real 3D hex elements were created. A leftover 2D section mesh
-   by itself is a failure.
-3. If the hex route fails, clean up temporary/invalid elements and mesh that
-   object with tetra.
-4. For bearing/ring-like revolved bodies, do not stop after direct spin fails.
-   Use a real cut plane through the rotation axis, mesh the true radial section,
-   and spin that section before the explicit tetra phase.
+1. Probe all solids with temporary coarse surface mesh.
+2. Classify by geometry facts: `gear_aware_tetra`, `drag_hex`, `spin_hex`,
+   or `tetra_plain`.
+3. Execute mandatory Phase 2 rename/color finalization before meshing.
+4. Mesh drag solids first.
+5. Mesh spin solids through the real cut-section workflow only.
+6. Promote failed drag/spin solids to the explicit tetra phase.
+7. Mesh tetra and gear-aware tetra solids in guarded batches.
+8. Save once at the end and write reports/diagnostics.
+
+Do not resurrect direct source-surface spin. Current `spin_hex` means:
+split through the rotation axis, detect newly created cut-section surfaces,
+mesh one true section, and spin that section. If no new cut-section surface is
+created or no valid 3D hex mesh results, the solid falls back to tetra.
 
 ### Tetra
 
@@ -79,16 +86,19 @@ Use `tetra_surface_deviation_rtrias` for:
 Required checks:
 
 - create 2D surface-deviation R-trias mesh first
-- keep the nominal `element_size`; for high-face-count solids, reduce
-  `min_element_size` to capture small faces/features instead of coarsening the
-  part
-- clean/check 2D aspect issues
-- continue to `*tetmesh` even for complex solids, while logging shell-count
-  guard warnings for crash diagnosis
-- run high-risk tetra solids in isolated Phase 3 batches rather than stopping
-  them or making them coarser
-- tetramesh per component/object
-- check and locally repair/report volume quality
+- keep target size inside `element_size_min..element_size_max`
+- keep min size inside `min_element_size_min..min_element_size_max`
+- use HyperMesh native `*elementtestaspect` for 2D aspect checks, with coordinate
+  fallback only if the native command fails
+- use HyperMesh native `*elementtestchordaldeviation` for chordal deviation
+- repair 2D before tetra, but skip high-risk repair modes when the shell mesh
+  looks like overlap/broken geometry
+- do not enter tetra when the repaired 2D mesh exceeds crash guards, contains
+  extreme aspect, or fit/chordal deviation degraded badly
+- copy repaired 2D shells to a temporary backup component before tetra
+- call tetmesh without updating the shell input
+- if 3D quality still fails after repair, delete tetra and restore/keep the
+  repaired 2D shell mesh
 
 ### Phase 2 Finalization
 
@@ -153,33 +163,16 @@ applied.
 
 ### Spin Hex
 
-Use guarded spin only when the selected source surface is already known to be a
-true cross-section of a clean revolved solid.
-
-Preconditions:
-
-- source section is a real cross-section
-- source section meshes as 100% quads
-- spin result contains hex elements only
-
-Pass `solid_id` when possible so the generated mesh can be checked against the
-target solid. Failed fit/non-hex results are cleaned, retried once with the same
-element size, then sent to tetra fallback when enabled.
-
-If the solid is stepped, recessed, grooved, or the source section is ambiguous,
-use cut-section spin instead.
-
-### Cut-Section Spin Hex
-
-Use `generate_cutsection_spin_hex_tcl` for stepped/recessed/ambiguous revolved
-solids.
+Use `generate_cutsection_spin_hex_tcl` for all current spin work. There is no
+separate supported direct-spin entry point in the workflow.
 
 Workflow:
 
 1. Split the actual solid with `*body_splitmerge_with_plane` using a middle plane.
 2. Detect newly created surfaces from the split.
 3. Temporarily mesh each new surface.
-4. Accept only all-quad surfaces whose shell nodes lie on the split plane.
+4. Accept a real section when enough shell nodes lie on the split plane. Mixed
+   section meshes are allowed; the section is not required to be 100% quads.
 5. Spin the accepted 2D section shells into 3D hex elements.
 6. Delete only the temporary 2D seed shells.
 
@@ -190,7 +183,7 @@ Required inputs:
 - split plane normal and point
 - spin axis and a point on the spin axis; this is required and must be on the
   real rotation axis, not merely any point on the split plane
-- element size and spin density
+- requested section element size, spin density min, and spin density max
 
 The split plane must contain the spin axis. In practical terms, the split plane
 normal should be nearly perpendicular to the spin axis. If the cut plane is
@@ -198,36 +191,40 @@ perpendicular to the axis and creates an annular transverse section, that is a
 drag-style source section for a constant-section body, not a spin section.
 
 The generator validates the spin result. If no valid 3D hex8 elements are
-created, it deletes temporary section/invalid elements and retries once with the
-same requested element size. It does not shrink/refine the hex mesh for the
-retry. If the second attempt still fails, the explicit tetra phase handles the
-solid.
-
-The cut-section generator also considers existing section surfaces on the target
-solid after a split. This helps when a model has already been split or when
-HyperMesh does not create new surface IDs. If mapped quads fail, it can try a
-quad-only section mesh mode with the same element size before stopping for the explicit tetra phase.
+created, it deletes temporary section/invalid elements and retries up to the
+configured retry count. If it still fails, the explicit tetra phase handles the
+solid. It no longer considers existing pre-split solid surfaces as spin section
+candidates; no new cut-section surface means tetra fallback.
 
 ### Gear-Aware Tetra
 
 Use `classify_all_solids_from_probe` from geometry facts only. Do not classify
 gear regions from component names, file names, or natural-language labels.
-Set one or more of these when geometry inspection shows a gear-like region:
-`has_gear_teeth`, `has_helical_teeth`, `has_twisted_tooth_faces`,
-`has_many_repeated_radial_teeth`, `has_periodic_outer_radius_variation`,
-`has_outer_tooth_band`, `has_repeated_tooth_flanks`, `tooth_count`, or
-`outer_radius_variation_ratio`.
+
+Gear recognition is based on repeated connected tooth-like faces around a
+shared axis. The repeated faces must be numerous, adjacent, curved/flat/oblique
+in a gear-like pattern, and arranged as a ring. This rejects housings, covers,
+hole arrays, ribs, and cylindrical bands that merely contain repeated features.
+
+When `use_gear_tooth_refinement` is enabled, gear solids become
+`gear_aware_tetra`. Tooth surfaces are meshed with smaller target/min sizes and
+a smaller feature angle. When disabled, the same solids fall back to normal
+tetra behavior.
+
+The workflow can also run tooth-preview mode: rename/color first, mesh only the
+recognized tooth surfaces into the preview component, and stop. Use the delete
+preview action to remove those tooth preview elements after inspection.
 
 ## Known Limitations
 
-- Some bearing/ring solids still need the explicit tetra phase even though a human can see
-  they should be sweepable by cutting a radial section and spinning it. The
-  current `generate_cutsection_spin_hex_tcl` requires HyperMesh to expose a
-  usable all-quad true section after `*body_splitmerge_with_plane`; on some
-  recessed bearing geometry it only produces invalid/non-quad sections, so the
-  guarded workflow correctly stops before tetra. Future work: add a more robust
-  profile extraction path that derives ordered radial profile loops from solid
-  edges instead of relying only on newly split surfaces.
+- Some revolved bodies still fall back to tetra if HyperMesh cannot create a
+  usable new cut-section surface after `*body_splitmerge_with_plane`.
+- Tooth recognition is intentionally conservative. If a new gear family is
+  missed, inspect `runs/gear_tooth_recognition_<timestamp>.txt` before changing
+  thresholds.
+- For broken surfaces or overlapping 2D shell meshes, repair may stop early and
+  keep repaired 2D instead of entering tetra. This is intentional crash
+  prevention.
 
 ## Quality Policy
 
@@ -236,12 +233,14 @@ Do not blindly refine the whole mesh to fix quality.
 Preferred order:
 
 1. Change strategy if the topology is wrong.
-2. Try local 3D smooth/remesh.
-3. Try sliver repair where applicable.
-4. If bad volume elements remain, keep them and report their IDs.
+2. Repair 2D with guarded steps and timeout checks.
+3. Enter tetra only after 2D crash guards pass.
+4. Try local 3D smooth/remesh.
+5. If bad volume elements remain, delete tetra and keep the repaired 2D shell
+   mesh for that solid.
 
-Do not automatically delete unfixable quality-failed volume elements unless the
-user explicitly asks.
+Do not automatically keep unfixable bad 3D volume elements as final output
+unless the user explicitly asks.
 
 ## Configuration Example
 
@@ -284,14 +283,41 @@ python run_full_meshing_workflow.py `
   --tetra-timeout 1800
 ```
 
+Current important workflow switches:
+
+- `--use-gear-tooth-refinement` is the default. Gear solids become
+  `gear_aware_tetra`; recognized tooth surfaces use local smaller tetra
+  settings.
+- `--no-gear-tooth-refinement` keeps gear-like solids on the ordinary tetra
+  path.
+- `--gear-tooth-preview-only` runs probe, classification, Phase 2 rename/color,
+  then meshes only recognized tooth surfaces for visual checking.
+- `--delete-gear-tooth-preview` deletes the temporary tooth-preview mesh.
+- `--gear-tooth-element-size-min/max`,
+  `--gear-tooth-min-element-size-min/max`, and
+  `--gear-tooth-feature-angle` control tooth-local sizing. Defaults are fixed
+  `1.05`, fixed `0.35`, and `10.5`, which are 30% smaller than the ordinary
+  tetra defaults.
+- `--spin-section-element-size-min/max` controls the cut-section 2D mesh size
+  used before spin.
+- `--drag-aspect-guard` enables the drag minimum-three-layer/aspect guard from
+  the command line. The offline panel enables the same `drag三层` behavior by
+  default.
+
+The offline panel in `launch_meshing_workflow_panel.tcl` exposes the same
+current switches, including gear refinement, tooth preview/delete, tooth sizing,
+spin section sizing, and drag three-layer guarding.
+
 The runner performs these steps:
 
 1. Probe all solids in the current GUI model.
 2. Classify solids from geometry facts.
 3. Execute Phase 2 rename/color finalization.
 4. Mesh drag-hex solids.
-5. Mesh tetra solids in generated batches through the async GUI path.
-6. Save once at the end and write JSON summaries into `runs/`.
+5. Mesh spin-hex solids through cut-section spin.
+6. Promote failed drag/spin solids to tetra.
+7. Mesh tetra and gear-aware tetra solids in generated batches through the async GUI path.
+8. Save once at the end and write reports/diagnostics into `runs/`.
 
 By default the runner records failed batches and continues so a full-model run
 can finish and be diagnosed afterward. Pass `--stop-on-error` to stop at the

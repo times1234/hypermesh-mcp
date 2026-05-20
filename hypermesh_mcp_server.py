@@ -961,9 +961,13 @@ def _gear_reason_from_probe(facts: dict[str, Any]) -> str | None:
 
     if src_surf <= 0 and sc >= 100 and tooth_count >= 40 and tooth_density >= 0.45 and md_mx >= 0.95 and 0.18 <= mn_mx <= 0.50:
         return "gear disk/body: circular envelope with dense repeated-tooth band"
+    if src_surf <= 0 and sc >= 400 and tooth_count >= 30 and tooth_density >= 0.06 and md_mx >= 0.95 and 0.18 <= mn_mx <= 0.50:
+        return "gear high-surface external ring: repeated tooth band on circular envelope"
     if src_surf <= 0 and sc >= 180 and tooth_count >= 40 and tooth_density >= 0.25 and md_mx >= 0.70 and mn_mx >= 0.70:
         return "gear rounded/chamfer body: compact envelope with repeated-tooth band"
-    if src_surf <= 0 and 50 <= sc <= 90 and mn_md >= 0.95 and 3.5 <= mx_md <= 5.0:
+    if src_surf <= 0 and 40 <= sc <= 90 and tooth_count >= 20 and tooth_density >= 0.45 and mn_md >= 0.85 and 2.5 <= mx_md <= 5.5:
+        return "gear shaft/end slender body: dense repeated tooth band"
+    if src_surf <= 0 and 80 <= sc <= 140 and tooth_count >= 20 and tooth_density >= 0.10 and mn_md >= 0.90 and 2.5 <= mx_md <= 5.5:
         return "gear shaft/tooth-related slender body: repeated-feature surface count with round cross-section"
     return None
 
@@ -1493,11 +1497,14 @@ proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
     set radial_roundness [expr {$min_radial_span / max($max_radial_span, 0.001)}]
     set solid_rmax [expr {sqrt($len1*$len1 + $len2*$len2) / 2.0}]
     if {$solid_rmax <= 0.001} {return {}}
+    set solid_rnom [expr {$max_radial_span / 2.0}]
+    if {$solid_rnom <= 0.001} {set solid_rnom $solid_rmax}
 
     *createmark surfaces 1 "by solids" $solid_id
     set all_surfs [hm_getmark surfaces 1]
     set high_count_gear [expr {[llength $all_surfs] >= 400}]
     set shaft_end_gear [expr {$axis_len > $max_radial_span * 2.5 && [llength $all_surfs] <= 120}]
+    set shaft_inline_gear [expr {$axis_len > $max_radial_span * 2.3 && $radial_roundness >= 0.80 && [llength $all_surfs] >= 80 && [llength $all_surfs] <= 160}]
     set compact_no_source_gear [expr {$axis_len > $max_radial_span * 1.30 && $axis_len <= $max_radial_span * 2.20 && $radial_roundness >= 0.85 && [llength $all_surfs] >= 40 && [llength $all_surfs] <= 90}]
     set small_loop_gear [expr {$axis_len <= $max_radial_span * 0.38 && [llength $all_surfs] >= 70 && [llength $all_surfs] <= 100}]
     set full_thickness_compact_gear [expr {$axis_len <= $max_radial_span * 0.46 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 300}]
@@ -1528,6 +1535,9 @@ proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
         set outer_ratio [expr {$rmax / $solid_rmax}]
         set radial_span [expr {$rmax - $rmin}]
         set radial_span_ratio [expr {$radial_span / $solid_rmax}]
+        set center_nom_ratio [expr {$center_radius / $solid_rnom}]
+        set outer_nom_ratio [expr {$rmax / $solid_rnom}]
+        set radial_span_nom_ratio [expr {$radial_span / $solid_rnom}]
         set surf_axis_span [expr {abs([lindex $sbb $ax_max] - [lindex $sbb $ax_min])}]
         set surf_r1_span [expr {abs([lindex $sbb $r1_max] - [lindex $sbb $r1_min])}]
         set surf_r2_span [expr {abs([lindex $sbb $r2_max] - [lindex $sbb $r2_min])}]
@@ -1545,13 +1555,24 @@ proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
             if {$center_ratio >= 0.60 && $outer_ratio >= 0.68 && $axis_ratio >= 0.55 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.14 && $angle_span <= 18.0} {
                 lappend candidates $surf_id
             }
+        } elseif {$high_count_gear && $axis_len <= $max_radial_span * 0.42 && $radial_roundness >= 0.85} {
+            set high_count_external_tooth [expr {$center_ratio >= 0.66 && $outer_ratio >= 0.70 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.10 && $angle_span <= 16.0 && $radial_span_ratio <= 0.12}]
+            set high_count_external_side [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.70 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.06 && $angle_span <= 10.0 && $radial_span_ratio >= 0.006 && $radial_span_ratio <= 0.08}]
+            set high_count_radial_flank [expr {$axis_len > $max_radial_span * 0.18 && $center_ratio >= 0.62 && $outer_ratio >= 0.78 && $axis_ratio >= 0.08 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.18 && $angle_span <= 14.0 && $radial_span_ratio >= 0.08 && $radial_span_ratio <= 0.55}]
+            set high_count_nominal_outer_tip [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.78 && $outer_nom_ratio >= 0.92 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.30 && $angle_span <= 34.0 && $radial_span_nom_ratio <= 0.34}]
+            set high_count_nominal_outer_flank [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.64 && $outer_nom_ratio >= 0.90 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.48 && $angle_span <= 82.0 && $radial_span_nom_ratio >= 0.04 && $radial_span_nom_ratio <= 0.98}]
+            set high_count_nominal_outer_axial_side [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.88 && $outer_nom_ratio >= 0.98 && $axis_ratio >= 0.015 && $axis_ratio <= 0.05 && $local_span_ratio <= 0.12 && $angle_span <= 14.0 && $radial_span_nom_ratio >= 0.10 && $radial_span_nom_ratio <= 0.22}]
+            if {$high_count_external_tooth || $high_count_external_side || $high_count_radial_flank || $high_count_nominal_outer_tip || $high_count_nominal_outer_flank || $high_count_nominal_outer_axial_side} {
+                lappend candidates $surf_id
+            }
         } elseif {$compact_thin_gear || $full_thickness_compact_gear} {
             set compact_full_span [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.66 && $axis_ratio >= 0.80 && $local_span_ratio <= 0.12 && $angle_span <= 10.0 && $radial_span_ratio >= 0.0}]
             set compact_flank_band [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.66 && $axis_ratio >= 0.35 && $axis_ratio <= 0.55 && $local_span_ratio <= 0.08 && $angle_span <= 8.0 && $radial_span_ratio >= 0.0}]
             set compact_full_tooth_band [expr {$full_thickness_compact_gear && $center_ratio >= 0.55 && $outer_ratio >= 0.60 && $axis_ratio >= 0.70 && $local_span_ratio <= 0.22 && $angle_span <= 26.0 && $radial_span_ratio >= 0.0}]
             set compact_thick_tooth_band [expr {$full_thickness_compact_gear && $axis_len > $max_radial_span * 0.36 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 170 && $center_ratio >= 0.50 && $outer_ratio >= 0.55 && $axis_ratio >= 0.65 && $local_span_ratio <= 0.30 && $angle_span <= 35.0 && $radial_span_ratio >= 0.0}]
             set compact_oblique_tooth_band [expr {$full_thickness_compact_gear && $axis_len > $max_radial_span * 0.36 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 170 && $radial_roundness >= 0.95 && $outer_ratio >= 0.45 && $axis_ratio >= 0.05 && $local_span_ratio <= 0.95 && $angle_span <= 125.0}]
-            if {$compact_full_span || $compact_flank_band || $compact_full_tooth_band || $compact_thick_tooth_band || $compact_oblique_tooth_band} {
+            set compact_high_count_tooth_band [expr {$high_count_gear && $center_ratio >= 0.55 && $outer_ratio >= 0.58 && $axis_ratio >= 0.12 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.45 && $angle_span <= 70.0 && $radial_span_ratio >= 0.0}]
+            if {$compact_full_span || $compact_flank_band || $compact_full_tooth_band || $compact_thick_tooth_band || $compact_oblique_tooth_band || $compact_high_count_tooth_band} {
                 lappend candidates $surf_id
             }
         } elseif {$compact_no_source_gear} {
@@ -1559,6 +1580,12 @@ proc mcp_gear_tooth_surfaces {solid_id gear_axis solid_bb} {
             set compact_no_source_root_flank [expr {$center_ratio >= 0.49 && $outer_ratio >= 0.52 && $axis_ratio >= 0.50 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.18 && $angle_span <= 22.0 && $radial_span_ratio >= 0.03}]
             set compact_no_source_tip_sliver [expr {$center_ratio >= 0.70 && $outer_ratio >= 0.70 && $axis_ratio >= 0.50 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.05 && $angle_span <= 6.0}]
             if {$compact_no_source_outer_flank || $compact_no_source_root_flank || $compact_no_source_tip_sliver} {
+                lappend candidates $surf_id
+            }
+        } elseif {$shaft_inline_gear} {
+            set shaft_inline_flank [expr {$center_ratio >= 0.32 && $outer_ratio >= 0.40 && $axis_ratio >= 0.035 && $axis_ratio <= 0.60 && $local_span_ratio <= 0.34 && $angle_span <= 55.0 && $radial_span_ratio >= 0.008}]
+            set shaft_inline_top_root [expr {$center_ratio >= 0.28 && $outer_ratio >= 0.36 && $axis_ratio >= 0.015 && $axis_ratio <= 0.80 && $local_span_ratio <= 0.55 && $angle_span <= 82.0 && $radial_span_ratio >= 0.0}]
+            if {$shaft_inline_flank || $shaft_inline_top_root} {
                 lappend candidates $surf_id
             }
         } elseif {$shaft_end_gear} {
@@ -2265,10 +2292,13 @@ def generate_geometry_probe_tcl(
         "    set radial_roundness [expr {$min_radial_span / max($max_radial_span, 0.001)}]",
         "    set solid_rmax [expr {sqrt($len1*$len1 + $len2*$len2) / 2.0}]",
         "    if {$solid_rmax <= 0.001} {return {}}",
+        "    set solid_rnom [expr {$max_radial_span / 2.0}]",
+        "    if {$solid_rnom <= 0.001} {set solid_rnom $solid_rmax}",
         "    *createmark surfaces 1 \"by solids\" $solid_id",
         "    set all_surfs [hm_getmark surfaces 1]",
         "    set high_count_gear [expr {[llength $all_surfs] >= 400}]",
         "    set shaft_end_gear [expr {$axis_len > $max_radial_span * 2.5 && [llength $all_surfs] <= 120}]",
+        "    set shaft_inline_gear [expr {$axis_len > $max_radial_span * 2.3 && $radial_roundness >= 0.80 && [llength $all_surfs] >= 80 && [llength $all_surfs] <= 160}]",
         "    set compact_no_source_gear [expr {$axis_len > $max_radial_span * 1.30 && $axis_len <= $max_radial_span * 2.20 && $radial_roundness >= 0.85 && [llength $all_surfs] >= 40 && [llength $all_surfs] <= 90}]",
         "    set small_loop_gear [expr {$axis_len <= $max_radial_span * 0.38 && [llength $all_surfs] >= 70 && [llength $all_surfs] <= 100}]",
         "    set full_thickness_compact_gear [expr {$axis_len <= $max_radial_span * 0.46 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 300}]",
@@ -2299,6 +2329,9 @@ def generate_geometry_probe_tcl(
         "        set outer_ratio [expr {$rmax / $solid_rmax}]",
         "        set radial_span [expr {$rmax - $rmin}]",
         "        set radial_span_ratio [expr {$radial_span / $solid_rmax}]",
+        "        set center_nom_ratio [expr {$center_radius / $solid_rnom}]",
+        "        set outer_nom_ratio [expr {$rmax / $solid_rnom}]",
+        "        set radial_span_nom_ratio [expr {$radial_span / $solid_rnom}]",
         "        set surf_axis_span [expr {abs([lindex $sbb $ax_max] - [lindex $sbb $ax_min])}]",
         "        set surf_r1_span [expr {abs([lindex $sbb $r1_max] - [lindex $sbb $r1_min])}]",
         "        set surf_r2_span [expr {abs([lindex $sbb $r2_max] - [lindex $sbb $r2_min])}]",
@@ -2312,13 +2345,24 @@ def generate_geometry_probe_tcl(
         "            if {$center_ratio >= 0.60 && $outer_ratio >= 0.68 && $axis_ratio >= 0.55 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.14 && $angle_span <= 18.0} {",
         "                lappend candidates $surf_id",
         "            }",
+        "        } elseif {$high_count_gear && $axis_len <= $max_radial_span * 0.42 && $radial_roundness >= 0.85} {",
+        "            set high_count_external_tooth [expr {$center_ratio >= 0.66 && $outer_ratio >= 0.70 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.10 && $angle_span <= 16.0 && $radial_span_ratio <= 0.12}]",
+        "            set high_count_external_side [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.70 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.06 && $angle_span <= 10.0 && $radial_span_ratio >= 0.006 && $radial_span_ratio <= 0.08}]",
+        "            set high_count_radial_flank [expr {$axis_len > $max_radial_span * 0.18 && $center_ratio >= 0.62 && $outer_ratio >= 0.78 && $axis_ratio >= 0.08 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.18 && $angle_span <= 14.0 && $radial_span_ratio >= 0.08 && $radial_span_ratio <= 0.55}]",
+        "            set high_count_nominal_outer_tip [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.78 && $outer_nom_ratio >= 0.92 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.30 && $angle_span <= 34.0 && $radial_span_nom_ratio <= 0.34}]",
+        "            set high_count_nominal_outer_flank [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.64 && $outer_nom_ratio >= 0.90 && $axis_ratio >= 0.06 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.48 && $angle_span <= 82.0 && $radial_span_nom_ratio >= 0.04 && $radial_span_nom_ratio <= 0.98}]",
+        "            set high_count_nominal_outer_axial_side [expr {$axis_len > $max_radial_span * 0.18 && $center_nom_ratio >= 0.88 && $outer_nom_ratio >= 0.98 && $axis_ratio >= 0.015 && $axis_ratio <= 0.05 && $local_span_ratio <= 0.12 && $angle_span <= 14.0 && $radial_span_nom_ratio >= 0.10 && $radial_span_nom_ratio <= 0.22}]",
+        "            if {$high_count_external_tooth || $high_count_external_side || $high_count_radial_flank || $high_count_nominal_outer_tip || $high_count_nominal_outer_flank || $high_count_nominal_outer_axial_side} {",
+        "                lappend candidates $surf_id",
+        "            }",
         "        } elseif {$compact_thin_gear || $full_thickness_compact_gear} {",
         "            set compact_full_span [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.66 && $axis_ratio >= 0.80 && $local_span_ratio <= 0.12 && $angle_span <= 10.0 && $radial_span_ratio >= 0.0}]",
         "            set compact_flank_band [expr {$center_ratio >= 0.62 && $outer_ratio >= 0.66 && $axis_ratio >= 0.35 && $axis_ratio <= 0.55 && $local_span_ratio <= 0.08 && $angle_span <= 8.0 && $radial_span_ratio >= 0.0}]",
         "            set compact_full_tooth_band [expr {$full_thickness_compact_gear && $center_ratio >= 0.55 && $outer_ratio >= 0.60 && $axis_ratio >= 0.70 && $local_span_ratio <= 0.22 && $angle_span <= 26.0 && $radial_span_ratio >= 0.0}]",
         "            set compact_thick_tooth_band [expr {$full_thickness_compact_gear && $axis_len > $max_radial_span * 0.36 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 170 && $center_ratio >= 0.50 && $outer_ratio >= 0.55 && $axis_ratio >= 0.65 && $local_span_ratio <= 0.30 && $angle_span <= 35.0 && $radial_span_ratio >= 0.0}]",
         "            set compact_oblique_tooth_band [expr {$full_thickness_compact_gear && $axis_len > $max_radial_span * 0.36 && [llength $all_surfs] >= 100 && [llength $all_surfs] <= 170 && $radial_roundness >= 0.95 && $outer_ratio >= 0.45 && $axis_ratio >= 0.05 && $local_span_ratio <= 0.95 && $angle_span <= 125.0}]",
-        "            if {$compact_full_span || $compact_flank_band || $compact_full_tooth_band || $compact_thick_tooth_band || $compact_oblique_tooth_band} {",
+        "            set compact_high_count_tooth_band [expr {$high_count_gear && $center_ratio >= 0.55 && $outer_ratio >= 0.58 && $axis_ratio >= 0.12 && $axis_ratio <= 1.05 && $local_span_ratio <= 0.45 && $angle_span <= 70.0 && $radial_span_ratio >= 0.0}]",
+        "            if {$compact_full_span || $compact_flank_band || $compact_full_tooth_band || $compact_thick_tooth_band || $compact_oblique_tooth_band || $compact_high_count_tooth_band} {",
         "                lappend candidates $surf_id",
         "            }",
         "        } elseif {$compact_no_source_gear} {",
@@ -2326,6 +2370,12 @@ def generate_geometry_probe_tcl(
         "            set compact_no_source_root_flank [expr {$center_ratio >= 0.49 && $outer_ratio >= 0.52 && $axis_ratio >= 0.50 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.18 && $angle_span <= 22.0 && $radial_span_ratio >= 0.03}]",
         "            set compact_no_source_tip_sliver [expr {$center_ratio >= 0.70 && $outer_ratio >= 0.70 && $axis_ratio >= 0.50 && $axis_ratio <= 0.75 && $local_span_ratio <= 0.05 && $angle_span <= 6.0}]",
         "            if {$compact_no_source_outer_flank || $compact_no_source_root_flank || $compact_no_source_tip_sliver} {",
+        "                lappend candidates $surf_id",
+        "            }",
+        "        } elseif {$shaft_inline_gear} {",
+        "            set shaft_inline_flank [expr {$center_ratio >= 0.32 && $outer_ratio >= 0.40 && $axis_ratio >= 0.035 && $axis_ratio <= 0.60 && $local_span_ratio <= 0.34 && $angle_span <= 55.0 && $radial_span_ratio >= 0.008}]",
+        "            set shaft_inline_top_root [expr {$center_ratio >= 0.28 && $outer_ratio >= 0.36 && $axis_ratio >= 0.015 && $axis_ratio <= 0.80 && $local_span_ratio <= 0.55 && $angle_span <= 82.0 && $radial_span_ratio >= 0.0}]",
+        "            if {$shaft_inline_flank || $shaft_inline_top_root} {",
         "                lappend candidates $surf_id",
         "            }",
         "        } elseif {$shaft_end_gear} {",
@@ -4588,7 +4638,6 @@ def generate_cutsection_spin_hex_tcl(
     plane_tolerance: float = 0.02,
     retry_count: int = 1,
     section_edge_seed_counts: list[int] | None = None,
-    include_existing_section_surfaces: bool = False,
     delete_existing_component_elements: bool = True,
     output_hm_path: str | None = None,
 ) -> dict[str, Any]:
@@ -4659,7 +4708,6 @@ def generate_cutsection_spin_hex_tcl(
     comp = component_name.replace('"', '\\"')
 
     delete_existing = "1" if delete_existing_component_elements else "0"
-    include_existing = "1" if include_existing_section_surfaces else "0"
     size_factors_text = " ".join(f"{value / 100.0:.6g}" for value in section_size_percentages)
     lines = [
         "# HyperMesh MCP generated cut-section spin-hex script",
@@ -4675,7 +4723,6 @@ def generate_cutsection_spin_hex_tcl(
         f"set plane_tol {float(plane_tolerance)}",
         f"set retry_count {int(retry_count)}",
         f"set section_size_factors {{{size_factors_text}}}",
-        f"set include_existing_section_surfaces {include_existing}",
         f"set delete_existing_component_elements {delete_existing}",
         f"set split_nx {nx}",
         f"set split_ny {ny}",
@@ -4933,14 +4980,8 @@ def generate_cutsection_spin_hex_tcl(
         '        puts "MCP cut-section new_surfs=$new_surfs"',
         "        set candidate_surfs $new_surfs",
         "        if {[llength $candidate_surfs] == 0} {",
-        '            puts "MCP cut-section no new surfaces; checking existing solid surfaces on the split plane."',
-        "            *createmark surfs 2 \"by solids\" $target_solid",
-        "            set candidate_surfs [hm_getmark surfs 2]",
-        "        }",
-        "        if {$include_existing_section_surfaces} {",
-        "            *createmark surfs 2 \"by solids\" $target_solid",
-        "            set solid_surfs [hm_getmark surfs 2]",
-        "            set candidate_surfs [mcp_unique_append $candidate_surfs $solid_surfs]",
+        '            puts "MCP cut-section no new cut-section surfaces were created; spin fallback to tetra."',
+        '            error "no cut-section surfaces were created"',
         "        }",
         '        puts "MCP cut-section candidate_surfs=$candidate_surfs"',
         "        set attempt 0",

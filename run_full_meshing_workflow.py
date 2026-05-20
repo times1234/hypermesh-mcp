@@ -1608,7 +1608,6 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 section_element_size_max=args.spin_section_element_size_max,
                 retry_count=args.spin_retry_count,
                 section_edge_seed_counts=[100, 75],
-                include_existing_section_surfaces=False,
                 delete_existing_component_elements=True,
             )
             spin_script_path = RUNS_DIR / f"workflow_spin_hex_s{sid}_{stamp}.tcl"

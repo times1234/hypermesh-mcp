@@ -1020,12 +1020,51 @@ def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[st
     def item_group(item: dict[str, Any]) -> str:
         return "gear" if item.get("strategy") == "gear_aware_tetra" else "tetra"
 
-    for item in sorted(tetra, key=lambda value: (0 if value.get("strategy") == "gear_aware_tetra" else 1, int(value.get("solid_id", 0)))):
-        sid = int(item.get("solid_id", 0))
-        sc = int(item.get("surf_count", 0))
-        score = risk_score(item)
-        group = item_group(item)
-        high_risk = sc >= TETRA_VERY_COMPLEX_SURFACE_COUNT or score >= 20000
+    grouped_items: list[dict[str, Any]] = []
+    grouped_by_id: dict[str, list[dict[str, Any]]] = {}
+    ungrouped: list[dict[str, Any]] = []
+    for item in tetra:
+        tetra_group_id = str(item.get("tetra_group_id") or "")
+        if tetra_group_id:
+            grouped_by_id.setdefault(tetra_group_id, []).append(item)
+        else:
+            ungrouped.append(item)
+    for tetra_group_id, members in grouped_by_id.items():
+        ordered_members = sorted(
+            members,
+            key=lambda value: (
+                int(value.get("tetra_group_order", 0) or 0),
+                int(value.get("solid_id", 0)),
+            ),
+        )
+        grouped_items.append(
+            {
+                "items": ordered_members,
+                "sort_key": (
+                    0 if any(value.get("strategy") == "gear_aware_tetra" for value in ordered_members) else 1,
+                    min(int(value.get("solid_id", 0)) for value in ordered_members),
+                ),
+                "group_id": tetra_group_id,
+            }
+        )
+    for item in ungrouped:
+        grouped_items.append(
+            {
+                "items": [item],
+                "sort_key": (0 if item.get("strategy") == "gear_aware_tetra" else 1, int(item.get("solid_id", 0))),
+                "group_id": "",
+            }
+        )
+
+    for group_entry in sorted(grouped_items, key=lambda value: value["sort_key"]):
+        group_items = group_entry["items"]
+        solid_ids = [int(value.get("solid_id", 0)) for value in group_items]
+        score = sum(risk_score(value) for value in group_items)
+        group = item_group(group_items[0])
+        high_risk = (
+            any(int(value.get("surf_count", 0)) >= TETRA_VERY_COMPLEX_SURFACE_COUNT for value in group_items)
+            or score >= 20000
+        )
         if current and group != current_group:
             batches.append({
                 "batch": batch_index,
@@ -1051,13 +1090,13 @@ def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[st
                 current_group = ""
             batches.append({
                 "batch": batch_index,
-                "solid_ids": [sid],
+                "solid_ids": solid_ids,
                 "reason": f"high-risk {batch_reason(group)}; run alone, then save/cool down before the next tetra batch",
                 "pause_seconds_after_batch": 10,
             })
             batch_index += 1
             continue
-        if current and (len(current) >= 4 or current_score + score > 18000):
+        if current and (len(current) + len(solid_ids) > 4 or current_score + score > 18000):
             batches.append({
                 "batch": batch_index,
                 "solid_ids": current,
@@ -1068,7 +1107,7 @@ def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[st
             current = []
             current_score = 0.0
             current_group = ""
-        current.append(sid)
+        current.extend(solid_ids)
         current_score += score
         current_group = group
     if current:
@@ -4941,6 +4980,37 @@ def generate_cutsection_spin_hex_tcl(
         "    if {$d < 0} {set d [expr {-$d}]}",
         "    return $d",
         "}",
+        "proc mcp_surfs_by_solids {solids} {",
+        "    set out {}",
+        "    foreach solid_id $solids {",
+        "        *createmark surfaces 1 \"by solids\" $solid_id",
+        "        set out [mcp_unique_append $out [hm_getmark surfaces 1]]",
+        "    }",
+        "    return [lsort -integer $out]",
+        "}",
+        "proc mcp_surface_bbox_plane_maxdist {sid nx ny nz px py pz} {",
+        "    *createmark surfaces 2 $sid",
+        "    if {[catch {hm_getboundingbox surfaces 2 0 0 0} bb] || [llength $bb] < 6} {",
+        "        return 1.0e30",
+        "    }",
+        "    set x0 [lindex $bb 0]",
+        "    set y0 [lindex $bb 1]",
+        "    set z0 [lindex $bb 2]",
+        "    set x1 [lindex $bb 3]",
+        "    set y1 [lindex $bb 4]",
+        "    set z1 [lindex $bb 5]",
+        "    set maxdist 0.0",
+        "    foreach x [list $x0 $x1] {",
+        "        foreach y [list $y0 $y1] {",
+        "            foreach z [list $z0 $z1] {",
+        "                set d [expr {$nx * ($x - $px) + $ny * ($y - $py) + $nz * ($z - $pz)}]",
+        "                if {$d < 0} {set d [expr {-$d}]}",
+        "                if {$d > $maxdist} {set maxdist $d}",
+        "            }",
+        "        }",
+        "    }",
+        "    return $maxdist",
+        "}",
         "proc mcp_section_size_info {sid requested_size section_min section_max} {",
         "    *createmark surfaces 2 $sid",
         "    if {[catch {hm_getboundingbox surfaces 2 0 0 0} bb] || [llength $bb] < 6} {",
@@ -4959,7 +5029,7 @@ def generate_cutsection_spin_hex_tcl(
         "    set min_shells [expr {int(ceil($area_est / max($chosen*$chosen*4.0, 1.0e-9)))}]",
         "    if {$min_shells < 2} {set min_shells 2}",
         "    if {$minor <= 3.0 && $major <= 6.0 && $min_shells > 4} {set min_shells 4}",
-        "    if {$min_shells > 80} {set min_shells 80}",
+        "    if {$min_shells > 30} {set min_shells 30}",
         "    return [list $chosen $minor $major $diag $min_shells]",
         "}",
         "proc mcp_node_axis_radius {nid axis_key ax ay az} {",
@@ -4987,7 +5057,9 @@ def generate_cutsection_spin_hex_tcl(
         "        }",
         "    }",
         "    if {$section_size <= 0} {set section_size 1.0}",
-        "    set raw [expr {int(ceil((2.0 * 3.141592653589793 * $max_radius) / $section_size))}]",
+        "    set density_scale 0.85",
+        "    set raw_unscaled [expr {int(ceil((2.0 * 3.141592653589793 * $max_radius) / $section_size))}]",
+        "    set raw [expr {int(ceil($raw_unscaled * $density_scale))}]",
         "    set density $raw",
         "    set density_min [expr {int($min_density)}]",
         "    set density_max [expr {int($max_density)}]",
@@ -4996,7 +5068,7 @@ def generate_cutsection_spin_hex_tcl(
         "    if {$density_min > $density_max} {set tmp $density_min; set density_min $density_max; set density_max $tmp}",
         "    if {$density < $density_min} {set density $density_min}",
         "    if {$density > $density_max} {set density $density_max}",
-        '    puts "MCP spin density radius=$max_radius section_size=$section_size min=$density_min max=$density_max raw=$raw chosen=$density"',
+        '    puts "MCP spin density radius=$max_radius section_size=$section_size scale=$density_scale raw_unscaled=$raw_unscaled min=$density_min max=$density_max raw=$raw chosen=$density"',
         "    return $density",
         "}",
         "proc mcp_mesh_true_section {sid elem_size nx ny nz px py pz plane_tol} {",
@@ -5041,12 +5113,13 @@ def generate_cutsection_spin_hex_tcl(
         "                    if {$d > $maxdist} {set maxdist $d}",
         "                }",
         "            }",
-        "            if {[llength $shells] >= $section_min_shells && $maxdist <= $plane_tol} {",
+        "            set enough_section_shells [expr {[llength $shells] >= $section_min_shells || ($quads >= 6 && $maxdist <= $plane_tol)}]",
+        "            if {$enough_section_shells && $maxdist <= $plane_tol} {",
         "                set ::mcp_last_section_size $local_size",
-        '                puts "MCP accepted true section surface=$sid mesh_mode=$face_mode size=$local_size shells=[llength $shells] quads=$quads min_shells=$section_min_shells maxdist=$maxdist plane_tol=$plane_tol"',
+        '                puts "MCP accepted true section surface=$sid mesh_mode=$face_mode size=$local_size shells=[llength $shells] quads=$quads min_shells=$section_min_shells maxdist=$maxdist plane_tol=$plane_tol shell_accept=$enough_section_shells"',
         "                return $shells",
         "            }",
-        '            puts "MCP rejected section surface=$sid mesh_mode=$face_mode size=$local_size shells=[llength $shells] quads=$quads min_shells=$section_min_shells maxdist=$maxdist plane_tol=$plane_tol"',
+        '            puts "MCP rejected section surface=$sid mesh_mode=$face_mode size=$local_size shells=[llength $shells] quads=$quads min_shells=$section_min_shells maxdist=$maxdist plane_tol=$plane_tol shell_accept=$enough_section_shells"',
         "            mcp_delete_elems $shells",
         "        }",
         "    }",
@@ -5088,10 +5161,26 @@ def generate_cutsection_spin_hex_tcl(
         '        puts "MCP cut-section split_solids=$final_split_solids new_solids=$split_new_solids"',
         "        set new_surfs [lsort -integer [mcp_list_subtract [mcp_all_surfs] $before_surfs]]",
         '        puts "MCP cut-section new_surfs=$new_surfs"',
-        "        set candidate_surfs $new_surfs",
+        "        set split_all_surfs [mcp_surfs_by_solids $final_split_solids]",
+        "        set candidate_surfs {}",
+        "        set bbox_plane_tol [expr {max($plane_tol, $elem_size * 0.05)}]",
+        "        foreach surf_id $split_all_surfs {",
+        "            set bbox_plane_dist [mcp_surface_bbox_plane_maxdist $surf_id $split_nx $split_ny $split_nz $split_px $split_py $split_pz]",
+        "            if {$bbox_plane_dist <= $bbox_plane_tol} {",
+        "                lappend candidate_surfs $surf_id",
+        "                puts \"MCP cut-section candidate surface=$surf_id bbox_plane_dist=$bbox_plane_dist tol=$bbox_plane_tol source=split_surface\"",
+        "            } else {",
+        "                puts \"MCP cut-section reject surface=$surf_id bbox_plane_dist=$bbox_plane_dist tol=$bbox_plane_tol reason=not_on_split_plane\"",
+        "            }",
+        "        }",
+        "        if {[llength $candidate_surfs] > 1} {",
+        "            set duplicate_section_surfs [lrange $candidate_surfs 1 end]",
+        "            set candidate_surfs [list [lindex $candidate_surfs 0]]",
+        "            puts \"MCP cut-section selected_single_section_surface=[lindex $candidate_surfs 0] dropped_duplicate_section_surfs=$duplicate_section_surfs reason=one_seed_section_required\"",
+        "        }",
         "        if {[llength $candidate_surfs] == 0} {",
-        '            puts "MCP cut-section no new cut-section surfaces were created; spin fallback to tetra."',
-        '            error "no cut-section surfaces were created"',
+        '            puts "MCP cut-section no split-plane section surfaces were found; spin fallback to tetra."',
+        '            error "no split-plane section surfaces were found"',
         "        }",
         '        puts "MCP cut-section candidate_surfs=$candidate_surfs"',
         "        set attempt 0",

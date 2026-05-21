@@ -919,6 +919,7 @@ def _promote_spin_fallback_solids_to_tetra(
     fallback_ids = [int(value) for value in parsed.get("split_solid_ids") or [sid] if int(value) > 0]
     if sid not in fallback_ids:
         fallback_ids.insert(0, sid)
+    tetra_group_id = f"spin_fallback_{sid}"
     source = dict(results.get(str(sid)) or active_results.get(str(sid)) or {})
     if not source:
         source = {
@@ -929,7 +930,7 @@ def _promote_spin_fallback_solids_to_tetra(
             "surf_count": 0,
             "evidence": [],
         }
-    for fallback_id in fallback_ids:
+    for group_order, fallback_id in enumerate(fallback_ids):
         target = dict(source)
         target["solid_id"] = fallback_id
         target["strategy"] = "tetra_plain"
@@ -940,6 +941,9 @@ def _promote_spin_fallback_solids_to_tetra(
         target["evidence"].append("spin failed after split -> tetra fallback")
         target["allow_tetmesh"] = True
         target["allow_surface_mesh"] = True
+        target["tetra_group_id"] = tetra_group_id
+        target["tetra_group_order"] = group_order
+        target["tetra_group_reason"] = "spin split fallback; keep split solids in the same tetra batch"
         active_results[str(fallback_id)] = target
         results[str(fallback_id)] = dict(target)
     return fallback_ids

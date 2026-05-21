@@ -1127,6 +1127,18 @@ def _gui_listener_script(host: str = "127.0.0.1", port: int = DEFAULT_GUI_PORT) 
 set ::mcp_hm_host "{host}"
 set ::mcp_hm_port {int(port)}
 
+proc ::mcp_hm_restore_puts {{}} {{
+    if {{[llength [info commands ::_mcp_orig_puts]] > 0}} {{
+        catch {{rename puts ""}}
+        catch {{rename ::_mcp_orig_puts puts}}
+    }}
+    if {{[llength [info commands ::_mcp_base_puts]] > 0}} {{
+        catch {{rename puts ""}}
+        catch {{rename ::_mcp_base_puts puts}}
+    }}
+}}
+::mcp_hm_restore_puts
+
 proc ::mcp_hm_run_async {{job_id script log_path}} {{
     set ::mcp_async_status($job_id) "running"
     set f [open $log_path a]
@@ -1151,9 +1163,8 @@ proc ::mcp_hm_run_async {{job_id script log_path}} {{
         }}
     }}
 
-    if {{![info exists ::_mcp_base_puts]}} {{
-        rename puts ::_mcp_base_puts
-    }}
+    ::mcp_hm_restore_puts
+    rename puts ::_mcp_base_puts
     set old_capture ""
     if {{[info exists ::mcp_capture]}} {{set old_capture $::mcp_capture}}
     set ::mcp_capture ""
@@ -1174,8 +1185,8 @@ proc ::mcp_hm_run_async {{job_id script log_path}} {{
 
     set code [catch {{uplevel #0 $script}} result options]
 
-    rename puts ""
-    rename ::_mcp_base_puts puts
+    catch {{rename puts ""}}
+    catch {{rename ::_mcp_base_puts puts}}
 
     set f [open $log_path a]
     if {{$code == 0 || $code == 2}} {{
@@ -1205,7 +1216,8 @@ proc ::mcp_hm_accept {{chan addr client_port}} {{
         return
     }}
 
-    # 濞ｅ洦绻傞悺銊╁储閻斿娼?puts闁挎稑鑻崹鍗烆嚈閻戞ê绀嬮柤楣冾棑婢ф寮?
+    ::mcp_hm_restore_puts
+    # Capture puts output for the Python client without leaving stale hooks.
     rename puts ::_mcp_orig_puts
     set ::mcp_capture ""
     proc puts args {{
@@ -1223,9 +1235,8 @@ proc ::mcp_hm_accept {{chan addr client_port}} {{
 
     set code [catch {{uplevel #0 $script}} result options]
     
-    # 闁诡厹鍨归ˇ鏌ュ储閻斿娼?puts
-    rename puts ""
-    rename ::_mcp_orig_puts puts
+    catch {{rename puts ""}}
+    catch {{rename ::_mcp_orig_puts puts}}
 
     if {{[catch {{
         if {{$code == 0 || $code == 2}} {{
@@ -1842,9 +1853,9 @@ def classify_all_solids_from_probe(
             evidence.append(gear_reason)
             if gear_tooth_surface_ids:
                 evidence.append(f"gear tooth/outer-band surface candidates: {gear_tooth_count}")
-        elif sc == 6 and mx > 0 and mn / mx <= 0.58 and src_surf > 0 and source_inner_loops <= 1:
+        elif sc == 6 and mx > 0 and mn / mx <= 0.75 and src_surf > 0 and source_inner_loops <= 1:
             strategy = "drag_hex"
-            evidence.append("6-face constant-section solid/ring -> drag")
+            evidence.append("6-face constant-section solid/ring, including short thick rings -> drag")
         elif sc == 4 and mx > 0 and src_surf > 0 and cross_ratio >= 0.75 and mn / mx <= 0.60 and source_inner_loops <= 1:
             strategy = "drag_hex"
             evidence.append("4-surface short cylinder -> drag")
@@ -3221,10 +3232,13 @@ def generate_plain_tetra_tcl(
         "    eval *createmark elems 1 $elems",
         "    set rc [catch {*elementtestvolumeareaskew elems 1 $threshold 2 4 0 \"\"} err]",
         "    set failed {}",
-        "    if {!$rc} {set failed [hm_getmark elems 2]} else {puts \"MCP_PT_WARN volumearea_skew_mark2_test_failed=$err\"}",
-        "    if {[llength $failed] == 0} {",
+        "    if {!$rc} {",
+        "        set failed [mcp_list_intersect [hm_getmark elems 2] $elems]",
+        "        return $failed",
+        "    }",
+        "    puts \"MCP_PT_WARN volumearea_skew_mark2_test_failed=$err fallback=usermark\"",
+        "    if {$rc} {",
         "        catch {*clearmark elems 2}",
-        "        catch {*marktousermark elems 2}",
         "        eval *createmark elems 1 $elems",
         "        set rc2 [catch {*elementtestvolumeareaskew elems 1 $threshold 0 4 0 \"\"} err2]",
         "        if {!$rc2} {set failed [mcp_list_intersect [hm_getusermark elems] $elems]} else {puts \"MCP_PT_WARN volumearea_skew_usermark_test_failed=$err2\"}",
@@ -3675,7 +3689,9 @@ def generate_plain_tetra_tcl(
         '        set kept_surface_shell_count $shell_count',
         '        continue',
         '    }',
+        '    catch {update}',
         '    set tet_rc [catch {*tetmesh components 2 1 elements 0 -1 1 2} tet_err]',
+        '    catch {update}',
         '    if {$tet_rc} {',
         '        puts "MCP_PT_WARN solid=$target_solid tetmesh_failed=$tet_err manual_component_tetmesh_rejected=1"',
         '        set failed_new_elems [mcp_list_subtract [mcp_all_elems] $before_tetmesh_elems]',
@@ -3707,8 +3723,10 @@ def generate_plain_tetra_tcl(
         '                catch {*elementchecksettings -1 0 0 1 0 0 0 1 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0}',
         '                *createstringarray 2 "tet: 256 1.2 2 0.0 0.8 0.0 0" "pars: fix_comp_bdr= 1 fix_top_bdr= 0 shell_swap=0 shell_remesh=0 use_optimizer=1 skip_aflr3=1 feature_angle=35.0 niter=3 upd_shell=0 vol_skew=\'0.99,0.60,0.10,1.0\'"',
         '                eval *createmark elements 1 $comp_elems',
-        '                *createmark elements 2',
+        '                catch {*clearmark elements 2}',
+        '                catch {update}',
         '                set opt_rc [catch {*tetmesh elements 1 6 elements 2 1 1 2} opt_err]',
+        '                catch {update}',
         '                if {$opt_rc} {puts "MCP_PT_WARN solid=$target_solid solid_mesh_optimization_failed=$opt_err"}',
         '                catch {*elementchecksettings -1 0 0 1 0 0 0 1 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0}',
         '            } elseif {$vol_repair_at == 1} {',
@@ -3923,6 +3941,7 @@ def generate_batched_plain_tetra_tcl(
         body_lines.extend([
             "incr mcp_tetra_completed",
             'puts "MCP_BT_PROGRESS completed=$mcp_tetra_completed total=$mcp_tetra_batch_count"',
+            "catch {update}",
         ])
         if checkpoint_hm_path and checkpoint_every_n_solids > 0:
             body_lines.extend([
@@ -3931,7 +3950,7 @@ def generate_batched_plain_tetra_tcl(
                 "    catch {*writefile $mcp_tetra_checkpoint_path 1}",
                 "}",
             ])
-        body_lines.append("if {$mcp_tetra_pause_ms > 0} {after $mcp_tetra_pause_ms}")
+        body_lines.append("if {$mcp_tetra_pause_ms > 0} {after $mcp_tetra_pause_ms; catch {update}}")
 
     if output_hm_path:
         body_lines.append(f'*writefile "{_quote_tcl_path(output_hm_path)}" 1')
@@ -4617,6 +4636,7 @@ def generate_batched_drag_hex_tcl(
         "            foreach e {0 1 2 3} { catch {*set_meshedgeparams $e $td 1 0 0 0 $cs 0 0} }",
         "        }",
         "        *automesh 0 5 1; *storemeshtodatabase 1; *ameshclearsurface",
+        "        catch {update}; after 25",
         "        if {!$drag_aspect_guard} {puts \"MCP_DRAG_ASPECT_CHECK_SKIPPED solid=$sid\"}",
         '        *createmark elems 1 "by surface" $surf',
         '        set source_shells [hm_getmark elems 1]',
@@ -4650,6 +4670,7 @@ def generate_batched_drag_hex_tcl(
         "        if {[catch {",
         "            *meshdragelements2 1 1 $dd $dl 0 0.0 0",
         "        } _mcp_drag_err]} {",
+        "            catch {update}; after 25",
         "            puts \"MCP_DRAG_FAIL stage=meshdragelements_error solid=$sid error=$_mcp_drag_err\"",
         "            b_del $source_shells",
         "            set cs [expr {$cs*0.8}]",
@@ -4657,6 +4678,7 @@ def generate_batched_drag_hex_tcl(
         "            incr at",
         "            continue",
         "        }",
+        "        catch {update}; after 25",
         "        set after_drag [b_all]",
         "        set new_drag_elems [b_sub $after_drag $be]",
         "        puts \"MCP_DRAG_NEW_ELEMS solid=$sid count=[llength $new_drag_elems]\"",
@@ -4693,6 +4715,7 @@ def generate_batched_drag_hex_tcl(
         "        set td [expr {int(round($mj/$cs))}]; if {$td<4} {set td 4}",
         "        foreach e {0 1 2 3} { catch {*set_meshedgeparams $e $td 1 0 0 0 $cs 0 0} }",
         "        *automesh 0 5 1; *storemeshtodatabase 1; *ameshclearsurface",
+        "        catch {update}; after 25",
         "        *createmark elems 1 \"by surface\" $surf",
         "        set source_shells [hm_getmark elems 1]",
         "        set ss $source_shells; set qc 0",
@@ -4708,6 +4731,7 @@ def generate_batched_drag_hex_tcl(
         "            *createvector 1 $dvx $dvy $dvz",
         "            eval *createmark elems 1 $source_shells",
         "            if {![catch {*meshdragelements2 1 1 $dd 1 0 0.0 0} _mcp_drag_err]} {",
+        "                catch {update}; after 25",
         "                set after_drag [b_all]",
         "                set new_drag_elems [b_sub $after_drag $be]",
         "                set ne $new_drag_elems; set hc [b_hex $ne]; set fo [b_fit $ne $sid $fit_tol_ratio $cs]",
@@ -4720,6 +4744,7 @@ def generate_batched_drag_hex_tcl(
         "                    puts \"MCP_DRAG_FAIL stage=one_layer_fallback_quality solid=$sid hex=$hc total=[llength $ne] fit=$fo\"",
         "                }",
         "            } else {",
+        "                catch {update}; after 25",
         "                puts \"MCP_DRAG_FAIL stage=one_layer_fallback_error solid=$sid error=$_mcp_drag_err\"",
         "            }",
         "        } else {",
@@ -4869,6 +4894,7 @@ def generate_cutsection_spin_hex_tcl(
         f"set axis_py {ay}",
         f"set axis_pz {az}",
         f'set spin_axis_key "{axis_key}"',
+        "set mcp_ui_yield_ms 75",
         "proc mcp_mark_count {entity mark_id} {",
         "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
         "    return $n",
@@ -5071,6 +5097,12 @@ def generate_cutsection_spin_hex_tcl(
         '    puts "MCP spin density radius=$max_radius section_size=$section_size scale=$density_scale raw_unscaled=$raw_unscaled min=$density_min max=$density_max raw=$raw chosen=$density"',
         "    return $density",
         "}",
+        "proc mcp_ui_yield {{ms \"\"}} {",
+        "    variable mcp_ui_yield_ms",
+        "    if {$ms eq \"\"} {set ms $mcp_ui_yield_ms}",
+        "    catch {update}",
+        "    if {$ms > 0} {after $ms}",
+        "}",
         "proc mcp_mesh_true_section {sid elem_size nx ny nz px py pz plane_tol} {",
         "    set size_info [mcp_section_size_info $sid $elem_size $::mcp_section_size_min $::mcp_section_size_max]",
         "    set base_size [lindex $size_info 0]",
@@ -5098,11 +5130,13 @@ def generate_cutsection_spin_hex_tcl(
         "            } mesh_err]} {",
         '                puts "MCP rejected section surface=$sid mesh_mode=$face_mode size=$local_size automesh_error=$mesh_err"',
         "                catch {*ameshclearsurface}",
+        "                mcp_ui_yield 25",
         "                continue",
         "            }",
+        "            mcp_ui_yield",
         '            *createmark elems 1 "by surface" $sid',
         "            set shells [hm_getmark elems 1]",
-        "            if {[llength $shells] == 0} {continue}",
+        "            if {[llength $shells] == 0} {mcp_ui_yield 25; continue}",
         "            set quads 0",
         "            set maxdist 0.0",
         "            foreach eid $shells {",
@@ -5117,10 +5151,12 @@ def generate_cutsection_spin_hex_tcl(
         "            if {$enough_section_shells && $maxdist <= $plane_tol} {",
         "                set ::mcp_last_section_size $local_size",
         '                puts "MCP accepted true section surface=$sid mesh_mode=$face_mode size=$local_size shells=[llength $shells] quads=$quads min_shells=$section_min_shells maxdist=$maxdist plane_tol=$plane_tol shell_accept=$enough_section_shells"',
+        "                mcp_ui_yield",
         "                return $shells",
         "            }",
         '            puts "MCP rejected section surface=$sid mesh_mode=$face_mode size=$local_size shells=[llength $shells] quads=$quads min_shells=$section_min_shells maxdist=$maxdist plane_tol=$plane_tol shell_accept=$enough_section_shells"',
         "            mcp_delete_elems $shells",
+        "            mcp_ui_yield 25",
         "        }",
         "    }",
         "    return {}",
@@ -5145,6 +5181,7 @@ def generate_cutsection_spin_hex_tcl(
         '    *createmark elems 1 "by comp name" $target_component',
         "    if {[mcp_mark_count elems 1] > 0} {catch {*deletemark elems 1}}",
         "}",
+        "mcp_ui_yield",
         "set before_surfs [mcp_all_surfs]",
         "set before_solids [mcp_all_solids]",
         "*createmark solids 1 $target_solid",
@@ -5155,6 +5192,7 @@ def generate_cutsection_spin_hex_tcl(
         "    if {[catch {*body_splitmerge_with_plane solids 1 1} split_err]} {",
         '        puts "MCP cut-section split failed: $split_err"',
         "    } else {",
+        "        mcp_ui_yield",
         "        set after_solids [mcp_all_solids]",
         "        set split_new_solids [lsort -integer [mcp_list_subtract $after_solids $before_solids]]",
         "        set final_split_solids [lsort -integer [mcp_unique_append [list $target_solid] $split_new_solids]]",
@@ -5183,6 +5221,7 @@ def generate_cutsection_spin_hex_tcl(
         '            error "no split-plane section surfaces were found"',
         "        }",
         '        puts "MCP cut-section candidate_surfs=$candidate_surfs"',
+        "        mcp_ui_yield",
         "        set attempt 0",
         "        while {$attempt <= $retry_count && !$hex_success} {",
         "            set attempt_size $elem_size",
@@ -5213,9 +5252,11 @@ def generate_cutsection_spin_hex_tcl(
         "            set actual_spin_density [mcp_spin_density_for_shells $seed_shells $spin_axis_key $axis_px $axis_py $axis_pz $::mcp_last_section_size $spin_density_min $spin_density_max]",
         "            set final_spin_density $actual_spin_density",
         "            set final_section_size $::mcp_last_section_size",
+        "            mcp_ui_yield",
         "            if {[catch {*meshspinelements2 1 1 360 $actual_spin_density 1 0.0 0} spin_err]} {",
         '                puts "MCP cut-section spin attempt failed: $spin_err"',
         "            } else {",
+        "                mcp_ui_yield",
         "                set new_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
         "                if {[llength $new_elems] > 0} {",
         "                    eval *createmark elems 1 $new_elems",
@@ -5224,6 +5265,7 @@ def generate_cutsection_spin_hex_tcl(
         "                    set merged_nodes [mcp_merge_coincident_nodes_in_elems $new_elems $merge_tol]",
         "                    set final_merged_nodes $merged_nodes",
         "                    puts \"MCP cut-section spin node_merge new3d=[llength $new_elems] merged=$merged_nodes tol=$merge_tol\"",
+        "                    mcp_ui_yield",
         "                    set hex_count [mcp_hex8_count $new_elems]",
         "                    set hex_success 1",
         "                    set final_hex_count $hex_count",
@@ -5235,6 +5277,7 @@ def generate_cutsection_spin_hex_tcl(
         "                }",
         "            }",
         "            mcp_delete_elems $seed_shells",
+        "            mcp_ui_yield",
         "            incr attempt",
         "        }",
         "    }",

@@ -54,6 +54,7 @@ namespace eval ::hm_mcp_launcher {
     variable current_pid ""
     variable current_log ""
     variable current_stamp ""
+    variable background_input_path ""
     variable last_log_size 0
     variable log_poll_ms 4000
     variable pid_check_ms 8000
@@ -291,8 +292,13 @@ proc ::hm_mcp_launcher::build_command {{mode full}} {
     variable tetra_timeout
     variable save_timeout
     variable current_stamp
+    variable background_input_path
 
-    set runner [file join $project_dir run_full_meshing_workflow.py]
+    if {$mode eq "background"} {
+        set runner [file join $project_dir run_full_meshing_workflow_batch.py]
+    } else {
+        set runner [file join $project_dir run_full_meshing_workflow.py]
+    }
     set cmd [list $python_exe $runner \
         --host $host \
         --port $port \
@@ -333,6 +339,9 @@ proc ::hm_mcp_launcher::build_command {{mode full}} {
         --gear-tooth-min-element-size-min $gear_tooth_min_element_size_min \
         --gear-tooth-min-element-size-max $gear_tooth_min_element_size_max \
         --gear-tooth-feature-angle $gear_tooth_feature_angle]
+    if {$mode eq "background"} {
+        lappend cmd --input $background_input_path
+    }
     if {$continue_on_error} {
         lappend cmd --continue-on-error
     } else {
@@ -365,6 +374,26 @@ proc ::hm_mcp_launcher::pid_running {pid} {
         return 1
     }
     return 0
+}
+
+proc ::hm_mcp_launcher::save_background_snapshot {} {
+    variable project_dir
+    variable current_stamp
+    variable background_input_path
+
+    ensure_directories
+    set snapshot [file normalize [file join $project_dir runs "panel_background_snapshot_$current_stamp.hm"]]
+    set snapshot_tcl [string map {"\\" "/"} $snapshot]
+    if {[catch {
+        *writefile "$snapshot_tcl" 1
+    } err opts]} {
+        error "保存当前 HyperMesh 模型快照失败：$err"
+    }
+    if {![file exists $snapshot]} {
+        error "保存当前 HyperMesh 模型快照失败：未生成 $snapshot"
+    }
+    set background_input_path $snapshot
+    return $snapshot
 }
 
 proc ::hm_mcp_launcher::read_new_log_data {} {
@@ -466,6 +495,8 @@ proc ::hm_mcp_launcher::start_workflow {{mode full}} {
         set current_log [file normalize [file join $project_dir runs "panel_gear_tooth_preview_$current_stamp.log"]]
     } elseif {$mode eq "delete_gear_preview"} {
         set current_log [file normalize [file join $project_dir runs "panel_delete_gear_tooth_preview_$current_stamp.log"]]
+    } elseif {$mode eq "background"} {
+        set current_log [file normalize [file join $project_dir runs "panel_background_workflow_$current_stamp.log"]]
     } else {
         set current_log [file normalize [file join $project_dir runs "panel_workflow_$current_stamp.log"]]
     }
@@ -474,7 +505,16 @@ proc ::hm_mcp_launcher::start_workflow {{mode full}} {
     replace_log ""
     normalize_mesh_parameters
 
-    if {$auto_listener} {
+    if {$mode eq "background"} {
+        set_status "正在保存当前模型快照"
+        append_log "正在保存当前 HyperMesh 模型为后台划分快照...\n"
+        if {[catch {set snapshot_path [save_background_snapshot]} err]} {
+            set_status "后台快照保存失败"
+            append_log "后台划分无法启动：$err\n"
+            return
+        }
+        append_log "后台划分快照：$snapshot_path\n"
+    } elseif {$auto_listener} {
         set_status "正在建立 HyperMesh 连接"
         append_log "正在建立 HyperMesh 连接...\n"
         if {[catch {set listener_path [ensure_listener]} err]} {
@@ -692,14 +732,16 @@ proc ::hm_mcp_launcher::build_ui {} {
         }
     }
     ttk::button $w.root.actions.run -text "开始划分" -style HM.TButton -command ::hm_mcp_launcher::start_workflow
+    ttk::button $w.root.actions.background -text "后台划分" -style HM.TButton -command {::hm_mcp_launcher::start_workflow background}
     ttk::button $w.root.actions.gearpreview -text "只划分齿面网格" -style HM.TButton -command {::hm_mcp_launcher::start_workflow gear_preview}
     ttk::button $w.root.actions.deletegearpreview -text "删除齿面网格" -style HM.TButton -command {::hm_mcp_launcher::start_workflow delete_gear_preview}
     ttk::button $w.root.actions.stop -text "停止当前流程" -style HMStop.TButton -command ::hm_mcp_launcher::stop_workflow
     grid $w.root.actions.connect -row 0 -column 0 -padx {0 12}
     grid $w.root.actions.run -row 0 -column 1 -padx 12
-    grid $w.root.actions.gearpreview -row 0 -column 2 -padx 12
-    grid $w.root.actions.deletegearpreview -row 0 -column 3 -padx 12
-    grid $w.root.actions.stop -row 0 -column 4 -padx 12
+    grid $w.root.actions.background -row 0 -column 2 -padx 12
+    grid $w.root.actions.gearpreview -row 0 -column 3 -padx 12
+    grid $w.root.actions.deletegearpreview -row 0 -column 4 -padx 12
+    grid $w.root.actions.stop -row 0 -column 5 -padx 12
 }
 
 ::hm_mcp_launcher::build_ui

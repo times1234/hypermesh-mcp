@@ -308,6 +308,15 @@ The offline panel in `launch_meshing_workflow_panel.tcl` exposes the same
 current switches, including gear refinement, tooth preview/delete, tooth sizing,
 spin section sizing, and drag three-layer guarding.
 
+Two background-mode entry points are also available:
+
+- `run_batch_meshing_panel.py` opens a standalone Windows panel. Select a
+  `.stp`, `.step`, or `.hm` file, choose the output `.hm`, then run the same
+  meshing logic through `hmbatch.exe` without a visible HyperMesh workflow.
+- The HyperMesh Tcl panel has a `后台划分` button. It saves the currently open
+  HyperMesh model to a temporary `.hm` snapshot under `runs/`, then passes that
+  snapshot to `run_full_meshing_workflow_batch.py`.
+
 The runner performs these steps:
 
 1. Probe all solids in the current GUI model.

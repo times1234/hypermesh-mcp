@@ -313,6 +313,8 @@ def _candidate_hmbatch_paths() -> list[Path]:
     candidates.extend(
         [
             DEFAULT_HMBATCH,
+            Path(r"E:\Program Files\Altair\2020\hwdesktop\hw\bin\win64\hmbatch.exe"),
+            Path(r"E:\Program Files\Altair\2020\hwdesktop\hm\bin\win64\hmbatch.exe"),
             Path(r"F:\Program Files\Altair\2020\hwdesktop\hm\bin\win64\hmbatch.exe"),
             Path(r"C:\Program Files\Altair\2020\hwdesktop\hw\bin\win64\hmbatch.exe"),
             Path(r"C:\Program Files\Altair\2020\hwdesktop\hm\bin\win64\hmbatch.exe"),
@@ -339,6 +341,8 @@ def _candidate_hypermesh_gui_paths() -> list[Path]:
     candidates.extend(
         [
             DEFAULT_HW,
+            Path(r"E:\Program Files\Altair\2020\hwdesktop\hw\bin\win64\hw.exe"),
+            Path(r"E:\Program Files\Altair\2020\hwdesktop\hwx\bin\win64\hwx.exe"),
             Path(r"F:\Program Files\Altair\2020\hwdesktop\hwx\bin\win64\hwx.exe"),
             Path(r"C:\Program Files\Altair\2020\hwdesktop\hw\bin\win64\hw.exe"),
             Path(r"C:\Program Files\Altair\2020\hwdesktop\hwx\bin\win64\hwx.exe"),
@@ -385,6 +389,40 @@ def _resolve_hypermesh_gui(gui_path: str | None = None) -> Path:
     raise FileNotFoundError(
         "Could not find hw.exe/hwx.exe. Set HYPERMESH_GUI_EXE or pass gui_path."
     )
+
+
+def _altair_home_from_exe(exe: Path) -> Path:
+    resolved = exe.resolve()
+    parts = [part.lower() for part in resolved.parts]
+    if "hm" in parts:
+        index = parts.index("hm")
+        if index > 0:
+            return Path(*resolved.parts[:index])
+    if "hw" in parts:
+        index = parts.index("hw")
+        if index > 0:
+            return Path(*resolved.parts[:index])
+    return DEFAULT_HYPERMESH_DIR.parents[3]
+
+
+def _hmbatch_environment(exe: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    altair_home = _altair_home_from_exe(exe)
+    env["ALTAIR_HOME"] = str(altair_home)
+    env.setdefault("HW_ROOTDIR", str(altair_home))
+
+    bin_paths = [
+        altair_home / "hm" / "bin" / "win64",
+        altair_home / "hw" / "bin" / "win64",
+    ]
+    existing_bins = [str(path) for path in bin_paths if path.exists()]
+    if existing_bins:
+        env["PATH"] = ";".join(existing_bins + [env.get("PATH", "")])
+
+    tcl_library = altair_home / "hw" / "tcl" / "tcl8.5.9" / "win64" / "lib" / "tcl8.5"
+    if tcl_library.exists():
+        env["TCL_LIBRARY"] = str(tcl_library)
+    return env
 
 
 def _quote_tcl_path(path: str | os.PathLike[str]) -> str:
@@ -1349,8 +1387,7 @@ def _run_hmbatch(
             raise FileNotFoundError(f"Model file was not found: {model}")
         command.append(str(model))
 
-    env = os.environ.copy()
-    env.setdefault("ALTAIR_HOME", str(DEFAULT_HYPERMESH_DIR.parents[4]))
+    env = _hmbatch_environment(exe)
 
     try:
         completed = subprocess.run(
@@ -2739,8 +2776,7 @@ def start_hypermesh_gui_listener(
             raise FileNotFoundError(f"Model file was not found: {model}")
         command.append(str(model))
 
-    env = os.environ.copy()
-    env.setdefault("ALTAIR_HOME", str(DEFAULT_HYPERMESH_DIR.parents[4]))
+    env = _hmbatch_environment(exe)
     process = subprocess.Popen(
         command,
         cwd=str(script_path.parent),
@@ -2769,6 +2805,7 @@ def check_hypermesh_connection(hmbatch_path: str | None = None) -> dict[str, Any
     try:
         completed = subprocess.run(
             command,
+            env=_hmbatch_environment(exe),
             capture_output=True,
             text=True,
             timeout=20,
@@ -5058,6 +5095,20 @@ def generate_cutsection_spin_hex_tcl(
         "    if {$min_shells > 30} {set min_shells 30}",
         "    return [list $chosen $minor $major $diag $min_shells]",
         "}",
+        "proc mcp_section_area_info {sid} {",
+        "    *createmark surfaces 2 $sid",
+        "    if {[catch {hm_getboundingbox surfaces 2 0 0 0} bb] || [llength $bb] < 6} {",
+        "        return [list 0.0 0.0 0.0]",
+        "    }",
+        "    set dx [expr {abs([lindex $bb 3] - [lindex $bb 0])}]",
+        "    set dy [expr {abs([lindex $bb 4] - [lindex $bb 1])}]",
+        "    set dz [expr {abs([lindex $bb 5] - [lindex $bb 2])}]",
+        "    set dims [lsort -real [list $dx $dy $dz]]",
+        "    set minor [lindex $dims 1]",
+        "    set major [lindex $dims 2]",
+        "    set area [expr {$minor * $major}]",
+        "    return [list $area $minor $major]",
+        "}",
         "proc mcp_node_axis_radius {nid axis_key ax ay az} {",
         "    set x [hm_getvalue nodes id=$nid dataname=x]",
         "    set y [hm_getvalue nodes id=$nid dataname=y]",
@@ -5202,19 +5253,46 @@ def generate_cutsection_spin_hex_tcl(
         "        set split_all_surfs [mcp_surfs_by_solids $final_split_solids]",
         "        set candidate_surfs {}",
         "        set bbox_plane_tol [expr {max($plane_tol, $elem_size * 0.05)}]",
+        "        set candidate_records {}",
         "        foreach surf_id $split_all_surfs {",
+        "            set is_new_split_surface [expr {[llength $new_surfs] == 0 || [lsearch -exact $new_surfs $surf_id] >= 0}]",
+        "            if {!$is_new_split_surface} {",
+        "                puts \"MCP cut-section reject surface=$surf_id reason=preexisting_surface_not_new_split\"",
+        "                continue",
+        "            }",
         "            set bbox_plane_dist [mcp_surface_bbox_plane_maxdist $surf_id $split_nx $split_ny $split_nz $split_px $split_py $split_pz]",
         "            if {$bbox_plane_dist <= $bbox_plane_tol} {",
+        "                set area_info [mcp_section_area_info $surf_id]",
+        "                set area [lindex $area_info 0]",
+        "                set minor [lindex $area_info 1]",
+        "                set major [lindex $area_info 2]",
         "                lappend candidate_surfs $surf_id",
-        "                puts \"MCP cut-section candidate surface=$surf_id bbox_plane_dist=$bbox_plane_dist tol=$bbox_plane_tol source=split_surface\"",
+        "                lappend candidate_records [list $surf_id $area $minor $major $bbox_plane_dist]",
+        "                puts \"MCP cut-section candidate surface=$surf_id bbox_plane_dist=$bbox_plane_dist tol=$bbox_plane_tol area=$area minor=$minor major=$major source=new_split_surface\"",
         "            } else {",
         "                puts \"MCP cut-section reject surface=$surf_id bbox_plane_dist=$bbox_plane_dist tol=$bbox_plane_tol reason=not_on_split_plane\"",
         "            }",
         "        }",
         "        if {[llength $candidate_surfs] > 1} {",
-        "            set duplicate_section_surfs [lrange $candidate_surfs 1 end]",
-        "            set candidate_surfs [list [lindex $candidate_surfs 0]]",
-        "            puts \"MCP cut-section selected_single_section_surface=[lindex $candidate_surfs 0] dropped_duplicate_section_surfs=$duplicate_section_surfs reason=one_seed_section_required\"",
+        "            set best_surf -1",
+        "            set best_area -1.0",
+        "            set best_major -1.0",
+        "            set duplicate_section_surfs {}",
+        "            foreach record $candidate_records {",
+        "                set surf_id [lindex $record 0]",
+        "                set area [lindex $record 1]",
+        "                set major [lindex $record 3]",
+        "                if {$area > $best_area || ($area == $best_area && $major > $best_major)} {",
+        "                    if {$best_surf > 0} {lappend duplicate_section_surfs $best_surf}",
+        "                    set best_surf $surf_id",
+        "                    set best_area $area",
+        "                    set best_major $major",
+        "                } else {",
+        "                    lappend duplicate_section_surfs $surf_id",
+        "                }",
+        "            }",
+        "            set candidate_surfs [list $best_surf]",
+        "            puts \"MCP cut-section selected_single_section_surface=$best_surf dropped_duplicate_section_surfs=$duplicate_section_surfs reason=largest_new_split_section area=$best_area major=$best_major\"",
         "        }",
         "        if {[llength $candidate_surfs] == 0} {",
         '            puts "MCP cut-section no split-plane section surfaces were found; spin fallback to tetra."',
@@ -5247,6 +5325,12 @@ def generate_cutsection_spin_hex_tcl(
         "            set final_source_quad_count [mcp_quad_shell_count $seed_shells]",
         "            set final_source_surface $seed_surface",
         '            puts "MCP cut-section selected_section_surface=$seed_surface source_shells=$final_source_shell_count source_quads=$final_source_quad_count"',
+        "            if {$final_source_shell_count < 4 || $final_source_quad_count < 4} {",
+        "                puts \"MCP cut-section spin attempt failed: section mesh too small shells=$final_source_shell_count quads=$final_source_quad_count min_shells=4 min_quads=4\"",
+        "                mcp_delete_elems $seed_shells",
+        "                incr attempt",
+        "                continue",
+        "            }",
         "            eval *createmark elems 1 $seed_shells",
         f"            *createplane 1 {snx} {sny} {snz} $axis_px $axis_py $axis_pz",
         "            set actual_spin_density [mcp_spin_density_for_shells $seed_shells $spin_axis_key $axis_px $axis_py $axis_pz $::mcp_last_section_size $spin_density_min $spin_density_max]",

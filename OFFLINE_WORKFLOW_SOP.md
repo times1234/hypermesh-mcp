@@ -308,6 +308,28 @@ runs/workflow_report_时间戳.txt
 
 最终 `.hm` 文件默认保存在面板中填写的输出路径。
 
+### 1.7 后台划分按钮
+
+面板中的“后台划分”按钮不走 GUI listener。它会先把当前 HyperMesh 中已经打开的
+模型保存成 `runs/panel_background_snapshot_时间戳.hm`，然后调用
+`run_full_meshing_workflow_batch.py` 通过 `hmbatch.exe` 在后台划分。
+
+这个入口适合已经在 HyperMesh 里导入并确认过模型，但希望划分过程不要继续卡住
+当前 HyperMesh 界面的情况。后台划分使用同一套分类、drag、spin、tetra、齿面加密
+逻辑；区别只是执行方式从可视 GUI listener 换成了 hmbatch。
+
+## 1.8 独立后台弹窗
+
+如果不想先打开 HyperMesh 界面，可以直接运行：
+
+```powershell
+python run_batch_meshing_panel.py
+```
+
+这个弹窗会让你选择 `.stp`、`.step` 或 `.hm` 输入文件，以及最终输出 `.hm` 路径。
+它同样调用 `run_full_meshing_workflow_batch.py`，不包含“只划分齿面网格/删除齿面网格”
+这类检查按钮，只保留开始划分和停止按钮。
+
 ## 2. 命令行运行方式
 
 下面是旧的命令行运行方式，适合需要排查连接问题或不使用面板时使用。

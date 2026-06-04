@@ -22,6 +22,19 @@ DEFAULT_GUI_PORT = 47881
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 GUI_REALTIME_DIAG_PATH = RUNS_DIR / "mcp_gui_realtime_diagnostics_latest.jsonl"
 
+
+def _hidden_subprocess_kwargs() -> dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
+
+
 HYPERMESH_MESHING_STRATEGY = """
 HyperMesh meshing strategy for this workstation:
 
@@ -871,6 +884,53 @@ def _probe_int_list_value(value: Any) -> list[int]:
     return out
 
 
+def _probe_float_list_value(value: Any, expected_len: int = 3) -> list[float]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        raw_values = value
+    else:
+        text = str(value).strip().strip("{}")
+        raw_values = text.replace(",", " ").split()
+    out: list[float] = []
+    for item in raw_values:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError):
+            continue
+    if expected_len and len(out) != expected_len:
+        return []
+    return out
+
+
+def _unit_vector(values: list[float]) -> list[float]:
+    if len(values) != 3:
+        return []
+    length = (values[0] * values[0] + values[1] * values[1] + values[2] * values[2]) ** 0.5
+    if length <= 1.0e-9:
+        return []
+    return [values[0] / length, values[1] / length, values[2] / length]
+
+
+def _perpendicular_unit_vector(axis: list[float]) -> list[float]:
+    unit = _unit_vector(axis)
+    if not unit:
+        return []
+    ux, uy, uz = unit
+    refs = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    best = refs[0]
+    best_dot = abs(ux)
+    for ref in refs[1:]:
+        dot = abs(ux * ref[0] + uy * ref[1] + uz * ref[2])
+        if dot < best_dot:
+            best = ref
+            best_dot = dot
+    cx = uy * best[2] - uz * best[1]
+    cy = uz * best[0] - ux * best[2]
+    cz = ux * best[1] - uy * best[0]
+    return _unit_vector([cx, cy, cz])
+
+
 def _probe_lines_iter(probe_lines) -> list[str]:
     if probe_lines is None:
         return []
@@ -897,20 +957,40 @@ def _generate_geometry_component_name(facts, strategy, suffix_solid_id=True):
     return "solid_" + str(round(dx)) + "x" + str(round(dy)) + "x" + str(round(dz)) + sfx
 
 
-def _spin_cutsection_params_from_probe(facts: dict[str, Any]) -> dict[str, Any]:
+def _spin_cutsection_params_from_probe(facts: dict[str, Any], allow_oblique_axis: bool = True) -> dict[str, Any]:
     """Build a cut-section spin plan from bbox facts.
 
     The spin axis is the smallest bbox direction. The split plane must contain
     that axis, so its normal is chosen from one of the two radial directions.
     """
-    axis = str(facts.get("drag_axis", "") or "z").lower()
-    if axis not in {"x", "y", "z"}:
-        axis = "z"
     x0, y0, z0 = (float(facts.get(k, 0.0) or 0.0) for k in ("x0", "y0", "z0"))
     x1, y1, z1 = (float(facts.get(k, 0.0) or 0.0) for k in ("x1", "y1", "z1"))
     cx = (x0 + x1) / 2.0
     cy = (y0 + y1) / 2.0
     cz = (z0 + z1) / 2.0
+    axis_mode = str(facts.get("axis_mode", "global") or "global").lower()
+    axis_vec = _unit_vector(_probe_float_list_value(facts.get("axis_vec")))
+    axis_p0 = _probe_float_list_value(facts.get("axis_p0"))
+    axis_p1 = _probe_float_list_value(facts.get("axis_p1"))
+    if allow_oblique_axis and axis_mode == "oblique" and axis_vec:
+        axis_point = axis_p0 if len(axis_p0) == 3 else [cx, cy, cz]
+        if len(axis_p0) == 3 and len(axis_p1) == 3:
+            split_point = [(axis_p0[i] + axis_p1[i]) / 2.0 for i in range(3)]
+        else:
+            split_point = [cx, cy, cz]
+        split_normal = _perpendicular_unit_vector(axis_vec)
+        if split_normal:
+            return {
+                "spin_method": "cutsection",
+                "spin_axis": "vector",
+                "spin_axis_vector": [round(v, 9) for v in axis_vec],
+                "spin_axis_point": [round(v, 6) for v in axis_point],
+                "spin_split_plane_normal": [round(v, 9) for v in split_normal],
+                "spin_split_plane_point": [round(v, 6) for v in split_point],
+            }
+    axis = str(facts.get("drag_axis", "") or "z").lower()
+    if axis not in {"x", "y", "z"}:
+        axis = "z"
     normal_by_axis = {
         "x": [0.0, 1.0, 0.0],
         "y": [1.0, 0.0, 0.0],
@@ -925,10 +1005,10 @@ def _spin_cutsection_params_from_probe(facts: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _spin_params_from_probe(facts: dict[str, Any]) -> dict[str, Any]:
+def _spin_params_from_probe(facts: dict[str, Any], allow_oblique_axis: bool = True) -> dict[str, Any]:
     # Spin is intentionally based on a real cross-section cut through the
     # rotation axis. Do not reuse drag end faces or guessed longitudinal faces.
-    return _spin_cutsection_params_from_probe(facts)
+    return _spin_cutsection_params_from_probe(facts, allow_oblique_axis=allow_oblique_axis)
 
 
 def _gear_reason_from_probe(facts: dict[str, Any]) -> str | None:
@@ -1006,7 +1086,7 @@ def _gear_reason_from_probe(facts: dict[str, Any]) -> str | None:
     # repeated ribs/chamfers. Keep this path limited to gear-like envelopes.
     if sc >= 100 and tooth_count >= 40 and tooth_density >= 0.25 and md_mx >= 0.95 and 0.25 <= mn_mx <= 0.60:
         return "gear thin circular repeated-tooth body"
-    if src_surf <= 0 and sc >= 100 and tooth_count >= 40 and tooth_density >= 0.20 and mn_mx >= 0.70 and md_mx >= 0.70 and mx_md <= 1.40:
+    if src_surf <= 0 and 100 <= sc <= 220 and tooth_count >= 40 and tooth_density >= 0.20 and mn_mx >= 0.70 and md_mx >= 0.70 and mx_md <= 1.40:
         return "gear thick near-round repeated-tooth body"
     if sc >= 100 and tooth_count >= 40 and tooth_density >= 0.45 and 0.40 <= mn_mx <= 0.54 and 0.60 <= md_mx <= 0.75 and mx_md <= 1.60:
         return "gear oblong repeated-tooth body"
@@ -1018,7 +1098,7 @@ def _gear_reason_from_probe(facts: dict[str, Any]) -> str | None:
         return "gear disk/body: circular envelope with dense repeated-tooth band"
     if src_surf <= 0 and sc >= 400 and tooth_count >= 30 and tooth_density >= 0.06 and md_mx >= 0.95 and 0.18 <= mn_mx <= 0.50:
         return "gear high-surface external ring: repeated tooth band on circular envelope"
-    if src_surf <= 0 and sc >= 180 and tooth_count >= 40 and tooth_density >= 0.25 and md_mx >= 0.70 and mn_mx >= 0.70:
+    if src_surf <= 0 and sc >= 180 and tooth_count >= 40 and 0.25 <= tooth_density <= 0.65 and md_mx >= 0.70 and mn_mx >= 0.70:
         return "gear rounded/chamfer body: compact envelope with repeated-tooth band"
     if src_surf <= 0 and 40 <= sc <= 90 and tooth_count >= 20 and tooth_density >= 0.45 and mn_md >= 0.85 and 2.5 <= mx_md <= 5.5:
         return "gear shaft/end slender body: dense repeated tooth band"
@@ -1057,6 +1137,16 @@ def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[st
 
     def item_group(item: dict[str, Any]) -> str:
         return "gear" if item.get("strategy") == "gear_aware_tetra" else "tetra"
+
+    def append_batch(solid_ids: list[int], reason: str, pause: int = 5) -> None:
+        nonlocal batch_index
+        batches.append({
+            "batch": batch_index,
+            "solid_ids": solid_ids,
+            "reason": reason,
+            "pause_seconds_after_batch": pause,
+        })
+        batch_index += 1
 
     grouped_items: list[dict[str, Any]] = []
     grouped_by_id: dict[str, list[dict[str, Any]]] = {}
@@ -1104,44 +1194,38 @@ def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[st
             or score >= 20000
         )
         if current and group != current_group:
-            batches.append({
-                "batch": batch_index,
-                "solid_ids": current,
-                "reason": batch_reason(current_group),
-                "pause_seconds_after_batch": 5,
-            })
-            batch_index += 1
+            append_batch(current, batch_reason(current_group))
             current = []
             current_score = 0.0
             current_group = ""
-        if high_risk:
+        if len(solid_ids) > 4:
             if current:
-                batches.append({
-                    "batch": batch_index,
-                    "solid_ids": current,
-                    "reason": batch_reason(current_group),
-                    "pause_seconds_after_batch": 5,
-                })
-                batch_index += 1
+                append_batch(current, batch_reason(current_group))
                 current = []
                 current_score = 0.0
                 current_group = ""
-            batches.append({
-                "batch": batch_index,
-                "solid_ids": solid_ids,
-                "reason": f"high-risk {batch_reason(group)}; run alone, then save/cool down before the next tetra batch",
-                "pause_seconds_after_batch": 10,
-            })
-            batch_index += 1
+            for start in range(0, len(solid_ids), 4):
+                chunk = solid_ids[start:start + 4]
+                append_batch(
+                    chunk,
+                    f"{batch_reason(group)}; oversized fallback group split to keep tetra batch <=4 solids",
+                    10 if high_risk else 5,
+                )
+            continue
+        if high_risk:
+            if current:
+                append_batch(current, batch_reason(current_group))
+                current = []
+                current_score = 0.0
+                current_group = ""
+            append_batch(
+                solid_ids,
+                f"high-risk {batch_reason(group)}; run alone, then save/cool down before the next tetra batch",
+                10,
+            )
             continue
         if current and (len(current) + len(solid_ids) > 4 or current_score + score > 18000):
-            batches.append({
-                "batch": batch_index,
-                "solid_ids": current,
-                "reason": batch_reason(current_group),
-                "pause_seconds_after_batch": 5,
-            })
-            batch_index += 1
+            append_batch(current, batch_reason(current_group))
             current = []
             current_score = 0.0
             current_group = ""
@@ -1149,12 +1233,7 @@ def _tetra_execution_batches(results: dict[str, dict[str, Any]]) -> list[dict[st
         current_score += score
         current_group = group
     if current:
-        batches.append({
-            "batch": batch_index,
-            "solid_ids": current,
-            "reason": batch_reason(current_group),
-            "pause_seconds_after_batch": 5,
-        })
+        append_batch(current, batch_reason(current_group))
     return batches
 
 
@@ -1397,6 +1476,7 @@ def _run_hmbatch(
             capture_output=True,
             text=True,
             timeout=max(1, int(timeout_seconds)),
+            **_hidden_subprocess_kwargs(),
         )
         return {
             "success": completed.returncode == 0,
@@ -1452,9 +1532,10 @@ proc mcp_delete_elems {elems} {
 }
 
 proc mcp_delete_nodes {nodes} {
-    if {[llength $nodes] == 0} {return}
-    eval *createmark nodes 1 $nodes
-    catch {*deletemark nodes 1}
+    # HyperMesh 2020 does not allow direct node deletion in hmbatch for these
+    # temporary probe nodes. Deleting the temporary elements is enough here;
+    # direct node deletion only spams errors and can destabilize batch logs.
+    return
 }
 
 proc mcp_shell_loop_info {elems} {
@@ -1573,6 +1654,138 @@ proc find_best_source_surface {solid_id drag_axis sbb_min sbb_max} {
         if {$score < $best_score} {set best_score $score; set best_surf $sid}
     }
     return $best_surf
+}
+
+proc mcp_surface_mesh_probe_info {sid probe_size} {
+    set before_elems [mcp_all_elems]
+    set before_nodes [mcp_all_nodes]
+    set min_size [expr {max($probe_size / 4.0, 0.2)}]
+    set max_size [expr {$probe_size * 2.0}]
+    *createmark surfaces 1 $sid
+    if {[catch {
+        *createarray 3 0 0 0
+        *defaultmeshsurf_growth 1 $probe_size 3 3 2 1 1 1 35 0 $min_size $max_size 0.2 20.0 1.3 1 3 1 0
+    } mesh_err]} {
+        set leaked_elems [mcp_list_subtract [mcp_all_elems] $before_elems]
+        set leaked_nodes [mcp_list_subtract [mcp_all_nodes] $before_nodes]
+        if {[llength $leaked_elems] > 0} {mcp_delete_elems $leaked_elems}
+        if {[llength $leaked_nodes] > 0} {mcp_delete_nodes $leaked_nodes}
+        catch {*ameshclearsurface}
+        return [list 0 $sid 0 0 0 0 0 0 0 0 0 0]
+    }
+    set elems [mcp_list_subtract [mcp_all_elems] $before_elems]
+    set nodes [mcp_list_subtract [mcp_all_nodes] $before_nodes]
+    if {[llength $elems] == 0} {
+        mcp_delete_nodes $nodes
+        return [list 0 $sid 0 0 0 0 0 0 0 0 0 0]
+    }
+    set c [hm_getcentroid surfs 1]
+    set cx [lindex $c 0]; set cy [lindex $c 1]; set cz [lindex $c 2]
+    set nx 0.0; set ny 0.0; set nz 0.0
+    foreach eid $elems {
+        if {![catch {hm_getvalue elems id=$eid dataname=normalx} ex] && ![catch {hm_getvalue elems id=$eid dataname=normaly} ey] && ![catch {hm_getvalue elems id=$eid dataname=normalz} ez]} {
+            set nx [expr {$nx + $ex}]
+            set ny [expr {$ny + $ey}]
+            set nz [expr {$nz + $ez}]
+        }
+    }
+    set nl [expr {sqrt($nx*$nx + $ny*$ny + $nz*$nz)}]
+    if {$nl <= 1.0e-9} {
+        set first_elem [lindex $elems 0]
+        set elem_nodes [hm_getvalue elems id=$first_elem dataname=nodes]
+        if {[llength $elem_nodes] >= 3} {
+            set n1 [lindex $elem_nodes 0]; set n2 [lindex $elem_nodes 1]; set n3 [lindex $elem_nodes 2]
+            set x1 [hm_getvalue nodes id=$n1 dataname=x]; set y1 [hm_getvalue nodes id=$n1 dataname=y]; set z1 [hm_getvalue nodes id=$n1 dataname=z]
+            set x2 [hm_getvalue nodes id=$n2 dataname=x]; set y2 [hm_getvalue nodes id=$n2 dataname=y]; set z2 [hm_getvalue nodes id=$n2 dataname=z]
+            set x3 [hm_getvalue nodes id=$n3 dataname=x]; set y3 [hm_getvalue nodes id=$n3 dataname=y]; set z3 [hm_getvalue nodes id=$n3 dataname=z]
+            set ux [expr {$x2-$x1}]; set uy [expr {$y2-$y1}]; set uz [expr {$z2-$z1}]
+            set vx [expr {$x3-$x1}]; set vy [expr {$y3-$y1}]; set vz [expr {$z3-$z1}]
+            set nx [expr {$uy*$vz - $uz*$vy}]
+            set ny [expr {$uz*$vx - $ux*$vz}]
+            set nz [expr {$ux*$vy - $uy*$vx}]
+            set nl [expr {sqrt($nx*$nx + $ny*$ny + $nz*$nz)}]
+        }
+    }
+    if {$nl > 1.0e-9} {
+        set nx [expr {$nx/$nl}]
+        set ny [expr {$ny/$nl}]
+        set nz [expr {$nz/$nl}]
+    }
+    set loop_info [mcp_shell_loop_info $elems]
+    set loops [lindex $loop_info 0]
+    set be [lindex $loop_info 1]
+    set bn [lindex $loop_info 2]
+    *createmark surfaces 2 $sid
+    set bb [hm_getboundingbox surfaces 2 0 0 0]
+    set dx [expr {abs([lindex $bb 3] - [lindex $bb 0])}]
+    set dy [expr {abs([lindex $bb 4] - [lindex $bb 1])}]
+    set dz [expr {abs([lindex $bb 5] - [lindex $bb 2])}]
+    set dims [lsort -real [list $dx $dy $dz]]
+    set area_est [expr {[lindex $dims 1] * [lindex $dims 2]}]
+    mcp_delete_elems $elems
+    mcp_delete_nodes $nodes
+    return [list 1 $sid $cx $cy $cz $nx $ny $nz $loops [expr {$loops > 1 ? $loops - 1 : 0}] $be $bn $area_est]
+}
+
+proc find_oblique_source_surface {solid_id diag surf_count} {
+    if {$surf_count > 40} {return [list -1 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0]}
+    *createmark surfaces 1 "by solids" $solid_id
+    set all_surfs [hm_getmark surfaces 1]
+    set target_dist 0.0
+    if {![catch {hm_getboundingbox surfaces 1 0 0 0} solid_bb] && [llength $solid_bb] >= 6} {
+        set dx [expr {abs([lindex $solid_bb 3] - [lindex $solid_bb 0])}]
+        set dy [expr {abs([lindex $solid_bb 4] - [lindex $solid_bb 1])}]
+        set dz [expr {abs([lindex $solid_bb 5] - [lindex $solid_bb 2])}]
+        set target_dist [expr {min($dx, min($dy, $dz))}]
+    }
+    set probe_size [expr {max(min($diag / 12.0, 4.0), 0.5)}]
+    set infos {}
+    foreach sid $all_surfs {
+        set info [mcp_surface_mesh_probe_info $sid $probe_size]
+        if {[lindex $info 0] != 1} {continue}
+        lappend infos $info
+    }
+    set best_score -1.0
+    set best {}
+    set n [llength $infos]
+    for {set i 0} {$i < $n} {incr i} {
+        set a [lindex $infos $i]
+        for {set j [expr {$i + 1}]} {$j < $n} {incr j} {
+            set b [lindex $infos $j]
+            set ax [expr {[lindex $b 2] - [lindex $a 2]}]
+            set ay [expr {[lindex $b 3] - [lindex $a 3]}]
+            set az [expr {[lindex $b 4] - [lindex $a 4]}]
+            set dist [expr {sqrt($ax*$ax + $ay*$ay + $az*$az)}]
+            if {$dist <= max($diag * 0.04, 0.2)} {continue}
+            if {$target_dist > 1.0e-6} {
+                if {$dist < max($target_dist * 0.35, 0.2) || $dist > $target_dist * 1.70} {continue}
+            }
+            set ux [expr {$ax/$dist}]
+            set uy [expr {$ay/$dist}]
+            set uz [expr {$az/$dist}]
+            set ndot [expr {abs([lindex $a 5]*[lindex $b 5] + [lindex $a 6]*[lindex $b 6] + [lindex $a 7]*[lindex $b 7])}]
+            set adot [expr {abs($ux*[lindex $a 5] + $uy*[lindex $a 6] + $uz*[lindex $a 7])}]
+            set bdot [expr {abs($ux*[lindex $b 5] + $uy*[lindex $b 6] + $uz*[lindex $b 7])}]
+            if {$ndot < 0.72 || $adot < 0.60 || $bdot < 0.60} {continue}
+            set loops_a [lindex $a 8]
+            set loops_b [lindex $b 8]
+            set boundary_a [lindex $a 10]
+            set boundary_b [lindex $b 10]
+            if {$loops_a < 1 || $loops_b < 1 || $boundary_a < 4 || $boundary_b < 4} {continue}
+            set area_a [lindex $a 12]
+            set area_b [lindex $b 12]
+            set area_ratio [expr {min($area_a, $area_b) / max(max($area_a, $area_b), 1.0e-6)}]
+            if {$area_ratio < 0.35} {continue}
+            set dist_ratio [expr {$target_dist > 1.0e-6 ? abs($dist - $target_dist) / max($target_dist, 1.0e-6) : 0.0}]
+            set score [expr {min($area_a, $area_b) * (0.5 + $area_ratio) / (1.0 + 8.0 * $dist_ratio)}]
+            if {$score > $best_score} {
+                set best_score $score
+                set best [list [lindex $a 1] [lindex $b 1] $dist $ux $uy $uz [lindex $a 2] [lindex $a 3] [lindex $a 4] [lindex $b 2] [lindex $b 3] [lindex $b 4] [lindex $a 8] [lindex $a 9] [lindex $a 10] [lindex $a 11]]
+            }
+        }
+    }
+    if {[llength $best] == 0} {return [list -1 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0]}
+    return $best
 }
 
 proc mcp_gear_axis_from_bbox {solid_bb fallback_axis} {
@@ -1771,6 +1984,70 @@ foreach sid $solid_ids {
     set sbb_min [list [lindex $bb 0] [lindex $bb 1] [lindex $bb 2]]
     set sbb_max [list [lindex $bb 3] [lindex $bb 4] [lindex $bb 5]]
     set src_surf [find_best_source_surface $sid $drag_axis $sbb_min $sbb_max]
+    set target_surf -1
+    set axis_mode "global"
+    if {$drag_axis eq "x"} {
+        set axis_vx 1.0; set axis_vy 0.0; set axis_vz 0.0
+    } elseif {$drag_axis eq "y"} {
+        set axis_vx 0.0; set axis_vy 1.0; set axis_vz 0.0
+    } else {
+        set axis_vx 0.0; set axis_vy 0.0; set axis_vz 1.0
+    }
+    set axis_p0x [expr {([lindex $bb 0] + [lindex $bb 3]) / 2.0}]
+    set axis_p0y [expr {([lindex $bb 1] + [lindex $bb 4]) / 2.0}]
+    set axis_p0z [expr {([lindex $bb 2] + [lindex $bb 5]) / 2.0}]
+    set axis_p1x $axis_p0x
+    set axis_p1y $axis_p0y
+    set axis_p1z $axis_p0z
+    set drag_distance_hint $mn
+    if {$src_surf <= 0 && ($sc == 4 || $sc == 6) && $mx > 0 && $mn / $mx <= 0.75} {
+        set long_axis $drag_axis
+        set long_distance $mn
+        if {$mx == $dx} {
+            set long_axis "x"; set long_distance $dx
+        } elseif {$mx == $dy} {
+            set long_axis "y"; set long_distance $dy
+        } else {
+            set long_axis "z"; set long_distance $dz
+        }
+        set long_src [find_best_source_surface $sid $long_axis $sbb_min $sbb_max]
+        if {$long_src > 0} {
+            set drag_axis $long_axis
+            set src_surf $long_src
+            set drag_distance_hint $long_distance
+            set axis_mode "global"
+            if {$drag_axis eq "x"} {
+                set axis_vx 1.0; set axis_vy 0.0; set axis_vz 0.0
+            } elseif {$drag_axis eq "y"} {
+                set axis_vx 0.0; set axis_vy 1.0; set axis_vz 0.0
+            } else {
+                set axis_vx 0.0; set axis_vy 0.0; set axis_vz 1.0
+            }
+            puts "MCP long-axis drag source fallback solid=$sid axis=$drag_axis source=$src_surf dist=$drag_distance_hint"
+        }
+    }
+    if {$src_surf <= 0 && $sc <= 40} {
+        set oblique_info [find_oblique_source_surface $sid $diag $sc]
+        set ob_src [lindex $oblique_info 0]
+        set ob_dst [lindex $oblique_info 1]
+        set ob_dist [lindex $oblique_info 2]
+        if {$ob_src > 0 && $ob_dst > 0 && $ob_dist > 0} {
+            set src_surf $ob_src
+            set target_surf $ob_dst
+            set drag_distance_hint $ob_dist
+            set axis_mode "oblique"
+            set axis_vx [lindex $oblique_info 3]
+            set axis_vy [lindex $oblique_info 4]
+            set axis_vz [lindex $oblique_info 5]
+            set axis_p0x [lindex $oblique_info 6]
+            set axis_p0y [lindex $oblique_info 7]
+            set axis_p0z [lindex $oblique_info 8]
+            set axis_p1x [lindex $oblique_info 9]
+            set axis_p1y [lindex $oblique_info 10]
+            set axis_p1z [lindex $oblique_info 11]
+            puts "MCP oblique axis detected solid=$sid source=$src_surf target=$target_surf dist=$drag_distance_hint vec=$axis_vx,$axis_vy,$axis_vz"
+        }
+    }
     set src_loop_count 0
     set src_inner_loop_count 0
     set src_boundary_edge_count 0
@@ -1799,7 +2076,7 @@ foreach sid $solid_ids {
     set gear_tooth_surfs [mcp_gear_tooth_surfaces $sid $gear_axis $bb]
     set gear_tooth_csv [join $gear_tooth_surfs ","]
     
-    puts $f "PROBE: solid=$sid comp=\"$comp_name\" sc=$sc x0=[format %.6f [lindex $bb 0]] y0=[format %.6f [lindex $bb 1]] z0=[format %.6f [lindex $bb 2]] x1=[format %.6f [lindex $bb 3]] y1=[format %.6f [lindex $bb 4]] z1=[format %.6f [lindex $bb 5]] dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag] src_surf=$src_surf drag_axis=$drag_axis gear_axis=$gear_axis gear_tooth_surfs=$gear_tooth_csv gear_tooth_count=[llength $gear_tooth_surfs] src_loops=$src_loop_count src_inner_loops=$src_inner_loop_count src_boundary_edges=$src_boundary_edge_count src_boundary_nodes=$src_boundary_node_count"
+    puts $f "PROBE: solid=$sid comp=\"$comp_name\" sc=$sc x0=[format %.6f [lindex $bb 0]] y0=[format %.6f [lindex $bb 1]] z0=[format %.6f [lindex $bb 2]] x1=[format %.6f [lindex $bb 3]] y1=[format %.6f [lindex $bb 4]] z1=[format %.6f [lindex $bb 5]] dx=[format %.3f $dx] dy=[format %.3f $dy] dz=[format %.3f $dz] mn=[format %.3f $mn] mx=[format %.3f $mx] md=[format %.3f $md] slender=[format %.2f $slender] diag=[format %.3f $diag] src_surf=$src_surf target_surf=$target_surf drag_axis=$drag_axis axis_mode=$axis_mode axis_vec=[format %.9f $axis_vx],[format %.9f $axis_vy],[format %.9f $axis_vz] axis_p0=[format %.6f $axis_p0x],[format %.6f $axis_p0y],[format %.6f $axis_p0z] axis_p1=[format %.6f $axis_p1x],[format %.6f $axis_p1y],[format %.6f $axis_p1z] drag_distance_hint=[format %.6f $drag_distance_hint] gear_axis=$gear_axis gear_tooth_surfs=$gear_tooth_csv gear_tooth_count=[llength $gear_tooth_surfs] src_loops=$src_loop_count src_inner_loops=$src_inner_loop_count src_boundary_edges=$src_boundary_edge_count src_boundary_nodes=$src_boundary_node_count"
 }
 close $f
 """
@@ -1876,7 +2153,33 @@ def classify_all_solids_from_probe(
         elem_size = 1.0
         min_elem_size = 0.5
         src_surf = f.get("source_surface_id", -1)
+        source_loops = int(f.get("source_loop_count", 0) or 0)
         source_inner_loops = int(f.get("source_inner_loop_count", 0) or 0)
+        source_boundary_edges = int(f.get("source_boundary_edge_count", 0) or 0)
+        source_boundary_nodes = int(f.get("source_boundary_node_count", 0) or 0)
+        drag_source_has_boundary = source_loops >= 1 and source_boundary_edges >= 4
+        axis_mode = str(f.get("axis_mode", "global") or "global").lower()
+        axis_vec = _unit_vector(_probe_float_list_value(f.get("axis_vec")))
+        axis_p0 = _probe_float_list_value(f.get("axis_p0"))
+        axis_p1 = _probe_float_list_value(f.get("axis_p1"))
+        target_surf = int(f.get("target_surf", f.get("target_surface_id", -1)) or -1)
+        drag_distance_hint = float(f.get("drag_distance_hint", 0.0) or 0.0)
+        oblique_drag_distance_ok = (
+            axis_mode != "oblique"
+            or (
+                drag_distance_hint > 0
+                and mn > 0
+                and max(mn * 0.35, 0.2) <= drag_distance_hint <= mn * 1.70
+            )
+        )
+        oblique_axis_usable = (
+            axis_mode == "oblique"
+            and oblique_drag_distance_ok
+            and bool(axis_vec)
+            and target_surf > 0
+            and len(axis_p0) == 3
+            and len(axis_p1) == 3
+        )
         gear_reason = _gear_reason_from_probe(f) if use_gear_tooth_refinement else None
         gear_tooth_surface_ids = (
             _probe_int_list_value(f.get("gear_tooth_surfs") or f.get("gear_tooth_surface_ids"))
@@ -1890,15 +2193,27 @@ def classify_all_solids_from_probe(
             evidence.append(gear_reason)
             if gear_tooth_surface_ids:
                 evidence.append(f"gear tooth/outer-band surface candidates: {gear_tooth_count}")
-        elif sc == 6 and mx > 0 and mn / mx <= 0.75 and src_surf > 0 and source_inner_loops <= 1:
+        elif axis_mode == "oblique" and oblique_drag_distance_ok and src_surf > 0 and target_surf > 0 and axis_vec and sc in {4, 6} and mx > 0 and mn / mx <= 0.75 and source_inner_loops <= 1 and drag_source_has_boundary:
+            strategy = "drag_hex"
+            evidence.append("oblique constant-section solid/ring -> vector drag")
+        elif axis_mode == "oblique" and sc in {4, 6} and src_surf > 0 and not drag_source_has_boundary:
+            evidence.append("oblique drag source is closed/no-boundary surface -> tetra")
+        elif axis_mode != "oblique" and sc == 6 and mx > 0 and mn / mx <= 0.75 and src_surf > 0 and source_inner_loops <= 1 and drag_source_has_boundary:
             strategy = "drag_hex"
             evidence.append("6-face constant-section solid/ring, including short thick rings -> drag")
-        elif sc == 4 and mx > 0 and src_surf > 0 and cross_ratio >= 0.75 and mn / mx <= 0.60 and source_inner_loops <= 1:
+        elif axis_mode != "oblique" and sc == 4 and mx > 0 and src_surf > 0 and cross_ratio >= 0.75 and mn / mx <= 0.60 and source_inner_loops <= 1 and drag_source_has_boundary:
             strategy = "drag_hex"
             evidence.append("4-surface short cylinder -> drag")
+        elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops == 0 and mn / mx <= 0.30 and 8 <= sc <= 16:
+            strategy = "spin_hex"
+            evidence.append("axisymmetric solid/revolved body without source inner loop -> cut-section spin")
+            if oblique_axis_usable:
+                evidence.append("oblique spin axis accepted from paired end faces")
         elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops == 1 and mn / mx <= 0.55 and 6 <= sc <= 28:
             strategy = "spin_hex"
             evidence.append("axisymmetric recessed/hollow body -> cut-section spin")
+            if oblique_axis_usable:
+                evidence.append("oblique spin axis accepted from paired end faces")
         elif is_axisymmetric_bbox and src_surf > 0 and source_inner_loops > 1 and mn / mx <= 0.55 and 6 <= sc <= 28:
             evidence.append("multi-hole thin ring/source section -> tetra")
         elif is_axisymmetric_bbox and src_surf > 0 and mn / mx <= 0.55 and 6 <= sc <= 28:
@@ -1941,7 +2256,11 @@ def classify_all_solids_from_probe(
             allow_tetmesh = True
             allow_surface_mesh = True
         name = _generate_geometry_component_name(f, strategy, suffix_solid_id=True)
-        spin_plan = _spin_params_from_probe(f) if strategy == "spin_hex" else {}
+        spin_plan = (
+            _spin_params_from_probe(f, allow_oblique_axis=oblique_axis_usable)
+            if strategy == "spin_hex"
+            else {}
+        )
         results[str(sid)] = {
             "solid_id": sid, "strategy": strategy, "component_name": name,
             "raw_probe_line": stripped,
@@ -1952,11 +2271,17 @@ def classify_all_solids_from_probe(
             "allow_surface_mesh": allow_surface_mesh,
             "evidence": evidence,
             "source_surface_id": f.get("source_surface_id", -1),
-            "source_loop_count": int(f.get("source_loop_count", 0) or 0),
+            "target_surface_id": target_surf,
+            "source_loop_count": source_loops,
             "source_inner_loop_count": source_inner_loops,
-            "source_boundary_edge_count": int(f.get("source_boundary_edge_count", 0) or 0),
-            "source_boundary_node_count": int(f.get("source_boundary_node_count", 0) or 0),
+            "source_boundary_edge_count": source_boundary_edges,
+            "source_boundary_node_count": source_boundary_nodes,
             "drag_axis": f.get("drag_axis", ""),
+            "axis_mode": axis_mode,
+            "axis_vec": axis_vec,
+            "axis_p0": axis_p0,
+            "axis_p1": axis_p1,
+            "drag_distance_hint": drag_distance_hint,
             "gear_axis": f.get("gear_axis", f.get("drag_axis", "")),
             "geometry_confirms_gear_teeth": strategy == "gear_aware_tetra",
             "gear_detection_enabled": bool(use_gear_tooth_refinement),
@@ -2268,16 +2593,46 @@ def generate_geometry_probe_tcl(
         "    foreach x $a {if {![info exists seen($x)]} {lappend out $x}}",
         "    return $out",
         "}",
+        "proc mcp_shell_loop_info {elems} {",
+        "    if {[llength $elems] == 0} {return {0 0 0}}",
+        "    array set edge_count {}; array set edge_nodes {}",
+        "    foreach eid $elems {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=nodes} nodes]} {continue}",
+        "        set n [llength $nodes]",
+        "        if {$n < 3} {continue}",
+        "        for {set i 0} {$i < $n} {incr i} {",
+        "            set a [lindex $nodes $i]; set b [lindex $nodes [expr {($i + 1) % $n}]]",
+        "            if {$a eq \"\" || $b eq \"\" || $a == $b} {continue}",
+        "            if {$a < $b} {set key \"$a,$b\"; set pair [list $a $b]} else {set key \"$b,$a\"; set pair [list $b $a]}",
+        "            if {![info exists edge_count($key)]} {set edge_count($key) 0}",
+        "            incr edge_count($key)",
+        "            set edge_nodes($key) $pair",
+        "        }",
+        "    }",
+        "    array set adj {}; set boundary_edges 0",
+        "    foreach key [array names edge_count] {",
+        "        if {$edge_count($key) != 1} {continue}",
+        "        incr boundary_edges",
+        "        set pair $edge_nodes($key); set a [lindex $pair 0]; set b [lindex $pair 1]",
+        "        lappend adj($a) $b; lappend adj($b) $a",
+        "    }",
+        "    array set seen {}; set loops 0",
+        "    foreach node [array names adj] {",
+        "        if {[info exists seen($node)]} {continue}",
+        "        incr loops; set stack [list $node]; set seen($node) 1",
+        "        while {[llength $stack] > 0} {",
+        "            set cur [lindex $stack end]; set stack [lrange $stack 0 end-1]",
+        "            foreach nb $adj($cur) {if {![info exists seen($nb)]} {set seen($nb) 1; lappend stack $nb}}",
+        "        }",
+        "    }",
+        "    return [list $loops $boundary_edges [array size adj]]",
+        "}",
         "proc mcp_delete_elems {elems} {",
         "    if {[llength $elems] == 0} {return}",
         "    eval *createmark elems 1 $elems",
         "    catch {*deletemark elems 1}",
         "}",
-        "proc mcp_delete_nodes {nodes} {",
-        "    if {[llength $nodes] == 0} {return}",
-        "    eval *createmark nodes 1 $nodes",
-        "    catch {*deletemark nodes 1}",
-        "}",
+        "proc mcp_delete_nodes {nodes} {return}",
         "proc mcp_shell_loop_info {elems} {",
         "    if {[llength $elems] == 0} {return {0 0 0}}",
         "    array set edge_count {}",
@@ -2372,6 +2727,108 @@ def generate_geometry_probe_tcl(
         "        if {$score < $best_score} {set best_score $score; set best_surf $surf_id}",
         "    }",
         "    return $best_surf",
+        "}",
+        "proc mcp_surface_mesh_probe_info {sid probe_size} {",
+        "    set before_elems [mcp_all_elems]",
+        "    set before_nodes [mcp_all_nodes]",
+        "    set min_size [expr {max($probe_size / 4.0, 0.2)}]",
+        "    set max_size [expr {$probe_size * 2.0}]",
+        "    *createmark surfaces 1 $sid",
+        "    *createarray 3 0 0 0",
+        "    if {[catch {*defaultmeshsurf_growth 1 $probe_size 3 3 2 1 1 1 35 0 $min_size $max_size 0.2 20.0 1.3 1 3 1 0}]} {",
+        "        set leaked_elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
+        "        set leaked_nodes [mcp_list_subtract [mcp_all_nodes] $before_nodes]",
+        "        if {[llength $leaked_elems] > 0} {mcp_delete_elems $leaked_elems}",
+        "        if {[llength $leaked_nodes] > 0} {mcp_delete_nodes $leaked_nodes}",
+        "        catch {*ameshclearsurface}",
+        "        return [list 0 $sid 0 0 0 0 0 0 0 0 0 0]",
+        "    }",
+        "    set elems [mcp_list_subtract [mcp_all_elems] $before_elems]",
+        "    set nodes [mcp_list_subtract [mcp_all_nodes] $before_nodes]",
+        "    if {[llength $elems] == 0} {mcp_delete_nodes $nodes; return [list 0 $sid 0 0 0 0 0 0 0 0 0 0]}",
+        "    set c [hm_getcentroid surfs 1]",
+        "    set cx [lindex $c 0]; set cy [lindex $c 1]; set cz [lindex $c 2]",
+        "    set nx 0.0; set ny 0.0; set nz 0.0",
+        "    foreach eid $elems {",
+        "        if {![catch {hm_getvalue elems id=$eid dataname=normalx} ex] && ![catch {hm_getvalue elems id=$eid dataname=normaly} ey] && ![catch {hm_getvalue elems id=$eid dataname=normalz} ez]} {",
+        "            set nx [expr {$nx + $ex}]; set ny [expr {$ny + $ey}]; set nz [expr {$nz + $ez}]",
+        "        }",
+        "    }",
+        "    set nl [expr {sqrt($nx*$nx + $ny*$ny + $nz*$nz)}]",
+        "    if {$nl <= 1.0e-9} {",
+        "        set first_elem [lindex $elems 0]",
+        "        set elem_nodes [hm_getvalue elems id=$first_elem dataname=nodes]",
+        "        if {[llength $elem_nodes] >= 3} {",
+        "            set n1 [lindex $elem_nodes 0]; set n2 [lindex $elem_nodes 1]; set n3 [lindex $elem_nodes 2]",
+        "            set x1 [hm_getvalue nodes id=$n1 dataname=x]; set y1 [hm_getvalue nodes id=$n1 dataname=y]; set z1 [hm_getvalue nodes id=$n1 dataname=z]",
+        "            set x2 [hm_getvalue nodes id=$n2 dataname=x]; set y2 [hm_getvalue nodes id=$n2 dataname=y]; set z2 [hm_getvalue nodes id=$n2 dataname=z]",
+        "            set x3 [hm_getvalue nodes id=$n3 dataname=x]; set y3 [hm_getvalue nodes id=$n3 dataname=y]; set z3 [hm_getvalue nodes id=$n3 dataname=z]",
+        "            set ux [expr {$x2-$x1}]; set uy [expr {$y2-$y1}]; set uz [expr {$z2-$z1}]",
+        "            set vx [expr {$x3-$x1}]; set vy [expr {$y3-$y1}]; set vz [expr {$z3-$z1}]",
+        "            set nx [expr {$uy*$vz - $uz*$vy}]",
+        "            set ny [expr {$uz*$vx - $ux*$vz}]",
+        "            set nz [expr {$ux*$vy - $uy*$vx}]",
+        "            set nl [expr {sqrt($nx*$nx + $ny*$ny + $nz*$nz)}]",
+        "        }",
+        "    }",
+        "    if {$nl > 1.0e-9} {set nx [expr {$nx/$nl}]; set ny [expr {$ny/$nl}]; set nz [expr {$nz/$nl}]}",
+        "    set loop_info [mcp_shell_loop_info $elems]",
+        "    *createmark surfaces 2 $sid",
+        "    set sbb [hm_getboundingbox surfaces 2 0 0 0]",
+        "    set sdx [expr {abs([lindex $sbb 3] - [lindex $sbb 0])}]",
+        "    set sdy [expr {abs([lindex $sbb 4] - [lindex $sbb 1])}]",
+        "    set sdz [expr {abs([lindex $sbb 5] - [lindex $sbb 2])}]",
+        "    set dims [lsort -real [list $sdx $sdy $sdz]]",
+        "    set area_est [expr {[lindex $dims 1] * [lindex $dims 2]}]",
+        "    set loops [lindex $loop_info 0]",
+        "    mcp_delete_elems $elems",
+        "    mcp_delete_nodes $nodes",
+        "    return [list 1 $sid $cx $cy $cz $nx $ny $nz $loops [expr {$loops > 1 ? $loops - 1 : 0}] [lindex $loop_info 1] [lindex $loop_info 2] $area_est]",
+        "}",
+        "proc mcp_oblique_source_pair {solid_id diag surf_count} {",
+        "    if {$surf_count > 40} {return {-1 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0}}",
+        "    *createmark surfaces 1 \"by solids\" $solid_id",
+        "    set all_surfs [hm_getmark surfaces 1]",
+        "    set target_dist 0.0",
+        "    if {![catch {hm_getboundingbox surfaces 1 0 0 0} solid_bb] && [llength $solid_bb] >= 6} {",
+        "        set dx [expr {abs([lindex $solid_bb 3] - [lindex $solid_bb 0])}]",
+        "        set dy [expr {abs([lindex $solid_bb 4] - [lindex $solid_bb 1])}]",
+        "        set dz [expr {abs([lindex $solid_bb 5] - [lindex $solid_bb 2])}]",
+        "        set target_dist [expr {min($dx, min($dy, $dz))}]",
+        "    }",
+        "    set probe_size [expr {max(min($diag / 12.0, 4.0), 0.5)}]",
+        "    set infos {}",
+        "    foreach sid $all_surfs {set info [mcp_surface_mesh_probe_info $sid $probe_size]; if {[lindex $info 0] == 1} {lappend infos $info}}",
+        "    set best_score -1.0; set best {}",
+        "    set n [llength $infos]",
+        "    for {set i 0} {$i < $n} {incr i} {",
+        "        set a [lindex $infos $i]",
+        "        for {set j [expr {$i + 1}]} {$j < $n} {incr j} {",
+        "            set b [lindex $infos $j]",
+        "            set ax [expr {[lindex $b 2] - [lindex $a 2]}]; set ay [expr {[lindex $b 3] - [lindex $a 3]}]; set az [expr {[lindex $b 4] - [lindex $a 4]}]",
+        "            set dist [expr {sqrt($ax*$ax + $ay*$ay + $az*$az)}]",
+        "            if {$dist <= max($diag * 0.04, 0.2)} {continue}",
+        "            if {$target_dist > 1.0e-6} {",
+        "                if {$dist < max($target_dist * 0.35, 0.2) || $dist > $target_dist * 1.70} {continue}",
+        "            }",
+        "            set ux [expr {$ax/$dist}]; set uy [expr {$ay/$dist}]; set uz [expr {$az/$dist}]",
+        "            set ndot [expr {abs([lindex $a 5]*[lindex $b 5] + [lindex $a 6]*[lindex $b 6] + [lindex $a 7]*[lindex $b 7])}]",
+        "            set adot [expr {abs($ux*[lindex $a 5] + $uy*[lindex $a 6] + $uz*[lindex $a 7])}]",
+        "            set bdot [expr {abs($ux*[lindex $b 5] + $uy*[lindex $b 6] + $uz*[lindex $b 7])}]",
+        "            if {$ndot < 0.72 || $adot < 0.60 || $bdot < 0.60} {continue}",
+        "            set loops_a [lindex $a 8]; set loops_b [lindex $b 8]",
+        "            set boundary_a [lindex $a 10]; set boundary_b [lindex $b 10]",
+        "            if {$loops_a < 1 || $loops_b < 1 || $boundary_a < 4 || $boundary_b < 4} {continue}",
+        "            set area_a [lindex $a 12]; set area_b [lindex $b 12]",
+        "            set area_ratio [expr {min($area_a, $area_b) / max(max($area_a, $area_b), 1.0e-6)}]",
+        "            if {$area_ratio < 0.35} {continue}",
+        "            set dist_ratio [expr {$target_dist > 1.0e-6 ? abs($dist - $target_dist) / max($target_dist, 1.0e-6) : 0.0}]",
+        "            set score [expr {min($area_a, $area_b) * (0.5 + $area_ratio) / (1.0 + 8.0 * $dist_ratio)}]",
+        "            if {$score > $best_score} {set best_score $score; set best [list [lindex $a 1] [lindex $b 1] $dist $ux $uy $uz [lindex $a 2] [lindex $a 3] [lindex $a 4] [lindex $b 2] [lindex $b 3] [lindex $b 4] [lindex $a 8] [lindex $a 9] [lindex $a 10] [lindex $a 11]]}",
+        "        }",
+        "    }",
+        "    if {[llength $best] == 0} {return {-1 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 0}}",
+        "    return $best",
         "}",
         "proc mcp_gear_axis_from_bbox {solid_bb fallback_axis} {",
         "    set dx [expr {abs([lindex $solid_bb 3] - [lindex $solid_bb 0])}]",
@@ -2588,6 +3045,12 @@ def generate_geometry_probe_tcl(
         "    set drag_axis \"\"",
         "    set gear_axis \"\"",
         "    set src_surf -1",
+        "    set target_surf -1",
+        "    set axis_mode \"global\"",
+        "    set axis_vx 0.0; set axis_vy 0.0; set axis_vz 1.0",
+        "    set axis_p0x 0.0; set axis_p0y 0.0; set axis_p0z 0.0",
+        "    set axis_p1x 0.0; set axis_p1y 0.0; set axis_p1z 0.0",
+        "    set drag_distance_hint 0.0",
         "    set src_loop_count 0",
         "    set src_inner_loop_count 0",
         "    set src_boundary_edge_count 0",
@@ -2596,15 +3059,67 @@ def generate_geometry_probe_tcl(
         "        if {$dx <= $dy && $dx <= $dz} {set drag_axis \"x\"} elseif {$dy <= $dx && $dy <= $dz} {set drag_axis \"y\"} else {set drag_axis \"z\"}",
         "        set gear_axis [mcp_gear_axis_from_bbox $bb $drag_axis]",
         "        set src_surf [mcp_best_source_surface $sid $drag_axis $bb]",
-        "        set loop_info [mcp_surface_loop_info $src_surf]",
-        "        set src_loop_count [lindex $loop_info 0]",
-        "        set src_boundary_edge_count [lindex $loop_info 1]",
-        "        set src_boundary_node_count [lindex $loop_info 2]",
-        "        if {$src_loop_count > 1} {set src_inner_loop_count [expr {$src_loop_count - 1}]}",
+        "        if {$drag_axis eq \"x\"} {set axis_vx 1.0; set axis_vy 0.0; set axis_vz 0.0} elseif {$drag_axis eq \"y\"} {set axis_vx 0.0; set axis_vy 1.0; set axis_vz 0.0} else {set axis_vx 0.0; set axis_vy 0.0; set axis_vz 1.0}",
+        "        set axis_p0x [expr {([lindex $bb 0] + [lindex $bb 3]) / 2.0}]",
+        "        set axis_p0y [expr {([lindex $bb 1] + [lindex $bb 4]) / 2.0}]",
+        "        set axis_p0z [expr {([lindex $bb 2] + [lindex $bb 5]) / 2.0}]",
+        "        set axis_p1x $axis_p0x",
+        "        set axis_p1y $axis_p0y",
+        "        set axis_p1z $axis_p0z",
+        "        set min_dim [expr {min($dx, min($dy, $dz))}]",
+        "        set drag_distance_hint $min_dim",
+        "        if {$src_surf <= 0 && ($surf_count == 4 || $surf_count == 6) && $max_dim > 0 && $min_dim / $max_dim <= 0.75} {",
+        "            set long_axis $drag_axis",
+        "            set long_distance $min_dim",
+        "            if {$max_dim == $dx} {",
+        "                set long_axis \"x\"; set long_distance $dx",
+        "            } elseif {$max_dim == $dy} {",
+        "                set long_axis \"y\"; set long_distance $dy",
+        "            } else {",
+        "                set long_axis \"z\"; set long_distance $dz",
+        "            }",
+        "            set long_src [mcp_best_source_surface $sid $long_axis $bb]",
+        "            if {$long_src > 0} {",
+        "                set drag_axis $long_axis",
+        "                set src_surf $long_src",
+        "                set drag_distance_hint $long_distance",
+        "                set axis_mode \"global\"",
+        "                if {$drag_axis eq \"x\"} {set axis_vx 1.0; set axis_vy 0.0; set axis_vz 0.0} elseif {$drag_axis eq \"y\"} {set axis_vx 0.0; set axis_vy 1.0; set axis_vz 0.0} else {set axis_vx 0.0; set axis_vy 0.0; set axis_vz 1.0}",
+        "                mcp_probe_line \"MCP long-axis drag source fallback solid=$sid axis=$drag_axis source=$src_surf dist=$drag_distance_hint\"",
+        "            }",
+        "        }",
+        "        if {$src_surf <= 0 && $surf_count <= 40} {",
+        "            set oblique_info [mcp_oblique_source_pair $sid $diag $surf_count]",
+        "            set ob_src [lindex $oblique_info 0]",
+        "            set ob_dst [lindex $oblique_info 1]",
+        "            set ob_dist [lindex $oblique_info 2]",
+        "            if {$ob_src > 0 && $ob_dst > 0 && $ob_dist > 0} {",
+        "                set src_surf $ob_src",
+        "                set target_surf $ob_dst",
+        "                set drag_distance_hint $ob_dist",
+        "                set axis_mode \"oblique\"",
+        "                set axis_vx [lindex $oblique_info 3]",
+        "                set axis_vy [lindex $oblique_info 4]",
+        "                set axis_vz [lindex $oblique_info 5]",
+        "                set axis_p0x [lindex $oblique_info 6]",
+        "                set axis_p0y [lindex $oblique_info 7]",
+        "                set axis_p0z [lindex $oblique_info 8]",
+        "                set axis_p1x [lindex $oblique_info 9]",
+        "                set axis_p1y [lindex $oblique_info 10]",
+        "                set axis_p1z [lindex $oblique_info 11]",
+        "            }",
+        "        }",
+        "        if {$src_surf > 0} {",
+        "            set loop_info [mcp_surface_loop_info $src_surf]",
+        "            set src_loop_count [lindex $loop_info 0]",
+        "            set src_boundary_edge_count [lindex $loop_info 1]",
+        "            set src_boundary_node_count [lindex $loop_info 2]",
+        "            if {$src_loop_count > 1} {set src_inner_loop_count [expr {$src_loop_count - 1}]}",
+        "        }",
         "    }",
         "    set gear_tooth_surfs [mcp_gear_tooth_surfaces $sid $gear_axis $bb]",
         "    set gear_tooth_csv [join $gear_tooth_surfs \",\"]",
-        '    mcp_probe_line "MCP_PROBE_SOLID id=$sid exists=1 surf_count=$surf_count elem_count=[llength $new_elems] node_count=[llength $new_nodes] tri_count=$tri_count quad_count=$quad_count bbox_ok=$bbox_ok x0=[lindex $bb 0] y0=[lindex $bb 1] z0=[lindex $bb 2] x1=[lindex $bb 3] y1=[lindex $bb 4] z1=[lindex $bb 5] dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender src_surf=$src_surf drag_axis=$drag_axis gear_axis=$gear_axis gear_tooth_surfs=$gear_tooth_csv gear_tooth_count=[llength $gear_tooth_surfs] src_loops=$src_loop_count src_inner_loops=$src_inner_loop_count src_boundary_edges=$src_boundary_edge_count src_boundary_nodes=$src_boundary_node_count"',
+        '    mcp_probe_line "MCP_PROBE_SOLID id=$sid exists=1 surf_count=$surf_count elem_count=[llength $new_elems] node_count=[llength $new_nodes] tri_count=$tri_count quad_count=$quad_count bbox_ok=$bbox_ok x0=[lindex $bb 0] y0=[lindex $bb 1] z0=[lindex $bb 2] x1=[lindex $bb 3] y1=[lindex $bb 4] z1=[lindex $bb 5] dx=$dx dy=$dy dz=$dz diag=$diag slender=$slender src_surf=$src_surf target_surf=$target_surf drag_axis=$drag_axis axis_mode=$axis_mode axis_vec=$axis_vx,$axis_vy,$axis_vz axis_p0=$axis_p0x,$axis_p0y,$axis_p0z axis_p1=$axis_p1x,$axis_p1y,$axis_p1z drag_distance_hint=$drag_distance_hint gear_axis=$gear_axis gear_tooth_surfs=$gear_tooth_csv gear_tooth_count=[llength $gear_tooth_surfs] src_loops=$src_loop_count src_inner_loops=$src_inner_loop_count src_boundary_edges=$src_boundary_edge_count src_boundary_nodes=$src_boundary_node_count"',
         "    mcp_delete_elems $new_elems",
         "    mcp_delete_nodes $new_nodes",
         "}",
@@ -2809,6 +3324,7 @@ def check_hypermesh_connection(hmbatch_path: str | None = None) -> dict[str, Any
             capture_output=True,
             text=True,
             timeout=20,
+            **_hidden_subprocess_kwargs(),
         )
         return {
             "success": True,
@@ -3002,6 +3518,7 @@ def generate_plain_tetra_tcl(
         "set final_bad_vol_count 0",
         "set kept_surface_shell_count 0",
         "set last_param_key \"\"",
+        "set last_no_tetra_reason none",
         "set target_vol_skew_report -1",
         "set repair_fit_degrade_ratio 2.0",
         "set surface_fit_degraded_keep_surface 0",
@@ -3311,15 +3828,26 @@ def generate_plain_tetra_tcl(
         "}",
         "proc mcp_restore_surface_backup {backup_ids backup_comp target_comp all_surfs} {",
         "    if {[llength $backup_ids] == 0} {return {}}",
-        "    set current_shells [mcp_list_subtract [mcp_shells_on_surfaces $all_surfs] $backup_ids]",
-        "    if {[llength $current_shells] > 0} {mcp_delete_elems $current_shells}",
         "    set before [mcp_all_elems]",
         "    if {![mcp_set_current_component $target_comp 7]} {return {}}",
         "    eval *createmark elems 1 $backup_ids",
         "    set dup_rc [catch {*duplicatemark elems 1 1} dup_err]",
         "    if {$dup_rc} {puts \"MCP_PT_WARN surface_backup_restore_failed=$dup_err component=$backup_comp\"; return {}}",
         "    set restored [mcp_list_subtract [mcp_all_elems] $before]",
+        "    if {[llength $restored] == 0} {",
+        "        puts \"MCP_PT_WARN surface_backup_restore_empty_after_duplicate component=$backup_comp\"",
+        "        mcp_cleanup_surface_backup $backup_ids $backup_comp",
+        "        return {}",
+        "    }",
         "    if {[llength $restored] > 0} {eval *createmark elems 1 $restored; catch {*movemark elems 1 \"$target_comp\"}}",
+        "    set current_shells [mcp_list_subtract [mcp_shells_on_surfaces $all_surfs] [concat $backup_ids $restored]]",
+        "    if {[llength $current_shells] > 0} {mcp_delete_elems $current_shells}",
+        "    *createmark elems 1 \"by comp\" \"$target_comp\"",
+        "    set target_leftovers [mcp_list_subtract [hm_getmark elems 1] [concat $backup_ids $restored]]",
+        "    if {[llength $target_leftovers] > 0} {",
+        "        puts \"MCP_PT_INFO rollback_cleanup_target_leftovers=[llength $target_leftovers] component=$target_comp\"",
+        "        mcp_delete_elems $target_leftovers",
+        "    }",
         "    mcp_delete_elems $backup_ids",
         "    mcp_delete_component_if_empty $backup_comp",
         "    return $restored",
@@ -3711,7 +4239,9 @@ def generate_plain_tetra_tcl(
         '    puts "MCP_PT_INFO solid=$target_solid surface_backup_created shell_count=$shell_count backup_count=$surface_backup_count component=$surface_backup_component"',
         '    if {$surface_backup_count != $shell_count} {',
         '        puts "MCP_PT_STOP solid=$target_solid surface_backup_failed shell_count=$shell_count backup_count=$surface_backup_count keep_repaired_surface_mesh=1"',
+        '        mcp_cleanup_surface_backup $surface_backup_ids $surface_backup_component',
         '        set kept_surface_shell_count $shell_count',
+        '        set last_no_tetra_reason surface_backup_failed',
         '        set ok 0',
         '        break',
         '    }',
@@ -3722,8 +4252,11 @@ def generate_plain_tetra_tcl(
         '    *createmark components 2 "$target_component"',
         '    if {[hm_marklength components 2] == 0} {',
         '        puts "MCP_PT_WARN solid=$target_solid tetmesh_failed=no_component_mark component=$target_component"',
-        '        mcp_cleanup_surface_backup $surface_backup_ids $surface_backup_component',
-        '        set kept_surface_shell_count $shell_count',
+        '        set rollback_shell_ids [mcp_restore_surface_backup $surface_backup_ids $surface_backup_component $target_component $all_surfs]',
+        '        puts "MCP_PT_INFO solid=$target_solid surface_backup_restored restored_count=[llength $rollback_shell_ids] expected=$surface_backup_count component=$surface_backup_component reason=no_component_mark"',
+        '        if {[llength $rollback_shell_ids] == 0} {set rollback_shell_ids [mcp_shells_on_surfaces $all_surfs]}',
+        '        set kept_surface_shell_count [llength $rollback_shell_ids]',
+        '        set last_no_tetra_reason no_component_mark',
         '        continue',
         '    }',
         '    catch {update}',
@@ -3733,12 +4266,25 @@ def generate_plain_tetra_tcl(
         '        puts "MCP_PT_WARN solid=$target_solid tetmesh_failed=$tet_err manual_component_tetmesh_rejected=1"',
         '        set failed_new_elems [mcp_list_subtract [mcp_all_elems] $before_tetmesh_elems]',
         '        mcp_delete_elems $failed_new_elems',
-        '        mcp_cleanup_surface_backup $surface_backup_ids $surface_backup_component',
-        '        set kept_surface_shell_count $shell_count',
+        '        set rollback_shell_ids [mcp_restore_surface_backup $surface_backup_ids $surface_backup_component $target_component $all_surfs]',
+        '        puts "MCP_PT_INFO solid=$target_solid surface_backup_restored restored_count=[llength $rollback_shell_ids] expected=$surface_backup_count component=$surface_backup_component reason=tetmesh_failed"',
+        '        if {[llength $rollback_shell_ids] == 0} {set rollback_shell_ids [mcp_shells_on_surfaces $all_surfs]}',
+        '        set kept_surface_shell_count [llength $rollback_shell_ids]',
+        '        set last_no_tetra_reason tetmesh_failed',
         '        continue',
         '    }',
         '    set comp_elems [mcp_tetra_ids_in_component $target_component]',
-        '    if {[llength $comp_elems] == 0} { puts "MCP_PT_WARN solid=$target_solid no_tetra_after_tetmesh_keep_surface_mesh=1"; mcp_cleanup_surface_backup $surface_backup_ids $surface_backup_component; set kept_surface_shell_count $shell_count; continue }',
+        '    if {[llength $comp_elems] == 0} {',
+        '        puts "MCP_PT_WARN solid=$target_solid no_tetra_after_tetmesh_keep_surface_mesh=1"',
+        '        set failed_new_elems [mcp_list_subtract [mcp_all_elems] $before_tetmesh_elems]',
+        '        mcp_delete_elems $failed_new_elems',
+        '        set rollback_shell_ids [mcp_restore_surface_backup $surface_backup_ids $surface_backup_component $target_component $all_surfs]',
+        '        puts "MCP_PT_INFO solid=$target_solid surface_backup_restored restored_count=[llength $rollback_shell_ids] expected=$surface_backup_count component=$surface_backup_component reason=no_tetra_after_tetmesh"',
+        '        if {[llength $rollback_shell_ids] == 0} {set rollback_shell_ids [mcp_shells_on_surfaces $all_surfs]}',
+        '        set kept_surface_shell_count [llength $rollback_shell_ids]',
+        '        set last_no_tetra_reason no_tetra_after_tetmesh',
+        '        continue',
+        '    }',
         '    puts "MCP_PT_INFO solid=$target_solid tetmesh_generation_vol_skew_target=$target_vol_skew"',
         '    set bad_vol_ids [mcp_bad_vol_skew_ids $comp_elems $repair_vol_skew]',
         '    if {[llength $bad_vol_ids] < 0} {',
@@ -3827,7 +4373,7 @@ def generate_plain_tetra_tcl(
         '    if {$c==210 || $c==547} {incr t10}',
         '}',
         'if {!$ok && $final_bad_vol_count > 0} { puts "MCP_PT_QUALITY_FAIL solid=$final_bad_solid bad_volume_elements=$final_bad_vol_count kept_surface_shells=1" }',
-        'if {!$ok && $final_bad_vol_count == 0} { puts "MCP_PT_FAIL solid=$target_solid no_accepted_tetra_after_retries kept_surface_shells=$kept_surface_shell_count" }',
+        'if {!$ok && $final_bad_vol_count == 0} { puts "MCP_PT_FAIL solid=$target_solid no_accepted_tetra_after_retries kept_surface_shells=$kept_surface_shell_count reason=$last_no_tetra_reason" }',
         'puts "MCP_PT_DONE solid=$target_solid ok=$ok total=$final_count tet4=$t4 tet10=$t10 unfixed_aspect=$unfixed_aspect_report extreme_surface_aspect=$extreme_surface_aspect_count tetmesh_generation_vol_skew_target=$target_vol_skew unrepaired_vol_skew_over_$repair_vol_skew=$unrepaired_vol_skew_report"',
         'puts "MCP_CONSOLE solid=$target_solid stage=3d_result ok=$ok tet4=$t4 tet10=$t10 unfixed_aspect=$unfixed_aspect_report bad_vol=$unrepaired_vol_skew_report"',
     ]
@@ -4430,17 +4976,37 @@ def generate_guarded_drag_hex_tcl(
         "*interactiveremeshsurf 1 $elem_size 1 1 1 1 1",
         "*set_meshfaceparams 0 5 1 0 0 1 0.5 1 1",
         *group_lines,
-        "*automesh 0 5 1",
-        "*storemeshtodatabase 1",
-        "*ameshclearsurface",
-        '*createmark elems 1 "by surface" $source_surface',
-        "set source_shells [hm_getmark elems 1]",
+        "set source_automesh_ok 1",
+        "if {[catch {*automesh 0 5 1} _mcp_automesh_err]} {",
+        '    puts "MCP_DRAG_WARN stage=source_automesh_mode5_error solid=$target_solid surf=$source_surface error=$_mcp_automesh_err"',
+        "    if {[catch {*automesh 0 4 1} _mcp_automesh_err2]} {",
+        '        puts "MCP_DRAG_FAIL stage=source_automesh_error solid=$target_solid surf=$source_surface error=$_mcp_automesh_err2"',
+        "        catch {*ameshclearsurface}",
+        "        set source_automesh_ok 0",
+        "    } else {",
+        "        *storemeshtodatabase 1",
+        "        *ameshclearsurface",
+        "    }",
+        "} else {",
+        "    *storemeshtodatabase 1",
+        "    *ameshclearsurface",
+        "}",
+        "if {$source_automesh_ok} {",
+        '    *createmark elems 1 "by surface" $source_surface',
+        "    set source_shells [hm_getmark elems 1]",
+        "} else {",
+        "    set source_shells {}",
+        "}",
         "set quad_count 0",
         "foreach eid $source_shells {",
         "    set cfg [hm_getvalue elems id=$eid dataname=config]",
         "    if {$cfg == 104 || $cfg == 108} { incr quad_count }",
         "}",
-        "if {[llength $source_shells] == 0 || $quad_count != [llength $source_shells]} {",
+        "set source_loop_info [mcp_shell_loop_info $source_shells]",
+        "set source_loops [lindex $source_loop_info 0]",
+        "set source_boundary_edges [lindex $source_loop_info 1]",
+        "puts \"MCP_DRAG_SOURCE_TOPOLOGY single solid=$target_solid loops=$source_loops boundary_edges=$source_boundary_edges boundary_nodes=[lindex $source_loop_info 2]\"",
+        "if {[llength $source_shells] == 0 || $quad_count != [llength $source_shells] || $source_loops < 1 || $source_boundary_edges < 4} {",
         '    puts "MCP guarded drag skipped: source face is not all quads."',
         "    if {[llength $source_shells] > 0} { eval *createmark elems 1 $source_shells; catch {*deletemark elems 1} }",
         '    puts "MCP guarded drag skipped tetra fallback: removed_old_tetra_path=1"',
@@ -4579,11 +5145,22 @@ def generate_batched_drag_hex_tcl(
         dd_val = float(s.get("drag_distance", 0))
         comp_val = _tcl_escape_name(str(s.get("component_name", "")))
         ax_val = str(s.get("axis", "z")).strip().lower()
+        axis_mode = str(s.get("axis_mode", "global") or "global").strip().lower()
+        drag_vec = _unit_vector(_probe_float_list_value(s.get("drag_vector") or s.get("axis_vec")))
         if sid_val <= 0 or surf_val <= 0 or dd_val <= 0 or not comp_val:
             raise ValueError(f"Invalid solid spec: {s}")
         if ax_val not in ("x", "y", "z"):
             raise ValueError(f"axis must be x/y/z, got: {ax_val}")
-        batch_items.append(f"{sid_val} {surf_val} {dd_val} {{{comp_val}}} {ax_val}")
+        if axis_mode == "oblique":
+            if not drag_vec:
+                raise ValueError(f"Oblique drag solid is missing axis_vec/drag_vector: {s}")
+            vx_val, vy_val, vz_val = drag_vec
+            mode_val = "vector"
+        else:
+            axis_vectors = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+            vx_val, vy_val, vz_val = axis_vectors[ax_val]
+            mode_val = "axis"
+        batch_items.append(f"{sid_val} {surf_val} {dd_val} {{{comp_val}}} {ax_val} {vx_val:.12g} {vy_val:.12g} {vz_val:.12g} {mode_val}")
 
     batch_tcl = "\n".join(f"    {item}" for item in batch_items)
 
@@ -4615,6 +5192,49 @@ def generate_batched_drag_hex_tcl(
         "proc b_sub {a b} { array set x {}; foreach i $b {set x($i) 1}; set o {}; foreach i $a {if {![info exists x($i)]} {lappend o $i}}; return $o }",
         "proc b_hex {e} { set c 0; foreach i $e { if {![catch {hm_getvalue elems id=$i dataname=config} g]} {if {$g==208} {incr c}} }; return $c }",
         "proc b_del {e} { if {[llength $e]>0} { eval *createmark elems 1 $e; catch {*deletemark elems 1} } }",
+        "proc b_shell_loop_info {elems} {",
+        "    if {[llength $elems] == 0} {return {0 0 0}}",
+        "    array set edge_count {}; array set edge_nodes {}",
+        "    foreach eid $elems {",
+        "        if {[catch {hm_getvalue elems id=$eid dataname=nodes} nodes]} {continue}",
+        "        set n [llength $nodes]",
+        "        if {$n < 3} {continue}",
+        "        for {set i 0} {$i < $n} {incr i} {",
+        "            set a [lindex $nodes $i]; set b [lindex $nodes [expr {($i + 1) % $n}]]",
+        "            if {$a eq \"\" || $b eq \"\" || $a == $b} {continue}",
+        "            if {$a < $b} {set key \"$a,$b\"; set pair [list $a $b]} else {set key \"$b,$a\"; set pair [list $b $a]}",
+        "            if {![info exists edge_count($key)]} {set edge_count($key) 0}",
+        "            incr edge_count($key)",
+        "            set edge_nodes($key) $pair",
+        "        }",
+        "    }",
+        "    array set adj {}; set boundary_edges 0",
+        "    foreach key [array names edge_count] {",
+        "        if {$edge_count($key) != 1} {continue}",
+        "        incr boundary_edges",
+        "        set pair $edge_nodes($key); set a [lindex $pair 0]; set b [lindex $pair 1]",
+        "        lappend adj($a) $b; lappend adj($b) $a",
+        "    }",
+        "    array set seen {}; set loops 0",
+        "    foreach node [array names adj] {",
+        "        if {[info exists seen($node)]} {continue}",
+        "        incr loops; set stack [list $node]; set seen($node) 1",
+        "        while {[llength $stack] > 0} {",
+        "            set cur [lindex $stack end]; set stack [lrange $stack 0 end-1]",
+        "            foreach nb $adj($cur) {if {![info exists seen($nb)]} {set seen($nb) 1; lappend stack $nb}}",
+        "        }",
+        "    }",
+        "    return [list $loops $boundary_edges [array size adj]]",
+        "}",
+        "proc b_set_current_component {comp} {",
+        "    if {[catch {hm_entityinfo exist comps $comp -byname} exists]} {set exists 0}",
+        "    if {!$exists} {catch {*createentity comps name=$comp color=7}}",
+        "    if {[catch {*currentcollector components \"$comp\"} err]} {",
+        "        puts \"MCP_DRAG_FAIL stage=currentcollector_error component=$comp error=$err\"",
+        "        return 0",
+        "    }",
+        "    return 1",
+        "}",
         "proc b_aspect_bad {e threshold} {",
         "    if {[llength $e]==0} {return 0}",
         "    if {[catch {eval *createmark elements 1 $e; *createmark elements 2; *elementtestaspect elements 1 $threshold 2 2 0 \"  3D Aspect Ratio  \"} err]} {",
@@ -4639,9 +5259,14 @@ def generate_batched_drag_hex_tcl(
         "set batch {",
         batch_tcl,
         "}",
-        "foreach {sid surf dd dc ax} $batch {",
+        "foreach {sid surf dd dc ax axis_vx axis_vy axis_vz axis_mode} $batch {",
         "    catch {*beginhistorystate \"MCP guarded drag hex batch s$sid\"}",
-        '    *currentcollector components "$dc"',
+        "    if {![b_set_current_component $dc]} {",
+        "        puts \"MCP_DRAG_SKIP_TETRA solid=$sid reason=currentcollector_failed removed_old_tetra_path=1\"",
+        "        catch {*endhistorystate \"MCP guarded drag hex batch s$sid\"}",
+        "        incr completed_drag_solids",
+        "        continue",
+        "    }",
         "    catch {*setedgedensitylinkwithaspectratio -1}; *setedgedensitylink 1",
         "    *createmark surfaces 2 $surf",
         "    set size_bb [hm_getboundingbox surfaces 2 0 0 0]",
@@ -4672,7 +5297,18 @@ def generate_batched_drag_hex_tcl(
         "        } else {",
         "            foreach e {0 1 2 3} { catch {*set_meshedgeparams $e $td 1 0 0 0 $cs 0 0} }",
         "        }",
-        "        *automesh 0 5 1; *storemeshtodatabase 1; *ameshclearsurface",
+        "        if {[catch {*automesh 0 5 1} _mcp_automesh_err]} {",
+        "            puts \"MCP_DRAG_WARN stage=source_automesh_mode5_error solid=$sid surf=$surf error=$_mcp_automesh_err\"",
+        "            if {[catch {*automesh 0 4 1} _mcp_automesh_err2]} {",
+        "                puts \"MCP_DRAG_FAIL stage=source_automesh_error solid=$sid surf=$surf error=$_mcp_automesh_err2\"",
+        "                catch {*ameshclearsurface}",
+        "                set cs [expr {$cs*0.8}]",
+        "                if {$cs<$elem_size_min} {set cs $elem_size_min}",
+        "                incr at",
+        "                continue",
+        "            }",
+        "        }",
+        "        *storemeshtodatabase 1; *ameshclearsurface",
         "        catch {update}; after 25",
         "        if {!$drag_aspect_guard} {puts \"MCP_DRAG_ASPECT_CHECK_SKIPPED solid=$sid\"}",
         '        *createmark elems 1 "by surface" $surf',
@@ -4687,6 +5323,15 @@ def generate_batched_drag_hex_tcl(
         '        }',
         "        set ss $source_shells; set qc 0",
         "        foreach i $ss { set cf [hm_getvalue elems id=$i dataname=config]; if {$cf==104||$cf==108} {incr qc} }",
+        "        set source_loop_info [b_shell_loop_info $ss]",
+        "        set source_loops [lindex $source_loop_info 0]",
+        "        set source_boundary_edges [lindex $source_loop_info 1]",
+        "        puts \"MCP_DRAG_SOURCE_TOPOLOGY solid=$sid loops=$source_loops boundary_edges=$source_boundary_edges boundary_nodes=[lindex $source_loop_info 2]\"",
+        "        if {$source_loops < 1 || $source_boundary_edges < 4} {",
+        "            b_del $ss",
+        "            puts \"MCP_DRAG_SKIP_TETRA solid=$sid reason=closed_or_non_boundary_source removed_old_tetra_path=1\"",
+        "            break",
+        "        }",
         "        if {[llength $ss]==0||$qc!=[llength $ss]} {",
         "            b_del $ss",
             "            puts \"MCP_DRAG_SKIP_TETRA solid=$sid reason=non_quad_source removed_old_tetra_path=1\"",
@@ -4699,8 +5344,12 @@ def generate_batched_drag_hex_tcl(
         "        set sb [hm_getboundingbox surfaces 2 0 0 0]",
         "        *createmark surfaces 2 \"by solids\" $sid",
         "        set bb [hm_getboundingbox surfaces 2 0 0 0]",
-        "        if {$ax eq \"x\"} {set dvx 1; set dvy 0; set dvz 0; set sc [expr {([lindex $sb 0]+[lindex $sb 3])/2.0}]; set smin [lindex $bb 0]; set smax [lindex $bb 3]} else { if {$ax eq \"y\"} {set dvx 0; set dvy 1; set dvz 0; set sc [expr {([lindex $sb 1]+[lindex $sb 4])/2.0}]; set smin [lindex $bb 1]; set smax [lindex $bb 4]} else {set dvx 0; set dvy 0; set dvz 1; set sc [expr {([lindex $sb 2]+[lindex $sb 5])/2.0}]; set smin [lindex $bb 2]; set smax [lindex $bb 5]} }",
-        "        if {[expr {$sc-$smin}] > [expr {$smax-$sc}]} { set dvx [expr {-1*$dvx}]; set dvy [expr {-1*$dvy}]; set dvz [expr {-1*$dvz}] }",
+        "        if {$axis_mode eq \"vector\"} {",
+        "            set dvx $axis_vx; set dvy $axis_vy; set dvz $axis_vz",
+        "        } else {",
+        "            if {$ax eq \"x\"} {set dvx 1; set dvy 0; set dvz 0; set sc [expr {([lindex $sb 0]+[lindex $sb 3])/2.0}]; set smin [lindex $bb 0]; set smax [lindex $bb 3]} else { if {$ax eq \"y\"} {set dvx 0; set dvy 1; set dvz 0; set sc [expr {([lindex $sb 1]+[lindex $sb 4])/2.0}]; set smin [lindex $bb 1]; set smax [lindex $bb 4]} else {set dvx 0; set dvy 0; set dvz 1; set sc [expr {([lindex $sb 2]+[lindex $sb 5])/2.0}]; set smin [lindex $bb 2]; set smax [lindex $bb 5]} }",
+        "            if {[expr {$sc-$smin}] > [expr {$smax-$sc}]} { set dvx [expr {-1*$dvx}]; set dvy [expr {-1*$dvy}]; set dvz [expr {-1*$dvz}] }",
+        "        }",
         "        *createvector 1 $dvx $dvy $dvz",
         "        set _mcp_drag_err \"\"",
         "        eval *createmark elems 1 $source_shells",
@@ -4751,20 +5400,44 @@ def generate_batched_drag_hex_tcl(
         "        set mj [lindex [lsort -real [list [expr {abs([lindex $bb 3]-[lindex $bb 0])}] [expr {abs([lindex $bb 4]-[lindex $bb 1])}] [expr {abs([lindex $bb 5]-[lindex $bb 2])}]]] 2]",
         "        set td [expr {int(round($mj/$cs))}]; if {$td<4} {set td 4}",
         "        foreach e {0 1 2 3} { catch {*set_meshedgeparams $e $td 1 0 0 0 $cs 0 0} }",
-        "        *automesh 0 5 1; *storemeshtodatabase 1; *ameshclearsurface",
+        "        set source_automesh_ok 1",
+        "        if {[catch {*automesh 0 5 1} _mcp_automesh_err]} {",
+        "            puts \"MCP_DRAG_WARN stage=one_layer_source_automesh_mode5_error solid=$sid surf=$surf error=$_mcp_automesh_err\"",
+        "            if {[catch {*automesh 0 4 1} _mcp_automesh_err2]} {",
+        "                puts \"MCP_DRAG_FAIL stage=one_layer_source_automesh_error solid=$sid surf=$surf error=$_mcp_automesh_err2\"",
+        "                catch {*ameshclearsurface}",
+        "                set source_automesh_ok 0",
+        "            } else {",
+        "                *storemeshtodatabase 1; *ameshclearsurface",
+        "            }",
+        "        } else {",
+        "            *storemeshtodatabase 1; *ameshclearsurface",
+        "        }",
         "        catch {update}; after 25",
-        "        *createmark elems 1 \"by surface\" $surf",
-        "        set source_shells [hm_getmark elems 1]",
+        "        if {$source_automesh_ok} {",
+        "            *createmark elems 1 \"by surface\" $surf",
+        "            set source_shells [hm_getmark elems 1]",
+        "        } else {",
+        "            set source_shells {}",
+        "        }",
         "        set ss $source_shells; set qc 0",
         "        foreach i $ss { set cf [hm_getvalue elems id=$i dataname=config]; if {$cf==104||$cf==108} {incr qc} }",
-        "        if {[llength $ss]>0&&$qc==[llength $ss]} {",
+        "        set source_loop_info [b_shell_loop_info $ss]",
+        "        set source_loops [lindex $source_loop_info 0]",
+        "        set source_boundary_edges [lindex $source_loop_info 1]",
+        "        puts \"MCP_DRAG_SOURCE_TOPOLOGY solid=$sid fallback=1 loops=$source_loops boundary_edges=$source_boundary_edges boundary_nodes=[lindex $source_loop_info 2]\"",
+        "        if {[llength $ss]>0&&$qc==[llength $ss]&&$source_loops>=1&&$source_boundary_edges>=4} {",
         "            set be [b_all]",
         "            *createmark surfaces 2 $surf",
         "            set sb [hm_getboundingbox surfaces 2 0 0 0]",
         "            *createmark surfaces 2 \"by solids\" $sid",
         "            set bb [hm_getboundingbox surfaces 2 0 0 0]",
-        "            if {$ax eq \"x\"} {set dvx 1; set dvy 0; set dvz 0; set sc [expr {([lindex $sb 0]+[lindex $sb 3])/2.0}]; set smin [lindex $bb 0]; set smax [lindex $bb 3]} else { if {$ax eq \"y\"} {set dvx 0; set dvy 1; set dvz 0; set sc [expr {([lindex $sb 1]+[lindex $sb 4])/2.0}]; set smin [lindex $bb 1]; set smax [lindex $bb 4]} else {set dvx 0; set dvy 0; set dvz 1; set sc [expr {([lindex $sb 2]+[lindex $sb 5])/2.0}]; set smin [lindex $bb 2]; set smax [lindex $bb 5]} }",
-        "            if {[expr {$sc-$smin}] > [expr {$smax-$sc}]} { set dvx [expr {-1*$dvx}]; set dvy [expr {-1*$dvy}]; set dvz [expr {-1*$dvz}] }",
+        "            if {$axis_mode eq \"vector\"} {",
+        "                set dvx $axis_vx; set dvy $axis_vy; set dvz $axis_vz",
+        "            } else {",
+        "                if {$ax eq \"x\"} {set dvx 1; set dvy 0; set dvz 0; set sc [expr {([lindex $sb 0]+[lindex $sb 3])/2.0}]; set smin [lindex $bb 0]; set smax [lindex $bb 3]} else { if {$ax eq \"y\"} {set dvx 0; set dvy 1; set dvz 0; set sc [expr {([lindex $sb 1]+[lindex $sb 4])/2.0}]; set smin [lindex $bb 1]; set smax [lindex $bb 4]} else {set dvx 0; set dvy 0; set dvz 1; set sc [expr {([lindex $sb 2]+[lindex $sb 5])/2.0}]; set smin [lindex $bb 2]; set smax [lindex $bb 5]} }",
+        "                if {[expr {$sc-$smin}] > [expr {$smax-$sc}]} { set dvx [expr {-1*$dvx}]; set dvy [expr {-1*$dvy}]; set dvz [expr {-1*$dvz}] }",
+        "            }",
         "            *createvector 1 $dvx $dvy $dvz",
         "            eval *createmark elems 1 $source_shells",
         "            if {![catch {*meshdragelements2 1 1 $dd 1 0 0.0 0} _mcp_drag_err]} {",
@@ -4786,7 +5459,7 @@ def generate_batched_drag_hex_tcl(
         "            }",
         "        } else {",
         "            b_del $ss",
-        "            puts \"MCP_DRAG_FAIL stage=one_layer_fallback_non_quad_source solid=$sid\"",
+        "            puts \"MCP_DRAG_FAIL stage=one_layer_fallback_invalid_source solid=$sid loops=$source_loops boundary_edges=$source_boundary_edges quads=$qc total=[llength $ss]\"",
         "        }",
         "    }",
         "    if {!$hs} {",
@@ -4825,6 +5498,7 @@ def generate_cutsection_spin_hex_tcl(
     split_plane_normal: list[float],
     split_plane_point: list[float],
     spin_axis: str = "x",
+    spin_axis_vector: list[float] | None = None,
     spin_axis_point: list[float] | None = None,
     element_size: float = 0.7,
     density: int = 160,
@@ -4877,8 +5551,13 @@ def generate_cutsection_spin_hex_tcl(
 
     axis_key = spin_axis.strip().lower()
     axis_normals = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}
-    if axis_key not in axis_normals:
-        raise ValueError("spin_axis must be one of: x, y, z.")
+    if axis_key == "vector":
+        vector = _unit_vector([float(v) for v in (spin_axis_vector or [])])
+        if not vector:
+            raise ValueError("spin_axis_vector must contain a non-zero 3D vector when spin_axis='vector'.")
+        axis_normals["vector"] = (vector[0], vector[1], vector[2])
+    elif axis_key not in axis_normals:
+        raise ValueError("spin_axis must be one of: x, y, z, vector.")
 
     nx, ny, nz = [float(v) for v in split_plane_normal]
     px, py, pz = [float(v) for v in split_plane_point]
@@ -4931,6 +5610,9 @@ def generate_cutsection_spin_hex_tcl(
         f"set axis_py {ay}",
         f"set axis_pz {az}",
         f'set spin_axis_key "{axis_key}"',
+        f"set ::mcp_spin_axis_vx {snx}",
+        f"set ::mcp_spin_axis_vy {sny}",
+        f"set ::mcp_spin_axis_vz {snz}",
         "set mcp_ui_yield_ms 75",
         "proc mcp_mark_count {entity mark_id} {",
         "    if {[catch {hm_marklength $entity $mark_id} n]} {return 0}",
@@ -5113,7 +5795,18 @@ def generate_cutsection_spin_hex_tcl(
         "    set x [hm_getvalue nodes id=$nid dataname=x]",
         "    set y [hm_getvalue nodes id=$nid dataname=y]",
         "    set z [hm_getvalue nodes id=$nid dataname=z]",
-        "    if {$axis_key eq \"x\"} {",
+        "    if {$axis_key eq \"vector\"} {",
+        "        set vx $::mcp_spin_axis_vx",
+        "        set vy $::mcp_spin_axis_vy",
+        "        set vz $::mcp_spin_axis_vz",
+        "        set rx [expr {$x - $ax}]",
+        "        set ry [expr {$y - $ay}]",
+        "        set rz [expr {$z - $az}]",
+        "        set cx [expr {$ry*$vz - $rz*$vy}]",
+        "        set cy [expr {$rz*$vx - $rx*$vz}]",
+        "        set cz [expr {$rx*$vy - $ry*$vx}]",
+        "        return [expr {sqrt($cx*$cx + $cy*$cy + $cz*$cz)}]",
+        "    } elseif {$axis_key eq \"x\"} {",
         "        set d1 [expr {$y - $ay}]",
         "        set d2 [expr {$z - $az}]",
         "    } elseif {$axis_key eq \"y\"} {",

@@ -54,6 +54,7 @@ namespace eval ::hm_mcp_launcher {
     variable current_pid ""
     variable current_log ""
     variable current_stamp ""
+    variable current_mode ""
     variable background_input_path ""
     variable last_log_size 0
     variable log_poll_ms 4000
@@ -427,9 +428,122 @@ proc ::hm_mcp_launcher::read_new_log_data {} {
     return $text
 }
 
+proc ::hm_mcp_launcher::background_output_from_log {text} {
+    set output ""
+    foreach line [split $text "\n"] {
+        if {[regexp {^Output:\s*(.+)$} $line -> path]} {
+            set output [string trim $path]
+        }
+    }
+    return $output
+}
+
+proc ::hm_mcp_launcher::open_background_output_if_ready {log_text} {
+    set output [background_output_from_log $log_text]
+    if {$output eq ""} {
+        append_log "后台结果尚未写出 Output 路径，跳过自动打开。\n"
+        return 0
+    }
+    set output [file normalize $output]
+    if {![file exists $output]} {
+        append_log "后台输出文件不存在，跳过自动打开：$output\n"
+        return 0
+    }
+    set output_tcl [string map {"\\" "/"} $output]
+    append_log "后台划分结束，正在当前 HyperMesh 界面打开结果：$output\n"
+    if {[catch {
+        catch {hm_answernext yes}
+        *readfile "$output_tcl"
+        catch {*fit}
+    } err]} {
+        append_log "自动打开后台结果失败：$err\n"
+        return 0
+    }
+    append_log "已在当前 HyperMesh 界面打开后台划分结果。\n"
+    return 1
+}
+
+proc ::hm_mcp_launcher::show_background_popup_summary_if_needed {} {
+    variable project_dir
+    variable current_stamp
+
+    if {$current_stamp eq ""} {
+        return 0
+    }
+    set popup_path [file normalize [file join $project_dir runs "workflow_popup_summary_$current_stamp.txt"]]
+    if {![file exists $popup_path]} {
+        append_log "未找到后台弹窗摘要文件，跳过质量提示弹窗：$popup_path\n"
+        return 0
+    }
+    if {[catch {
+        set fh [open $popup_path r]
+        fconfigure $fh -encoding utf-8
+        set text [read $fh]
+        close $fh
+    } err]} {
+        catch {close $fh}
+        append_log "读取后台弹窗摘要失败：$err\n"
+        return 0
+    }
+    if {[string first "没有实体退回到 2D 面网格" $text] >= 0} {
+        append_log "后台弹窗摘要未发现 2D 回退。\n"
+        return 0
+    }
+    append_log "正在显示后台质量提示弹窗：$popup_path\n"
+    catch {
+        tk_messageBox -type ok -icon warning -title "网格退回提醒" -message $text
+    }
+    return 1
+}
+
+proc ::hm_mcp_launcher::cmd_quote_arg {value} {
+    set text [file nativename $value]
+    set text [string map {"%" "%%" "\"" "\"\""} $text]
+    return "\"$text\""
+}
+
+proc ::hm_mcp_launcher::vbs_quote {value} {
+    return "\"[string map {"\"" "\"\""} $value]\""
+}
+
+proc ::hm_mcp_launcher::start_hidden_logged_process {cmd log_path} {
+    variable project_dir
+    variable current_stamp
+
+    set cmd_path [file normalize [file join $project_dir runs "panel_hidden_launch_$current_stamp.cmd"]]
+    set vbs_path [file normalize [file join $project_dir runs "panel_hidden_launch_$current_stamp.vbs"]]
+
+    set quoted_args {}
+    foreach arg $cmd {
+        lappend quoted_args [cmd_quote_arg $arg]
+    }
+    set command_line [join $quoted_args " "]
+    set log_arg [cmd_quote_arg $log_path]
+    set fh [open $cmd_path w]
+    fconfigure $fh -encoding utf-8
+    puts $fh "@echo off"
+    puts $fh "cd /d [cmd_quote_arg $project_dir]"
+    puts $fh "$command_line > $log_arg 2>&1"
+    puts $fh "exit /b %ERRORLEVEL%"
+    close $fh
+
+    set cmd_native [file nativename $cmd_path]
+    set run_command "%ComSpec% /D /C \"\"$cmd_native\"\""
+    set fh [open $vbs_path w]
+    fconfigure $fh -encoding utf-8
+    puts $fh "Set shell = CreateObject(\"WScript.Shell\")"
+    puts $fh "code = shell.Run([vbs_quote $run_command], 0, True)"
+    puts $fh "WScript.Quit code"
+    close $fh
+
+    return [exec wscript.exe [file nativename $vbs_path] &]
+}
+
 proc ::hm_mcp_launcher::poll_log {} {
     variable current_pid
     variable current_log
+    variable current_mode
+    variable current_stamp
     variable log_poll_ms
     variable pid_check_ms
     variable last_pid_check_ms
@@ -461,6 +575,10 @@ proc ::hm_mcp_launcher::poll_log {} {
                 fconfigure $fh -encoding utf-8
                 set text [read $fh]
                 close $fh
+                if {$current_mode eq "background"} {
+                    open_background_output_if_ready $text
+                    show_background_popup_summary_if_needed
+                }
                 if {[string first "Success: True" $text] >= 0} {
                     set_status "完成划分"
                 } else {
@@ -480,6 +598,7 @@ proc ::hm_mcp_launcher::start_workflow {{mode full}} {
     variable current_pid
     variable current_log
     variable current_stamp
+    variable current_mode
     variable last_log_size
     variable last_pid_check_ms
 
@@ -491,6 +610,7 @@ proc ::hm_mcp_launcher::start_workflow {{mode full}} {
 
     ensure_directories
     set current_stamp [make_stamp]
+    set current_mode $mode
     if {$mode eq "gear_preview"} {
         set current_log [file normalize [file join $project_dir runs "panel_gear_tooth_preview_$current_stamp.log"]]
     } elseif {$mode eq "delete_gear_preview"} {
@@ -532,7 +652,7 @@ proc ::hm_mcp_launcher::start_workflow {{mode full}} {
     append_log "正在启动后台划分流程...\n日志文件：$current_log\n\n"
     if {[catch {
         cd $project_dir
-        set pids [exec {*}$cmd > $current_log 2>@1 &]
+        set pids [start_hidden_logged_process $cmd $current_log]
     } err opts]} {
         catch {cd $old_pwd}
         set_status "启动失败"

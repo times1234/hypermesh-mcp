@@ -120,6 +120,11 @@ Preconditions:
 - corresponding logical edge groups are forced to matched seed counts
 - the source face meshes as 100% quads
 
+When a constant-section part is tilted away from global X/Y/Z, the probe can
+emit `axis_mode=oblique` with `axis_vec`, paired `target_surf`, and
+`drag_distance_hint`. Batched drag uses that vector directly instead of forcing
+the extrusion onto a global axis.
+
 Pass `solid_id` when possible. The generator then validates that the generated
 hex8 mesh bounding box fits the target solid. If the drag result is missing,
 non-hex, or poorly fitted, it deletes invalid elements and retries. Tetra is no
@@ -185,6 +190,10 @@ Required inputs:
 - spin axis and a point on the spin axis; this is required and must be on the
   real rotation axis, not merely any point on the split plane
 - requested section element size, spin density min, and spin density max
+
+`spin_axis` may be `x`, `y`, `z`, or `vector`. The `vector` mode is used for
+oblique axes detected by the probe; radius checks then use node distance to the
+arbitrary 3D axis instead of a global-coordinate shortcut.
 
 The split plane must contain the spin axis. In practical terms, the split plane
 normal should be nearly perpendicular to the spin axis. If the cut plane is

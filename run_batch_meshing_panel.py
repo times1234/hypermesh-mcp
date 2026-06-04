@@ -16,6 +16,18 @@ RUNS_DIR = ROOT / "runs"
 OUTPUTS_DIR = ROOT / "outputs"
 
 
+def _hidden_subprocess_kwargs() -> dict[str, object]:
+    if not sys.platform.startswith("win"):
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
+
+
 class BatchMeshingPanel:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -305,6 +317,7 @@ class BatchMeshingPanel:
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
+            **_hidden_subprocess_kwargs(),
         )
         log_handle.close()
         self.status.set(f"状态：运行中，PID={self.process.pid}")
@@ -370,19 +383,38 @@ class BatchMeshingPanel:
 
         report_path = summary.get("report_path") or ""
         output_path = summary.get("output_hm_path") or ""
+        popup_report_path = summary.get("popup_report_path") or ""
         errors = summary.get("errors") or []
         quality_errors = [item for item in errors if item.get("step") == "tetra_quality"]
+        tetra_result_errors = [item for item in errors if item.get("step") == "tetra_result"]
         if quality_errors:
-            lines = ["以下实体/批次触发 tetra 质量保护，最终可能保留 2D 面网格：", ""]
-            for item in quality_errors:
-                lines.append(f"- {item.get('status', 'unknown')}：{item.get('solid_count', 0)} 个")
+            popup_text = ""
+            if popup_report_path and Path(popup_report_path).exists():
+                popup_text = Path(popup_report_path).read_text(encoding="utf-8", errors="replace").strip()
+            if not popup_text:
+                lines = ["网格退回提醒"]
+                for item in quality_errors:
+                    solids = item.get("solids") or []
+                    for solid in solids[:20]:
+                        name = solid.get("component_name") or "未命名"
+                        lines.append(f"\nsolid {solid.get('solid_id')}（{name}）")
+                        lines.append(f"原因：{item.get('status', 'unknown')}")
+                    if len(solids) > 20:
+                        lines.append(f"\n... 还有 {len(solids) - 20} 个，详见中文报告")
+                popup_text = "\n".join(lines)
+            if "没有实体退回到 2D 面网格" not in popup_text:
+                messagebox.showwarning("网格退回提醒", popup_text)
+            return
+
+        if tetra_result_errors:
+            lines = ["以下实体未生成有效 tetra 结果："]
+            for item in tetra_result_errors:
                 solids = item.get("solids") or []
                 for solid in solids[:20]:
                     name = solid.get("component_name") or "未命名"
-                    lines.append(f"  solid {solid.get('solid_id')}：{name}")
+                    lines.append(f"  solid {solid.get('solid_id')}：{name} ({solid.get('status', 'unknown')})")
                 if len(solids) > 20:
                     lines.append(f"  ... 还有 {len(solids) - 20} 个，详见中文报告")
-            lines.extend(["", f"中文报告：{report_path}", f"输出模型：{output_path}"])
             messagebox.showwarning("后台划分质量提示", "\n".join(lines))
             return
 

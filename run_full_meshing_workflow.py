@@ -126,6 +126,14 @@ def _set_extreme_surface_aspect(info: dict[str, Any], suffix: str, value: Any) -
 
 
 def _drag_distance(item: dict[str, Any]) -> float:
+    hinted = item.get("drag_distance") or item.get("drag_distance_hint")
+    if hinted:
+        try:
+            value = float(hinted)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
     axis = str(item.get("drag_axis") or item.get("axis") or "z").lower()
     dims = item.get("dims") if isinstance(item.get("dims"), dict) else {}
     key = {"x": "dx", "y": "dy", "z": "dz"}.get(axis, "dz")
@@ -144,6 +152,11 @@ def _build_drag_solids(results: dict[str, dict[str, Any]]) -> list[dict[str, Any
                 "drag_distance": _drag_distance(item),
                 "component_name": str(item["component_name"]),
                 "axis": str(item.get("drag_axis") or "z"),
+                "axis_mode": str(item.get("axis_mode") or "global"),
+                "drag_vector": item.get("axis_vec") or item.get("drag_vector"),
+                "target_surface_id": item.get("target_surface_id"),
+                "axis_p0": item.get("axis_p0"),
+                "axis_p1": item.get("axis_p1"),
             }
         )
     return solids
@@ -162,6 +175,7 @@ def _build_spin_solids(results: dict[str, dict[str, Any]]) -> list[dict[str, Any
                 "element_size": float(item.get("element_size") or 1.0),
                 "spin_method": str(item.get("spin_method") or "cutsection"),
                 "spin_axis": str(item.get("spin_axis") or item.get("drag_axis") or item.get("axis") or "z"),
+                "spin_axis_vector": item.get("spin_axis_vector") or item.get("axis_vec"),
                 "spin_axis_point": item.get("spin_axis_point"),
                 "spin_split_plane_normal": item.get("spin_split_plane_normal"),
                 "spin_split_plane_point": item.get("spin_split_plane_point"),
@@ -190,29 +204,9 @@ def _detect_existing_mesh_by_solid(
     port: int,
     timeout_seconds: int,
 ) -> dict[str, dict[str, Any]]:
-    solid_ids = [int(key) for key in sorted(results, key=lambda value: int(value))]
-    if not solid_ids:
+    script = _generate_existing_mesh_probe_tcl(results)
+    if not script:
         return {}
-    solid_list = " ".join(str(sid) for sid in solid_ids)
-    script = f"""
-puts "MCP_EXISTING_MESH_BEGIN"
-foreach sid {{{solid_list}}} {{
-    set comp_name ""
-    set elem_count 0
-    *createmark components 1 "by solids" $sid
-    set cids [hm_getmark components 1]
-    if {{[llength $cids] > 0}} {{
-        set cid [lindex $cids 0]
-        catch {{set comp_name [hm_getvalue components id=$cid dataname=name]}}
-        catch {{
-            *createmark elements 1 "by comp" "$comp_name"
-            set elem_count [llength [hm_getmark elements 1]]
-        }}
-    }}
-    puts "MCP_EXISTING_MESH solid=$sid elems=$elem_count comp=<$comp_name>"
-}}
-puts "MCP_EXISTING_MESH_END"
-""".lstrip()
     response = hm.execute_tcl_gui(
         script,
         host=host,
@@ -220,19 +214,71 @@ puts "MCP_EXISTING_MESH_END"
         timeout_seconds=timeout_seconds,
         enforce_meshing_rules=False,
     )
-    text = str(response.get("response", "") or response.get("stdout", ""))
+    return _parse_existing_mesh_probe(str(response.get("response", "") or response.get("stdout", "")))
+
+
+def _generate_existing_mesh_probe_tcl(results: dict[str, dict[str, Any]]) -> str:
+    solid_ids = [int(key) for key in sorted(results, key=lambda value: int(value))]
+    if not solid_ids:
+        return ""
+    solid_list = " ".join(str(sid) for sid in solid_ids)
+    return f"""
+puts "MCP_EXISTING_MESH_BEGIN"
+foreach sid {{{solid_list}}} {{
+    set comp_name ""
+    set comp_elem_count 0
+    set solid_elem_count 0
+    *createmark components 1 "by solids" $sid
+    set cids [hm_getmark components 1]
+    if {{[llength $cids] > 0}} {{
+        set cid [lindex $cids 0]
+        catch {{set comp_name [hm_getvalue components id=$cid dataname=name]}}
+        catch {{
+            *createmark elements 1 "by comp" "$comp_name"
+            set comp_elem_count [llength [hm_getmark elements 1]]
+        }}
+    }}
+    catch {{
+        *createmark elements 2 "by solids" $sid
+        set solid_elem_count [llength [hm_getmark elements 2]]
+    }}
+    puts "MCP_EXISTING_MESH solid=$sid comp_elems=$comp_elem_count solid_elems=$solid_elem_count comp=<$comp_name>"
+}}
+puts "MCP_EXISTING_MESH_END"
+""".lstrip()
+
+
+def _parse_existing_mesh_probe(text: str) -> dict[str, dict[str, Any]]:
     detected: dict[str, dict[str, Any]] = {}
     for line in text.splitlines():
-        match = re.search(r"MCP_EXISTING_MESH solid=(\d+) elems=(\d+) comp=<([^>]*)>", line)
+        match = re.search(
+            r"MCP_EXISTING_MESH solid=(\d+) comp_elems=(\d+) solid_elems=(\d+) comp=<([^>]*)>",
+            line,
+        )
         if not match:
             continue
-        sid, elems, comp = match.group(1), int(match.group(2)), match.group(3)
+        sid, comp_elems, solid_elems, comp = (
+            match.group(1),
+            int(match.group(2)),
+            int(match.group(3)),
+            match.group(4),
+        )
         detected[sid] = {
             "solid_id": int(sid),
             "component_name": comp,
-            "element_count": elems,
-            "has_existing_mesh": elems > 0,
+            "component_element_count": comp_elems,
+            "solid_element_count": solid_elems,
         }
+    component_solid_counts: dict[str, int] = {}
+    for item in detected.values():
+        component_solid_counts[item["component_name"]] = component_solid_counts.get(item["component_name"], 0) + 1
+    for item in detected.values():
+        shared_component = component_solid_counts.get(item["component_name"], 0) > 1
+        element_count = item["solid_element_count"] if shared_component else item["component_element_count"]
+        item["shared_component"] = shared_component
+        item["detection_mode"] = "solid_reference_shared_component" if shared_component else "component_single_solid"
+        item["element_count"] = element_count
+        item["has_existing_mesh"] = element_count > 0
     return detected
 
 
@@ -489,6 +535,25 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
                 continue
 
             match = re.search(
+                r"MCP_PT_FAIL solid=(\d+) no_accepted_tetra_after_retries kept_surface_shells=(\d+)"
+                r"(?: reason=([^\s]+))?",
+                line,
+            )
+            if match:
+                sid = match.group(1)
+                reason = match.group(3) or "unknown"
+                info = repair.setdefault(sid, {})
+                info["no_accepted_tetra_after_retries"] = 1
+                info["tetmesh_failure_shell_count"] = int(match.group(2))
+                info["tetmesh_failure_reason"] = reason
+                info.setdefault("vol_skew_initial_bad", 0)
+                info.setdefault("vol_skew_final_bad", 0)
+                if reason in {"no_component_mark", "tetmesh_failed", "no_tetra_after_tetmesh"}:
+                    info["tetmesh_failed_keep_surface_mesh"] = 1
+                    info.setdefault("tetra_not_attempted_reason", reason)
+                continue
+
+            match = re.search(
                 r"MCP_PT_INFO solid=(\d+) repaired_surface_mesh_ready shell_count=(\d+) "
                 r"final_aspect_bad=(\d+)(?: normal_aspect_bad=(\d+))?"
                 r"(?: (?:extreme_surface_aspect|extreme_aspect_over_100)=(\d+))?",
@@ -700,6 +765,7 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "surface_fit_degraded_unfixed_aspect_count": 0,
         "surface_repair_timeout_keep_surface_mesh_count": 0,
         "surface_repair_timeout_unfixed_aspect_count": 0,
+        "tetmesh_failed_keep_surface_mesh_count": 0,
     }
     for item in repair.values():
         aggregate["initial_bad"] += int(item.get("initial_bad") or 0)
@@ -754,6 +820,9 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
         )
         if int(item.get("surface_repair_timeout_keep_surface_mesh") or 0) > 0:
             aggregate["surface_repair_timeout_unfixed_aspect_count"] += int(item.get("final_bad") or 0)
+        aggregate["tetmesh_failed_keep_surface_mesh_count"] += int(
+            item.get("tetmesh_failed_keep_surface_mesh") or 0
+        )
         for step in (
             "triangle_cleanup",
             "smooth_5",
@@ -783,6 +852,67 @@ def _parse_repair_summary(plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _tetra_result_failures(repair_summary: dict[str, Any], plan_batches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tetra_done = repair_summary.get("tetra_done", {}) if isinstance(repair_summary.get("tetra_done"), dict) else {}
+    repair_by_solid = (
+        repair_summary.get("repair_by_solid", {}) if isinstance(repair_summary.get("repair_by_solid"), dict) else {}
+    )
+    solid_name_by_id = {
+        str(sid): name
+        for batch in plan_batches
+        for sid, name in (batch.get("solid_names") or {}).items()
+    }
+    planned_ids = [
+        str(int(sid))
+        for batch in plan_batches
+        for sid in (batch.get("solid_ids") or [])
+    ]
+    terminal_repair_flags = {
+        "tetra_deleted_keep_surface_shells",
+        "crash_guard_keep_surface_mesh",
+        "extreme_aspect_keep_surface_mesh",
+        "surface_fit_degraded_keep_surface_mesh",
+        "surface_repair_timeout_keep_surface_mesh",
+        "surface_backup_failed_keep_surface_mesh",
+        "tetmesh_failed_keep_surface_mesh",
+        "tetra_not_attempted_reason",
+    }
+    failures: list[dict[str, Any]] = []
+    for sid, info in sorted(tetra_done.items(), key=lambda pair: int(pair[0])):
+        if int(info.get("ok") or 0) == 1 and int(info.get("tet4") or 0) > 0:
+            continue
+        repair_info = repair_by_solid.get(str(sid), {}) if isinstance(repair_by_solid.get(str(sid), {}), dict) else {}
+        if any(repair_info.get(flag) for flag in terminal_repair_flags):
+            continue
+        failures.append(
+            {
+                "solid_id": int(sid),
+                "component_name": solid_name_by_id.get(str(sid), ""),
+                "status": "tetra_done_failed",
+                "ok": int(info.get("ok") or 0),
+                "tet4": int(info.get("tet4") or 0),
+                "total": int(info.get("total") or 0),
+            }
+        )
+    for sid in planned_ids:
+        if sid in tetra_done:
+            continue
+        repair_info = repair_by_solid.get(sid, {}) if isinstance(repair_by_solid.get(sid, {}), dict) else {}
+        if any(repair_info.get(flag) for flag in terminal_repair_flags):
+            continue
+        failures.append(
+            {
+                "solid_id": int(sid),
+                "component_name": solid_name_by_id.get(str(sid), ""),
+                "status": "missing_tetra_result",
+                "ok": 0,
+                "tet4": 0,
+                "total": 0,
+            }
+        )
+    return failures
+
+
 def _parse_drag_actual_parameters(response_text: str) -> dict[str, dict[str, Any]]:
     actual: dict[str, dict[str, Any]] = {}
     for line in str(response_text or "").splitlines():
@@ -797,6 +927,22 @@ def _parse_drag_actual_parameters(response_text: str) -> dict[str, dict[str, Any
                 "element_size_min": float(match.group(4)),
                 "element_size_max": float(match.group(5)),
             }
+            continue
+        match = re.search(r"MCP_DRAG_SKIP_TETRA solid=(\d+) reason=([^\s]+)", line)
+        if match:
+            item = actual.setdefault(match.group(1), {})
+            item["skip_tetra"] = True
+            item.setdefault("skip_tetra_reason", match.group(2))
+            continue
+        match = re.search(r"MCP_DRAG_FAIL stage=([^\s]+) solid=(\d+)(?:\s+(.*))?", line)
+        if match:
+            item = actual.setdefault(match.group(2), {})
+            item.setdefault("failures", []).append(
+                {
+                    "stage": match.group(1),
+                    "detail": match.group(3) or "",
+                }
+            )
             continue
         match = re.search(
             r"MCP_DRAG_RESULT solid=(\d+) ok=(\d+) layers=(\d+) aspect_bad=(\d+) "
@@ -855,6 +1001,66 @@ def _drag_one_layer_fallbacks(
             }
         )
     return items
+
+
+def _promote_drag_failures_to_tetra(
+    *,
+    drag_solids: list[dict[str, Any]],
+    drag_response: dict[str, Any] | None,
+    active_results: dict[str, dict[str, Any]],
+    results: dict[str, dict[str, Any]],
+    trust_successful_results: bool = True,
+) -> list[dict[str, Any]]:
+    actual = _parse_drag_actual_parameters(str((drag_response or {}).get("response", "")))
+    response_success = bool((drag_response or {}).get("success"))
+    fallbacks: list[dict[str, Any]] = []
+    for solid in drag_solids:
+        sid = int(solid["solid_id"])
+        sid_key = str(sid)
+        info = actual.get(sid_key, {})
+        if trust_successful_results and int(info.get("ok") or 0) == 1:
+            continue
+        should_fallback = bool(info.get("skip_tetra") or info.get("failures"))
+        if response_success and info:
+            should_fallback = True
+        if (response_success or not trust_successful_results) and sid_key not in actual:
+            should_fallback = True
+            info = {"skip_tetra_reason": "missing_drag_result"}
+        if not trust_successful_results and int(info.get("ok") or 0) == 1:
+            should_fallback = True
+            info = {**info, "skip_tetra_reason": "drag_stage_failed_before_save"}
+        if not should_fallback:
+            continue
+
+        source = dict(results.get(sid_key) or active_results.get(sid_key) or {})
+        if not source:
+            source = {
+                "solid_id": sid,
+                "component_name": solid.get("component_name", f"solid_{sid}"),
+                "element_size": solid.get("element_size", 1.0),
+                "min_element_size": 0.5,
+                "surf_count": 0,
+                "evidence": [],
+            }
+        target = dict(source)
+        target["strategy"] = "tetra_plain"
+        target.setdefault("evidence", [])
+        target["evidence"] = list(target["evidence"])
+        reason = str(info.get("skip_tetra_reason") or "drag_failed")
+        target["evidence"].append(f"drag failed -> tetra fallback: {reason}")
+        target["allow_tetmesh"] = True
+        target["allow_surface_mesh"] = True
+        active_results[sid_key] = target
+        results[sid_key] = dict(target)
+        fallbacks.append(
+            {
+                "solid_id": sid,
+                "component_name": target.get("component_name") or solid.get("component_name", ""),
+                "reason": reason,
+                "failures": info.get("failures", []),
+            }
+        )
+    return fallbacks
 
 
 def _parse_spin_results(response_text: str) -> dict[str, dict[str, Any]]:
@@ -1137,6 +1343,44 @@ def _isolate_rolled_back_solids(
         return {"success": True, "skipped": True}
 
     solid_ids = " ".join(str(item["solid_id"]) for item in rolled_back_solids)
+    message = _rolled_back_popup_message(rolled_back_solids, repair_summary)
+    message_tcl = _tcl_braced(message)
+    script = f"""
+puts "MCP_ROLLBACK_ISOLATE_BEGIN solids={solid_ids}"
+catch {{
+    *createmark components 1 all
+    *hideentitybymark components 1
+}}
+catch {{
+    *createmark components 1 all
+    *maskentitymark components 1 0
+}}
+foreach sid {{{solid_ids}}} {{
+    catch {{
+        *createmark components 1 "by solids" $sid
+        *showentitybymark components 1
+    }}
+    catch {{
+        *createmark components 1 "by solids" $sid
+        *unmaskentitymark components 1 0
+    }}
+}}
+catch {{tk_messageBox -title "网格退回提醒" -icon warning -type ok -message {message_tcl}}}
+puts "MCP_ROLLBACK_ISOLATE_DONE solids={solid_ids}"
+""".lstrip()
+    return hm.execute_tcl_gui(
+        script,
+        host=host,
+        port=port,
+        timeout_seconds=timeout_seconds,
+        enforce_meshing_rules=False,
+    )
+
+
+def _rolled_back_popup_message(
+    rolled_back_solids: list[dict[str, Any]],
+    repair_summary: dict[str, Any],
+) -> str:
     repair_by_solid = repair_summary.get("repair_by_solid", {})
 
     def _solid_line(item: dict[str, Any], extra_lines: list[str]) -> list[str]:
@@ -1162,6 +1406,17 @@ def _isolate_rolled_back_solids(
         )
         > 0
     ]
+    tetmesh_failed_items = [
+        item
+        for item in rolled_back_solids
+        if int(item.get("crash_guard") or 0) <= 0
+        and int(repair_by_solid.get(str(item["solid_id"]), {}).get("extreme_aspect_keep_surface_mesh") or 0) <= 0
+        and int(
+            repair_by_solid.get(str(item["solid_id"]), {}).get("surface_fit_degraded_keep_surface_mesh") or 0
+        )
+        <= 0
+        and int(repair_by_solid.get(str(item["solid_id"]), {}).get("tetmesh_failed_keep_surface_mesh") or 0) > 0
+    ]
     tetra_quality_items = [
         item
         for item in rolled_back_solids
@@ -1171,6 +1426,7 @@ def _isolate_rolled_back_solids(
             repair_by_solid.get(str(item["solid_id"]), {}).get("surface_fit_degraded_keep_surface_mesh") or 0
         )
         <= 0
+        and int(repair_by_solid.get(str(item["solid_id"]), {}).get("tetmesh_failed_keep_surface_mesh") or 0) <= 0
     ]
 
     message_lines = ["网格退回提醒"]
@@ -1248,7 +1504,25 @@ def _isolate_rolled_back_solids(
             )
         )
 
-    message_lines.extend(["", "四、tetra 质量修复后仍不合格退回"])
+    message_lines.extend(["", "四、tetmesh 未生成有效 tetra，保留 2D"])
+    if not tetmesh_failed_items:
+        message_lines.append("无")
+    for item in tetmesh_failed_items:
+        sid = str(item["solid_id"])
+        info = repair_by_solid.get(sid, {})
+        shell_count = int(info.get("tetmesh_failure_shell_count") or info.get("pre_tetra_surface_shell_count") or 0)
+        reason = str(info.get("tetmesh_failure_reason") or "unknown")
+        message_lines.extend(
+            _solid_line(
+                item,
+                [
+                    f"tetmesh 失败原因：{reason}",
+                    f"当前保留 2D 总网格数：{shell_count}",
+                ],
+            )
+        )
+
+    message_lines.extend(["", "五、tetra 质量修复后仍不合格退回"])
     if not tetra_quality_items:
         message_lines.append("无")
     for item in tetra_quality_items:
@@ -1268,38 +1542,7 @@ def _isolate_rolled_back_solids(
             )
         )
 
-    message = "\n".join(message_lines)
-    message_tcl = _tcl_braced(message)
-    script = f"""
-puts "MCP_ROLLBACK_ISOLATE_BEGIN solids={solid_ids}"
-catch {{
-    *createmark components 1 all
-    *hideentitybymark components 1
-}}
-catch {{
-    *createmark components 1 all
-    *maskentitymark components 1 0
-}}
-foreach sid {{{solid_ids}}} {{
-    catch {{
-        *createmark components 1 "by solids" $sid
-        *showentitybymark components 1
-    }}
-    catch {{
-        *createmark components 1 "by solids" $sid
-        *unmaskentitymark components 1 0
-    }}
-}}
-catch {{tk_messageBox -title "网格退回提醒" -icon warning -type ok -message {message_tcl}}}
-puts "MCP_ROLLBACK_ISOLATE_DONE solids={solid_ids}"
-""".lstrip()
-    return hm.execute_tcl_gui(
-        script,
-        host=host,
-        port=port,
-        timeout_seconds=timeout_seconds,
-        enforce_meshing_rules=False,
-    )
+    return "\n".join(message_lines)
 
 
 def _show_drag_one_layer_warning_popup(
@@ -1468,6 +1711,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 "solid_id": int(sid),
                 "component_name": results.get(sid, {}).get("component_name") or item.get("component_name", ""),
                 "element_count": item.get("element_count", 0),
+                "detection_mode": item.get("detection_mode", ""),
+                "component_element_count": item.get("component_element_count", 0),
+                "solid_element_count": item.get("solid_element_count", 0),
             }
             for sid, item in sorted(skipped_existing_mesh.items(), key=lambda pair: int(pair[0]))
         ],
@@ -1602,16 +1848,28 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 "one_layer_fallback": _drag_one_layer_fallbacks(drag_solids, drag_response),
             }
         )
+        drag_fallback_to_tetra = _promote_drag_failures_to_tetra(
+            drag_solids=drag_solids,
+            drag_response=drag_response,
+            active_results=active_results,
+            results=results,
+        )
+        drag_step["fallback_to_tetra"] = drag_fallback_to_tetra
         _diag(
             diagnostic_log_path,
             "drag_done",
             script_path=str(drag_script_path),
             one_layer_fallback=drag_step.get("one_layer_fallback", []),
+            fallback_to_tetra=drag_fallback_to_tetra,
             **_response_diag(drag_response),
         )
         if drag_step["one_layer_fallback"]:
             workflow["warnings"].append(
                 "警告：部分 drag 六面体实体在至少 3 层且 aspect<20 的策略下仍未通过，已改为 1 层 drag；详见中文报告。"
+            )
+        if drag_fallback_to_tetra:
+            workflow["warnings"].append(
+                "警告：部分 drag 六面体实体未生成有效 hex，已自动转入后续 tetra 批次；详见中文报告。"
             )
         if not drag_response.get("success"):
             workflow["errors"].append({"step": "drag_hex", "response": drag_response})
@@ -1640,6 +1898,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 split_plane_normal=list(split_normal),
                 split_plane_point=list(split_point),
                 spin_axis=str(spin_solid.get("spin_axis") or spin_solid.get("axis") or "z"),
+                spin_axis_vector=spin_solid.get("spin_axis_vector"),
                 spin_axis_point=list(axis_point),
                 element_size=spin_size,
                 density=args.spin_density_max,
@@ -1880,6 +2139,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     surface_backup_failed_count = int(
         repair_summary["repair_aggregate"].get("surface_backup_failed_keep_surface_mesh_count") or 0
     )
+    tetmesh_failed_count = int(
+        repair_summary["repair_aggregate"].get("tetmesh_failed_keep_surface_mesh_count") or 0
+    )
     initial_extreme_aspect_count = int(
         repair_summary["repair_aggregate"].get(
             "extreme_surface_aspect_initial_count",
@@ -1922,6 +2184,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             or int(info.get("extreme_aspect_keep_surface_mesh") or 0) > 0
             or int(info.get("surface_fit_degraded_keep_surface_mesh") or 0) > 0
             or int(info.get("surface_repair_timeout_keep_surface_mesh") or 0) > 0
+            or int(info.get("tetmesh_failed_keep_surface_mesh") or 0) > 0
         ):
             rolled_back_solids.append(
                 {
@@ -1933,6 +2196,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                     "extreme_aspect_guard": int(info.get("extreme_aspect_keep_surface_mesh") or 0),
                     "surface_fit_degraded": int(info.get("surface_fit_degraded_keep_surface_mesh") or 0),
                     "surface_repair_timeout": int(info.get("surface_repair_timeout_keep_surface_mesh") or 0),
+                    "tetmesh_failed": int(info.get("tetmesh_failed_keep_surface_mesh") or 0),
                     "crash_guard_shell_count": int(info.get("crash_guard_shell_count") or 0),
                     "crash_guard_limit": int(info.get("crash_guard_limit") or 0),
                     "surface_repair_timeout_ms": int(info.get("surface_repair_timeout_ms") or 0),
@@ -2009,6 +2273,27 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             "solids": [item for item in rolled_back_solids if item.get("surface_backup_failed")],
         }
         workflow["errors"].append(backup_error)
+    if tetmesh_failed_count:
+        tetmesh_error = {
+            "step": "tetra_quality",
+            "status": "tetmesh_failed_keep_surface_mesh",
+            "solid_count": tetmesh_failed_count,
+            "solids": [item for item in rolled_back_solids if item.get("tetmesh_failed")],
+        }
+        workflow["errors"].append(tetmesh_error)
+    tetra_result_failures = _tetra_result_failures(repair_summary, plan_batches)
+    if tetra_result_failures:
+        workflow["errors"].append(
+            {
+                "step": "tetra_result",
+                "status": "tetra_failed_or_missing",
+                "solid_count": len(tetra_result_failures),
+                "solids": tetra_result_failures,
+            }
+        )
+        workflow["warnings"].append(
+            f"警告：{len(tetra_result_failures)} 个 tetra 实体失败或没有输出最终 tetra 结果；详见中文报告。"
+        )
     if rolled_back_solids:
         solid_text = "，".join(
             f"solid {item['solid_id']}({item['component_name'] or '未命名'})"

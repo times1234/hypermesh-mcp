@@ -46,6 +46,23 @@ def _response_text(response: dict[str, Any]) -> str:
     return str(response.get("stdout", "") or "") + "\n" + str(response.get("stderr", "") or "")
 
 
+def _batch_safe_script(script: str) -> str:
+    lines: list[str] = []
+    for line in str(script or "").splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("*writefile"):
+            indent = line[: len(line) - len(stripped)]
+            lines.append(f"{indent}catch {{hm_answernext yes}}")
+            lines.append(
+                f'{indent}if {{[catch {{{stripped}}} _mcp_write_err]}} '
+                f'{{puts "MCP_BATCH_WRITEFILE_ERROR error=$_mcp_write_err"; error $_mcp_write_err}} '
+                f'else {{puts "MCP_BATCH_WRITEFILE_OK"}}'
+            )
+            continue
+        lines.append(line)
+    return "\n".join(lines) + ("\n" if str(script or "").endswith("\n") else "")
+
+
 def _execute_batch(
     script: str,
     *,
@@ -55,7 +72,7 @@ def _execute_batch(
 ) -> dict[str, Any]:
     start = time.time()
     result = hm.execute_tcl(
-        script,
+        _batch_safe_script(script),
         hmbatch_path=hmbatch_path,
         model_path=str(model_path) if model_path else None,
         timeout_seconds=timeout_seconds,
@@ -77,6 +94,32 @@ def _write_batch_log(path: Path, response: dict[str, Any]) -> None:
     if stderr:
         lines.append("\nSTDERR:\n" + stderr)
     path.write_text("\n".join(lines), encoding="utf-8", errors="replace")
+
+
+def _write_popup_report(
+    path: Path,
+    summary: dict[str, Any],
+    repair_summary: dict[str, Any],
+) -> str:
+    errors = summary.get("errors") or []
+    quality_errors = [item for item in errors if item.get("step") == "tetra_quality"]
+    by_solid: dict[int, dict[str, Any]] = {}
+    for item in quality_errors:
+        for solid in item.get("solids") or []:
+            try:
+                sid = int(solid.get("solid_id"))
+            except (TypeError, ValueError):
+                continue
+            merged = by_solid.setdefault(sid, {"solid_id": sid})
+            merged.update(solid)
+    rolled_back = [by_solid[sid] for sid in sorted(by_solid)]
+    if rolled_back:
+        text = visible_runner._rolled_back_popup_message(rolled_back, repair_summary)
+    else:
+        text = "网格退回提醒\n\n没有实体退回到 2D 面网格。"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.rstrip() + "\n", encoding="utf-8", errors="replace")
+    return str(path)
 
 
 def _append_save(script: str, working_model: Path) -> str:
@@ -165,12 +208,21 @@ def _probe_model(args: argparse.Namespace, working_model: Path, stamp: str) -> t
         max_feature_angle=args.probe_feature_angle,
         growth_rate=args.probe_growth_rate,
     )
+    probe_script = generated["script"].rstrip()
+    probe_return = "return $::mcp_probe_output"
+    if probe_script.endswith(probe_return):
+        probe_script = probe_script[: -len(probe_return)].rstrip() + "\nputs $::mcp_probe_output\n"
+    else:
+        probe_script += "\ncatch {puts $::mcp_probe_output}\n"
     response = _execute_batch(
-        generated["script"],
+        probe_script,
         model_path=working_model,
         hmbatch_path=args.hmbatch,
         timeout_seconds=args.probe_timeout,
     )
+    response_log_path = RUNS_DIR / f"workflow_probe_response_{stamp}.log"
+    _write_batch_log(response_log_path, response)
+    response["log_path"] = str(response_log_path)
     probe_text = "\n".join(hm._extract_probe_lines(_response_text(response)))
     probe_path = RUNS_DIR / f"workflow_probe_{stamp}.txt"
     probe_path.write_text(probe_text, encoding="utf-8")
@@ -216,13 +268,23 @@ puts "MCP_FINAL_COUNTS elems=[llength $all_elems] shells=$shell_count tet4=$tet4
     return result
 
 
-def _existing_mesh_skip_empty(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "skipped_count": 0,
-        "skipped_solids": [],
-        "note": "Background mode assumes the selected/imported model is the meshing input; existing-mesh skip is not applied.",
-        "solid_count": len(results),
-    }
+def _detect_existing_mesh_by_solid_batch(
+    results: dict[str, dict[str, Any]],
+    *,
+    working_model: Path,
+    hmbatch_path: str | None,
+    timeout_seconds: int,
+) -> dict[str, dict[str, Any]]:
+    script = visible_runner._generate_existing_mesh_probe_tcl(results)
+    if not script:
+        return {}
+    response = _execute_batch(
+        script,
+        model_path=working_model,
+        hmbatch_path=hmbatch_path,
+        timeout_seconds=timeout_seconds,
+    )
+    return visible_runner._parse_existing_mesh_probe(_response_text(response))
 
 
 def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
@@ -282,9 +344,44 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     if not classification.get("success"):
         raise RuntimeError("Classification failed.")
     results = classification["results"]
+    existing_mesh = _detect_existing_mesh_by_solid_batch(
+        results,
+        working_model=working_model,
+        hmbatch_path=args.hmbatch,
+        timeout_seconds=args.phase2_timeout,
+    )
+    skipped_existing_mesh = {
+        sid: item for sid, item in existing_mesh.items()
+        if item.get("has_existing_mesh")
+    }
+    for sid, item in skipped_existing_mesh.items():
+        if sid in results:
+            results[sid]["skip_meshing"] = True
+            results[sid]["skip_reason"] = "已有网格，后台模式自动跳过划分"
+            results[sid]["existing_element_count"] = item.get("element_count", 0)
     active_results = {sid: item for sid, item in results.items() if not item.get("skip_meshing")}
-    workflow["steps"]["existing_mesh_skip"] = _existing_mesh_skip_empty(results)
-    workflow["steps"]["classification"]["skipped_existing_mesh_count"] = 0
+    workflow["steps"]["existing_mesh_skip"] = {
+        "skipped_count": len(skipped_existing_mesh),
+        "skipped_solids": [
+            {
+                "solid_id": int(sid),
+                "component_name": results.get(sid, {}).get("component_name") or item.get("component_name", ""),
+                "element_count": item.get("element_count", 0),
+                "detection_mode": item.get("detection_mode", ""),
+                "component_element_count": item.get("component_element_count", 0),
+                "solid_element_count": item.get("solid_element_count", 0),
+            }
+            for sid, item in sorted(skipped_existing_mesh.items(), key=lambda pair: int(pair[0]))
+        ],
+        "solid_count": len(results),
+    }
+    workflow["steps"]["classification"]["skipped_existing_mesh_count"] = len(skipped_existing_mesh)
+    if skipped_existing_mesh:
+        skipped_text = ", ".join(
+            f"{sid}({item.get('element_count', 0)} elems)"
+            for sid, item in sorted(skipped_existing_mesh.items(), key=lambda pair: int(pair[0]))
+        )
+        _log(f"  - skipped existing-mesh solids: {skipped_text}")
 
     phase2_response = _execute_batch(
         _append_save(classification["phase2_finalize_script"], working_model),
@@ -292,6 +389,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         hmbatch_path=args.hmbatch,
         timeout_seconds=args.phase2_timeout,
     )
+    phase2_log_path = RUNS_DIR / f"workflow_phase2_response_{stamp}.log"
+    _write_batch_log(phase2_log_path, phase2_response)
+    phase2_response["log_path"] = str(phase2_log_path)
     workflow["steps"]["phase2_finalize"] = phase2_response
     visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_phase2_response_{stamp}.json", phase2_response)
     if not phase2_response.get("success"):
@@ -331,6 +431,18 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 "one_layer_fallback": visible_runner._drag_one_layer_fallbacks(drag_solids, drag_response),
             }
         )
+        drag_fallback_to_tetra = visible_runner._promote_drag_failures_to_tetra(
+            drag_solids=drag_solids,
+            drag_response=drag_response,
+            active_results=active_results,
+            results=results,
+            trust_successful_results=bool(drag_response.get("success")),
+        )
+        drag_step["fallback_to_tetra"] = drag_fallback_to_tetra
+        if drag_fallback_to_tetra:
+            workflow["warnings"].append(
+                "drag hex failed for some solids; they were promoted to later tetra batches."
+            )
         visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_drag_hex_response_{stamp}.json", drag_response)
         if not drag_response.get("success"):
             workflow["errors"].append({"step": "drag_hex", "response": drag_response})
@@ -357,6 +469,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 split_plane_normal=list(split_normal),
                 split_plane_point=list(split_point),
                 spin_axis=str(spin_solid.get("spin_axis") or spin_solid.get("axis") or "z"),
+                spin_axis_vector=spin_solid.get("spin_axis_vector"),
                 spin_axis_point=list(axis_point),
                 element_size=spin_size,
                 density=args.spin_density_max,
@@ -530,6 +643,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "surface_fit_degraded_keep_surface_mesh_count": ("surface_fit_degraded_keep_surface_mesh", "surface_fit_degraded_keep_surface_mesh"),
         "surface_repair_timeout_keep_surface_mesh_count": ("surface_repair_timeout_keep_surface_mesh", "surface_repair_timeout_keep_surface_mesh"),
         "surface_backup_failed_keep_surface_mesh_count": ("surface_backup_failed_keep_surface_mesh", "surface_backup_failed_keep_surface_mesh"),
+        "tetmesh_failed_keep_surface_mesh_count": ("tetmesh_failed_keep_surface_mesh", "tetmesh_failed_keep_surface_mesh"),
     }
     for key, (status, solid_flag) in quality_error_keys.items():
         count = int(aggregate.get(key) or 0)
@@ -553,6 +667,19 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         )
         workflow["warnings"].append(
             f"tetra quality guard: {count} solid(s) ended as {status}; see Chinese report for details."
+        )
+    tetra_result_failures = visible_runner._tetra_result_failures(repair_summary, plan_batches)
+    if tetra_result_failures:
+        workflow["errors"].append(
+            {
+                "step": "tetra_result",
+                "status": "tetra_failed_or_missing",
+                "solid_count": len(tetra_result_failures),
+                "solids": tetra_result_failures,
+            }
+        )
+        workflow["warnings"].append(
+            f"tetra result guard: {len(tetra_result_failures)} solid(s) failed or did not report a final tetra result."
         )
     workflow["success"] = bool(final_save.get("success")) and bool(final_save.get("output_exists")) and not workflow["errors"]
     report_data = {
@@ -587,6 +714,11 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     }
     report = hm.write_chinese_meshing_workflow_report(report_data, output_path=str(report_path))
     workflow["report_path"] = report.get("report_path")
+    workflow["popup_report_path"] = _write_popup_report(
+        RUNS_DIR / f"workflow_popup_summary_{stamp}.txt",
+        workflow,
+        repair_summary,
+    )
     visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_summary_{stamp}.json", workflow)
     visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / "workflow_latest_summary.json", workflow)
     visible_runner._diag(diagnostic_log_path, "batch_workflow_done", success=workflow["success"], workflow=workflow)

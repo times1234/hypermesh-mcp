@@ -268,6 +268,85 @@ puts "MCP_FINAL_COUNTS elems=[llength $all_elems] shells=$shell_count tet4=$tet4
     return result
 
 
+def _stop_requested(args: argparse.Namespace) -> bool:
+    stop_file = getattr(args, "stop_file", None)
+    return bool(stop_file and Path(stop_file).exists())
+
+
+def _write_stopped_workflow_summary(
+    *,
+    args: argparse.Namespace,
+    workflow: dict[str, Any],
+    stamp: str,
+    stage: str,
+    working_model: Path,
+    output_path: Path,
+    report_path: Path,
+    diagnostic_log_path: Path,
+    repair_summary: dict[str, Any] | None = None,
+    probe_path: Path | None = None,
+    gear_diag_path: Path | None = None,
+) -> dict[str, Any]:
+    _log(f"STOP requested at stage={stage}; saving current working model before exit.")
+    workflow["stopped"] = True
+    workflow["stop_stage"] = stage
+    workflow["warnings"].append(f"User requested stop at {stage}; saved current working model and exited.")
+    workflow["errors"].append({"step": "user_stop", "status": "stopped_after_current_stage", "stage": stage})
+
+    final_save = _final_save_and_count(args=args, working_model=working_model, output_path=output_path)
+    workflow["steps"]["final_save"] = final_save
+    visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_final_save_response_{stamp}.json", final_save)
+    workflow["success"] = False
+
+    if repair_summary is None:
+        repair_summary = {
+            "repair_aggregate": {},
+            "repair_by_solid": {},
+            "tetra_attempted_count": 0,
+            "tetra_done_count": 0,
+            "tetra_failed_count": 0,
+            "tetra_tet4_total": 0,
+        }
+
+    report_data = {
+        "stamp": stamp,
+        "success": False,
+        "output_hm_path": str(output_path),
+        "classification": workflow["steps"].get("classification", {}),
+        "drag_count": int(workflow["steps"].get("drag_hex", {}).get("count") or 0),
+        "drag": workflow["steps"].get("drag_hex", {}),
+        "spin": workflow["steps"].get("spin_hex", {}),
+        "tetra": workflow["steps"].get("tetra", {}),
+        "final_save": final_save,
+        "repair_summary": repair_summary,
+        "errors": workflow["errors"],
+        "warnings": workflow["warnings"],
+        "parameters": vars(args),
+        "part_parameters": [],
+        "skipped_existing_mesh": workflow["steps"].get("existing_mesh_skip", {}),
+        "generated_files": {
+            "探测结果": str(probe_path) if probe_path else "",
+            "中文报告": str(report_path),
+            "最终模型": str(output_path),
+            "实时诊断日志": str(diagnostic_log_path),
+            "齿轮齿面识别诊断": str(gear_diag_path) if gear_diag_path else "",
+        },
+    }
+    report = hm.write_chinese_meshing_workflow_report(report_data, output_path=str(report_path))
+    workflow["report_path"] = report.get("report_path")
+    workflow["popup_report_path"] = _write_popup_report(
+        RUNS_DIR / f"workflow_popup_summary_{stamp}.txt",
+        workflow,
+        repair_summary,
+    )
+    visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_summary_{stamp}.json", workflow)
+    visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / "workflow_latest_summary.json", workflow)
+    visible_runner._diag(diagnostic_log_path, "batch_workflow_stopped", stage=stage, workflow=workflow)
+    _log(f"Stopped after current stage: {stage}")
+    _log(f"Chinese report: {workflow.get('report_path')}")
+    return workflow
+
+
 def _detect_existing_mesh_by_solid_batch(
     results: dict[str, dict[str, Any]],
     *,
@@ -313,6 +392,17 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     workflow["working_model_path"] = str(working_model)
     workflow["steps"]["import"] = import_response
     visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_batch_import_response_{stamp}.json", import_response)
+    if _stop_requested(args):
+        return _write_stopped_workflow_summary(
+            args=args,
+            workflow=workflow,
+            stamp=stamp,
+            stage="import",
+            working_model=working_model,
+            output_path=output_path,
+            report_path=report_path,
+            diagnostic_log_path=diagnostic_log_path,
+        )
 
     _log("[1/6] Probe model")
     probe_text, probe_response, probe_path = _probe_model(args, working_model, stamp)
@@ -323,6 +413,18 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "response": probe_response,
     }
     visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_probe_response_{stamp}.json", probe_response)
+    if _stop_requested(args):
+        return _write_stopped_workflow_summary(
+            args=args,
+            workflow=workflow,
+            stamp=stamp,
+            stage="probe",
+            working_model=working_model,
+            output_path=output_path,
+            report_path=report_path,
+            diagnostic_log_path=diagnostic_log_path,
+            probe_path=probe_path,
+        )
 
     _log("[2/6] Classify solids and run Phase 2")
     classification = hm.classify_all_solids_from_probe(
@@ -382,6 +484,19 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             for sid, item in sorted(skipped_existing_mesh.items(), key=lambda pair: int(pair[0]))
         )
         _log(f"  - skipped existing-mesh solids: {skipped_text}")
+    if _stop_requested(args):
+        return _write_stopped_workflow_summary(
+            args=args,
+            workflow=workflow,
+            stamp=stamp,
+            stage="classification",
+            working_model=working_model,
+            output_path=output_path,
+            report_path=report_path,
+            diagnostic_log_path=diagnostic_log_path,
+            probe_path=probe_path,
+            gear_diag_path=gear_diag_path,
+        )
 
     phase2_response = _execute_batch(
         _append_save(classification["phase2_finalize_script"], working_model),
@@ -396,6 +511,19 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_phase2_response_{stamp}.json", phase2_response)
     if not phase2_response.get("success"):
         raise RuntimeError("Phase 2 finalization failed.")
+    if _stop_requested(args):
+        return _write_stopped_workflow_summary(
+            args=args,
+            workflow=workflow,
+            stamp=stamp,
+            stage="phase2_finalize",
+            working_model=working_model,
+            output_path=output_path,
+            report_path=report_path,
+            diagnostic_log_path=diagnostic_log_path,
+            probe_path=probe_path,
+            gear_diag_path=gear_diag_path,
+        )
 
     _log("[3/6] Run drag-hex solids")
     drag_solids = visible_runner._build_drag_solids(active_results)
@@ -417,6 +545,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             checkpoint_every_n_solids=0,
         )
         drag_script_path = RUNS_DIR / f"workflow_drag_hex_{stamp}.tcl"
+        drag_log_path = RUNS_DIR / f"workflow_drag_hex_{stamp}.log"
         drag_script_path.write_text(drag["script"], encoding="utf-8")
         drag_response = _execute_batch(
             drag["script"],
@@ -424,10 +553,13 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             hmbatch_path=args.hmbatch,
             timeout_seconds=args.drag_timeout,
         )
+        _write_batch_log(drag_log_path, drag_response)
+        drag_response["log_path"] = str(drag_log_path)
         drag_step.update(
             {
                 "success": drag_response.get("success"),
                 "script_path": str(drag_script_path),
+                "log_path": str(drag_log_path),
                 "one_layer_fallback": visible_runner._drag_one_layer_fallbacks(drag_solids, drag_response),
             }
         )
@@ -449,6 +581,19 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             if not args.continue_on_error:
                 raise RuntimeError("Drag-hex step failed.")
     workflow["steps"]["drag_hex"] = drag_step
+    if _stop_requested(args):
+        return _write_stopped_workflow_summary(
+            args=args,
+            workflow=workflow,
+            stamp=stamp,
+            stage="drag_hex",
+            working_model=working_model,
+            output_path=output_path,
+            report_path=report_path,
+            diagnostic_log_path=diagnostic_log_path,
+            probe_path=probe_path,
+            gear_diag_path=gear_diag_path,
+        )
 
     _log("[3.5/6] Run spin-hex solids")
     spin_solids = visible_runner._build_spin_solids(active_results)
@@ -483,6 +628,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 output_hm_path=str(working_model),
             )
             spin_script_path = RUNS_DIR / f"workflow_spin_hex_s{sid}_{stamp}.tcl"
+            spin_log_path = RUNS_DIR / f"workflow_spin_hex_s{sid}_{stamp}.log"
             spin_script_path.write_text(spin["script"], encoding="utf-8")
             spin_response = _execute_batch(
                 spin["script"],
@@ -490,13 +636,15 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 hmbatch_path=args.hmbatch,
                 timeout_seconds=args.spin_timeout,
             )
+            _write_batch_log(spin_log_path, spin_response)
             spin_response["script_path"] = str(spin_script_path)
+            spin_response["log_path"] = str(spin_log_path)
             parsed = visible_runner._parse_spin_results(_response_text(spin_response)).get(str(sid), {})
             spin_response["parsed_result"] = parsed
             spin_responses[str(sid)] = spin_response
             spun_3d_count = int(parsed.get("total3d") or parsed.get("hex8") or 0)
             if spin_response.get("success") and int(parsed.get("ok") or 0) == 1 and spun_3d_count > 0:
-                spin_step["completed"].append({"solid_id": sid, **parsed, "script_path": str(spin_script_path)})
+                spin_step["completed"].append({"solid_id": sid, **parsed, "script_path": str(spin_script_path), "log_path": str(spin_log_path)})
             else:
                 fallback_ids = visible_runner._promote_spin_fallback_solids_to_tetra(
                     parsed=parsed,
@@ -505,7 +653,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                     results=results,
                 )
                 spin_step["fallback_to_tetra"].append(
-                    {"solid_id": sid, **parsed, "fallback_solid_ids": fallback_ids, "script_path": str(spin_script_path)}
+                    {"solid_id": sid, **parsed, "fallback_solid_ids": fallback_ids, "script_path": str(spin_script_path), "log_path": str(spin_log_path)}
                 )
         except Exception as exc:
             fallback_ids = visible_runner._promote_spin_fallback_solids_to_tetra(
@@ -515,9 +663,38 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
                 results=results,
             )
             spin_step["failed"].append({"solid_id": sid, "fallback_solid_ids": fallback_ids, "error": str(exc)})
+        if _stop_requested(args):
+            spin_step["success"] = not spin_step["failed"]
+            workflow["steps"]["spin_hex"] = spin_step
+            visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_spin_hex_responses_{stamp}.json", spin_responses)
+            return _write_stopped_workflow_summary(
+                args=args,
+                workflow=workflow,
+                stamp=stamp,
+                stage=f"spin_hex_s{sid}",
+                working_model=working_model,
+                output_path=output_path,
+                report_path=report_path,
+                diagnostic_log_path=diagnostic_log_path,
+                probe_path=probe_path,
+                gear_diag_path=gear_diag_path,
+            )
     spin_step["success"] = not spin_step["failed"]
     workflow["steps"]["spin_hex"] = spin_step
     visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_spin_hex_responses_{stamp}.json", spin_responses)
+    if _stop_requested(args):
+        return _write_stopped_workflow_summary(
+            args=args,
+            workflow=workflow,
+            stamp=stamp,
+            stage="spin_hex",
+            working_model=working_model,
+            output_path=output_path,
+            report_path=report_path,
+            diagnostic_log_path=diagnostic_log_path,
+            probe_path=probe_path,
+            gear_diag_path=gear_diag_path,
+        )
 
     _log("[4/6] Run tetra batches")
     tetra_batches = visible_runner._build_tetra_batches_from_results(active_results)
@@ -593,6 +770,32 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             workflow["errors"].append({"step": "tetra", **failure})
             if not args.continue_on_error:
                 raise RuntimeError(f"Tetra batch {batch_index} failed: {status}")
+        if _stop_requested(args):
+            workflow["steps"]["tetra"] = tetra_step
+            partial_plan = {
+                "stamp": stamp,
+                "drag_count": len(drag_solids),
+                "spin_count": len(spin_solids),
+                "spin_completed_count": len(spin_step.get("completed", [])),
+                "spin_fallback_count": len(spin_step.get("fallback_to_tetra", [])) + len(spin_step.get("failed", [])),
+                "tetra_batches": plan_batches,
+                "final_save_path": str(output_path),
+            }
+            visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_execution_plan_{stamp}.json", partial_plan)
+            partial_repair_summary = visible_runner._parse_repair_summary(partial_plan)
+            return _write_stopped_workflow_summary(
+                args=args,
+                workflow=workflow,
+                stamp=stamp,
+                stage=f"tetra_batch_{batch_index:02d}",
+                working_model=working_model,
+                output_path=output_path,
+                report_path=report_path,
+                diagnostic_log_path=diagnostic_log_path,
+                repair_summary=partial_repair_summary,
+                probe_path=probe_path,
+                gear_diag_path=gear_diag_path,
+            )
     workflow["steps"]["tetra"] = tetra_step
 
     plan = {
@@ -737,6 +940,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-max-deviation", type=float, default=0.2)
     parser.add_argument("--probe-feature-angle", type=float, default=20.0)
     parser.add_argument("--probe-growth-rate", type=float, default=1.3)
+    parser.add_argument("--stop-file", default=None, help="Optional flag file. If it appears, save current working HM and exit after the current stage.")
     return parser
 
 

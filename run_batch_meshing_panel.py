@@ -33,6 +33,7 @@ class BatchMeshingPanel:
         self.root = root
         self.process: subprocess.Popen[str] | None = None
         self.log_path: Path | None = None
+        self.stop_file: Path | None = None
         self.current_stamp: str | None = None
         self.log_pos = 0
 
@@ -222,6 +223,8 @@ class BatchMeshingPanel:
             self.vars["output"].get(),
             "--stamp",
             stamp,
+            "--stop-file",
+            str(RUNS_DIR / f"stop_background_{stamp}.flag"),
             "--write-json",
             "--drag-element-size",
             self.vars["drag_element_size_max"].get(),
@@ -304,6 +307,9 @@ class BatchMeshingPanel:
         stamp = time.strftime("%Y%m%d_%H%M%S")
         self.current_stamp = stamp
         self.log_path = RUNS_DIR / f"batch_panel_{stamp}.log"
+        self.stop_file = RUNS_DIR / f"stop_background_{stamp}.flag"
+        if self.stop_file.exists():
+            self.stop_file.unlink()
         self.log_pos = 0
         self._replace_log("")
         cmd = self._build_command(stamp)
@@ -329,12 +335,19 @@ class BatchMeshingPanel:
             self.status.set("状态：当前没有运行中的流程")
             return
         pid = self.process.pid
-        self.status.set(f"状态：正在停止 PID={pid}")
+        self.status.set(f"状态：正在请求停止 PID={pid}")
         try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, timeout=30)
+            if not self.stop_file:
+                self.stop_file = RUNS_DIR / f"stop_background_{self.current_stamp or 'manual'}.flag"
+            self.stop_file.parent.mkdir(exist_ok=True)
+            self.stop_file.write_text(
+                f"stop requested at {time.strftime('%Y-%m-%d %H:%M:%S')} for PID={pid}\n",
+                encoding="utf-8",
+            )
+            self._append_log(f"\n已请求停止：{self.stop_file}\n当前 hmbatch 阶段结束后会保存输出 HM 并退出。\n")
         except Exception as exc:
-            self._append_log(f"\n停止命令异常：{exc}\n")
-        self.status.set("状态：已发送停止命令")
+            self._append_log(f"\n停止请求写入失败：{exc}\n")
+        self.status.set("状态：已请求停止，等待当前阶段保存后退出")
 
     def _poll(self) -> None:
         if self.log_path and self.log_path.exists():

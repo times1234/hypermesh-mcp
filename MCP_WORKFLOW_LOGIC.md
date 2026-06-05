@@ -159,7 +159,9 @@ Phase 2 的核心是 `classify_all_solids_from_probe`。它只根据 Phase 1 的
 
 对轴线相对全局 X/Y/Z 有倾角的恒截面件，如果 Phase 1 输出 `axis_mode=oblique`，并且源面和目标面都明确、厚径比仍满足 drag 条件，也会归入 `drag_hex`。此时 drag 方向直接使用 `axis_vec`，drag 距离优先使用 `drag_distance_hint`。分类阶段会再次检查 `drag_distance_hint` 是否接近实体最薄尺寸；如果差得太多，说明很可能选到了侧面对而不是端面对，会放弃 vector drag，避免生成轴线歪斜的 hex。
 
-drag 的前提是源面能划出全 quad，否则后续 drag 生成 hex 的质量和完整性都很难保证。
+对薄盘、短圆柱这类表面数较少但整体轴线相对全局坐标倾斜的实体，Phase 1 还会在严格偏轴端面对匹配失败后做一轮薄件专用的松弛匹配。该松弛只在 `surf_count <= 12` 且最薄尺寸明显小于整体对角线时启用，仍要求两张端面都有边界 loop、距离接近厚度、面积相近且中心连线与端面法向大致一致。后台生成探针和前台探针都必须重新临时划分 `src_surf` 来计算 `src_loops/src_boundary_edges`，不能复用已删除或不可靠的整实体临时网格选择结果，否则有效端面会被误记为 `src_loops=0` 并被打回 tetra。
+
+drag 的前提是源面能划出全 quad，否则后续 drag 生成 hex 的质量和完整性都很难保证。执行阶段如果首次源面 automesh 混入少量 triangle，会按不同 face mode、尺寸系数和是否手工边密度继续重试，日志中以 `MCP_DRAG_SOURCE_TRY` 记录；只有所有重试仍无法得到全 quad 源面时才放弃 drag 并转入 tetra。
 
 ### 3.3 spin_hex 分类原理
 

@@ -55,6 +55,7 @@ namespace eval ::hm_mcp_launcher {
     variable current_log ""
     variable current_stamp ""
     variable current_mode ""
+    variable current_stop_file ""
     variable background_input_path ""
     variable last_log_size 0
     variable log_poll_ms 4000
@@ -342,6 +343,10 @@ proc ::hm_mcp_launcher::build_command {{mode full}} {
         --gear-tooth-feature-angle $gear_tooth_feature_angle]
     if {$mode eq "background"} {
         lappend cmd --input $background_input_path
+        variable current_stop_file
+        if {$current_stop_file ne ""} {
+            lappend cmd --stop-file $current_stop_file
+        }
     }
     if {$continue_on_error} {
         lappend cmd --continue-on-error
@@ -599,6 +604,7 @@ proc ::hm_mcp_launcher::start_workflow {{mode full}} {
     variable current_log
     variable current_stamp
     variable current_mode
+    variable current_stop_file
     variable last_log_size
     variable last_pid_check_ms
 
@@ -611,12 +617,17 @@ proc ::hm_mcp_launcher::start_workflow {{mode full}} {
     ensure_directories
     set current_stamp [make_stamp]
     set current_mode $mode
+    set current_stop_file ""
     if {$mode eq "gear_preview"} {
         set current_log [file normalize [file join $project_dir runs "panel_gear_tooth_preview_$current_stamp.log"]]
     } elseif {$mode eq "delete_gear_preview"} {
         set current_log [file normalize [file join $project_dir runs "panel_delete_gear_tooth_preview_$current_stamp.log"]]
     } elseif {$mode eq "background"} {
         set current_log [file normalize [file join $project_dir runs "panel_background_workflow_$current_stamp.log"]]
+        set current_stop_file [file normalize [file join $project_dir runs "stop_background_$current_stamp.flag"]]
+        if {[file exists $current_stop_file]} {
+            catch {file delete $current_stop_file}
+        }
     } else {
         set current_log [file normalize [file join $project_dir runs "panel_workflow_$current_stamp.log"]]
     }
@@ -671,6 +682,9 @@ proc ::hm_mcp_launcher::start_workflow {{mode full}} {
 proc ::hm_mcp_launcher::stop_workflow {} {
     variable current_pid
     variable current_log
+    variable current_mode
+    variable current_stop_file
+    variable log_poll_ms
 
     if {$current_pid eq ""} {
         set_status "当前没有运行中的流程"
@@ -680,15 +694,38 @@ proc ::hm_mcp_launcher::stop_workflow {} {
     }
 
     set pid $current_pid
-    set current_pid ""
-    set_status "正在停止 PID=$pid"
-    append_log "\n正在停止后台 Python 流程 PID=$pid ...\n"
-    if {[catch {exec taskkill /PID $pid /T /F} err]} {
-        set_status "停止命令已执行，请检查日志"
-        append_log "停止命令返回：$err\n如果 HyperMesh 已经开始执行一段很长的 Tcl，可能会完成当前命令后才停下来。\n日志：$current_log\n"
+    if {$current_mode eq "background"} {
+        if {$current_stop_file eq ""} {
+            variable project_dir
+            variable current_stamp
+            set current_stop_file [file normalize [file join $project_dir runs "stop_background_$current_stamp.flag"]]
+        }
+        set_status "已请求停止，等待当前阶段保存"
+        append_log "\n正在请求后台划分停止 PID=$pid ...\n"
+        if {[catch {
+            set fh [open $current_stop_file w]
+            fconfigure $fh -encoding utf-8
+            puts $fh "stop requested at [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}] for PID=$pid"
+            close $fh
+        } err]} {
+            catch {close $fh}
+            set_status "停止请求写入失败"
+            append_log "停止请求写入失败：$err\n日志：$current_log\n"
+        } else {
+            append_log "已写入停止请求：$current_stop_file\n当前 hmbatch 阶段结束后会保存输出 HM，然后本面板会自动打开该 HM。\n"
+        }
+        after $log_poll_ms ::hm_mcp_launcher::poll_log
     } else {
-        set_status "已停止后台 Python 流程"
-        append_log "后台 Python 流程已停止。如果 HyperMesh 正在执行已提交的 Tcl，可能还会短暂继续当前命令。\n"
+        set current_pid ""
+        set_status "正在停止 PID=$pid"
+        append_log "\n正在停止后台 Python 流程 PID=$pid ...\n"
+        if {[catch {exec taskkill /PID $pid /T /F} err]} {
+            set_status "停止命令已执行，请检查日志"
+            append_log "停止命令返回：$err\n如果 HyperMesh 已经开始执行一段很长的 Tcl，可能会完成当前命令后才停下来。\n日志：$current_log\n"
+        } else {
+            set_status "已停止后台 Python 流程"
+            append_log "后台 Python 流程已停止。如果 HyperMesh 正在执行已提交的 Tcl，可能还会短暂继续当前命令。\n"
+        }
     }
     keep_panel_visible
 }

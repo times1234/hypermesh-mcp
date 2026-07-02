@@ -9,6 +9,7 @@ not require a visible HyperMesh GUI listener: every phase is executed by
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 import time
@@ -102,6 +103,7 @@ def _write_popup_report(
     repair_summary: dict[str, Any],
 ) -> str:
     errors = summary.get("errors") or []
+    probe_skipped = (summary.get("steps", {}).get("probe", {}) or {}).get("skipped_solids", []) or []
     quality_errors = [item for item in errors if item.get("step") == "tetra_quality"]
     by_solid: dict[int, dict[str, Any]] = {}
     for item in quality_errors:
@@ -113,8 +115,23 @@ def _write_popup_report(
             merged = by_solid.setdefault(sid, {"solid_id": sid})
             merged.update(solid)
     rolled_back = [by_solid[sid] for sid in sorted(by_solid)]
+    sections: list[str] = []
+    if probe_skipped:
+        lines = [
+            "后台探针跳过提示",
+            "",
+            f"有 {len(probe_skipped)} 个实体在探针阶段失败，后续已自动跳过划分：",
+        ]
+        for item in probe_skipped:
+            lines.append(
+                f"- solid {item.get('solid_id', '')} {item.get('component_name', '')}: "
+                f"{item.get('reason', item.get('status', 'probe failed'))}"
+            )
+        sections.append("\n".join(lines))
     if rolled_back:
-        text = visible_runner._rolled_back_popup_message(rolled_back, repair_summary)
+        sections.append(visible_runner._rolled_back_popup_message(rolled_back, repair_summary))
+    if sections:
+        text = "\n\n".join(sections)
     else:
         text = "网格退回提醒\n\n没有实体退回到 2D 面网格。"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -200,6 +217,131 @@ puts "MCP_BATCH_IMPORT_DONE output={_tcl_path(working_model)}"
     return working_model, response
 
 
+def _probe_script_for_hmbatch(generated: dict[str, Any]) -> str:
+    probe_script = str(generated["script"]).rstrip()
+    probe_return = "return $::mcp_probe_output"
+    if probe_script.endswith(probe_return):
+        return probe_script[: -len(probe_return)].rstrip() + "\nputs $::mcp_probe_output\n"
+    return probe_script + "\ncatch {puts $::mcp_probe_output}\n"
+
+
+def _probe_targets(
+    *,
+    args: argparse.Namespace,
+    working_model: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    script = """
+*createmark solids 1 all
+set solids [lsort -integer [hm_getmark solids 1]]
+puts "MCP_PROBE_TARGET_BEGIN count=[llength $solids]"
+foreach sid $solids {
+    set surf_count 0
+    set comp_name ""
+    catch {
+        *createmark surfs 1 "by solids" $sid
+        set surf_count [llength [hm_getmark surfs 1]]
+    }
+    catch {
+        *createmark comps 1 "by solids" $sid
+        set cids [hm_getmark comps 1]
+        if {[llength $cids] > 0} {
+            set cid [lindex $cids 0]
+            set comp_name [hm_getvalue comps id=$cid dataname=name]
+        }
+    }
+    set comp_name [string map {"\\n" " " "\\r" " " "\\t" " "} $comp_name]
+    puts "MCP_PROBE_TARGET solid=$sid surf_count=$surf_count comp=$comp_name"
+}
+puts "MCP_PROBE_TARGET_END"
+""".lstrip()
+    response = _execute_batch(
+        script,
+        model_path=working_model,
+        hmbatch_path=args.hmbatch,
+        timeout_seconds=min(max(30, int(args.probe_timeout)), 180),
+    )
+    targets: list[dict[str, Any]] = []
+    for line in _response_text(response).splitlines():
+        match = re.match(r"^MCP_PROBE_TARGET solid=(\d+) surf_count=(\d+) comp=(.*)$", line.strip())
+        if not match:
+            continue
+        targets.append(
+            {
+                "solid_id": int(match.group(1)),
+                "surf_count": int(match.group(2)),
+                "component_name": match.group(3).strip(),
+            }
+        )
+    return targets, response
+
+
+def _probe_solid_has_usable_data(lines: list[str], solid_id: int) -> bool:
+    prefix = f"MCP_PROBE_SOLID id={int(solid_id)} "
+    for line in lines:
+        if not line.startswith(prefix):
+            continue
+        facts = _probe_line_facts(line)
+        return facts.get("exists") != "0" and facts.get("bbox_ok") == "1"
+    return False
+
+
+def _probe_line_facts(line: str) -> dict[str, str]:
+    return {
+        token.split("=", 1)[0]: token.split("=", 1)[1]
+        for token in line.split()
+        if "=" in token
+    }
+
+
+def _skipped_solids_from_probe_lines(
+    lines: list[str],
+    targets: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    target_by_id = {int(item["solid_id"]): item for item in (targets or [])}
+    skipped: list[dict[str, Any]] = []
+    for line in lines:
+        if not line.startswith("MCP_PROBE_SOLID"):
+            continue
+        facts = _probe_line_facts(line)
+        try:
+            sid = int(facts.get("id", "0"))
+        except ValueError:
+            continue
+        if sid <= 0 or (facts.get("exists") != "0" and facts.get("bbox_ok") == "1"):
+            continue
+        target = target_by_id.get(sid, {})
+        reason = "probe returned no usable bbox data"
+        if "mesh_error" in facts:
+            reason = "probe temporary surface mesh failed"
+        elif facts.get("exists") == "0":
+            reason = "solid no longer exists during probe"
+        skipped.append(
+            {
+                "solid_id": sid,
+                "component_name": target.get("component_name", ""),
+                "surf_count": int(facts.get("surf_count", target.get("surf_count", 0)) or 0),
+                "status": "probe_failed_skip_meshing",
+                "reason": reason,
+            }
+        )
+    return skipped
+
+
+def _probe_failure_reason(response: dict[str, Any], lines: list[str], solid_id: int) -> str:
+    prefix = f"MCP_PROBE_SOLID id={int(solid_id)} "
+    for line in lines:
+        if line.startswith(prefix) and "mesh_error=" in line:
+            return "probe temporary surface mesh failed"
+    text = _response_text(response)
+    if "All surfaces failed to mesh" in text:
+        return "All surfaces failed to mesh"
+    if response.get("timeout"):
+        return "probe timeout"
+    if not response.get("success"):
+        return "hmbatch probe command failed"
+    return "probe returned no usable bbox data"
+
+
 def _probe_model(args: argparse.Namespace, working_model: Path, stamp: str) -> tuple[str, dict[str, Any], Path]:
     generated = hm.generate_geometry_probe_tcl(
         probe_element_size=args.probe_element_size,
@@ -208,12 +350,7 @@ def _probe_model(args: argparse.Namespace, working_model: Path, stamp: str) -> t
         max_feature_angle=args.probe_feature_angle,
         growth_rate=args.probe_growth_rate,
     )
-    probe_script = generated["script"].rstrip()
-    probe_return = "return $::mcp_probe_output"
-    if probe_script.endswith(probe_return):
-        probe_script = probe_script[: -len(probe_return)].rstrip() + "\nputs $::mcp_probe_output\n"
-    else:
-        probe_script += "\ncatch {puts $::mcp_probe_output}\n"
+    probe_script = _probe_script_for_hmbatch(generated)
     response = _execute_batch(
         probe_script,
         model_path=working_model,
@@ -225,9 +362,107 @@ def _probe_model(args: argparse.Namespace, working_model: Path, stamp: str) -> t
     response["log_path"] = str(response_log_path)
     probe_text = "\n".join(hm._extract_probe_lines(_response_text(response)))
     probe_path = RUNS_DIR / f"workflow_probe_{stamp}.txt"
+    if response.get("success") and probe_text.strip():
+        probe_lines = probe_text.splitlines()
+        skipped_solids = _skipped_solids_from_probe_lines(probe_lines)
+        if skipped_solids:
+            targets, target_response = _probe_targets(args=args, working_model=working_model)
+            skipped_solids = _skipped_solids_from_probe_lines(probe_lines, targets)
+            response["target_response"] = target_response
+        response["probe_mode"] = "all_solids"
+        response["skipped_solids"] = skipped_solids
+        response["skipped_count"] = len(skipped_solids)
+        probe_path.write_text(probe_text, encoding="utf-8")
+        return probe_text, response, probe_path
+
+    _log("  - full-model probe failed; retrying probe per solid and skipping failed solids")
+    targets, target_response = _probe_targets(args=args, working_model=working_model)
+    if not targets:
+        probe_path.write_text(probe_text, encoding="utf-8")
+        response["probe_mode"] = "all_solids_failed"
+        response["target_response"] = target_response
+        raise RuntimeError("Geometry probe failed and solid list could not be read.")
+
+    aggregate_lines = [f"MCP_PROBE_BEGIN solid_count={len(targets)} probe_size={args.probe_element_size} mode=per_solid_skip_failed"]
+    skipped_solids: list[dict[str, Any]] = []
+    completed_solids: list[int] = []
+    per_solid_logs: list[dict[str, Any]] = []
+    for index, target in enumerate(targets, start=1):
+        sid = int(target["solid_id"])
+        _log(f"    probe solid {index}/{len(targets)} id={sid}")
+        single = hm.generate_geometry_probe_tcl(
+            solid_ids=[sid],
+            probe_element_size=args.probe_element_size,
+            min_element_size=args.probe_min_element_size,
+            max_deviation=args.probe_max_deviation,
+            max_feature_angle=args.probe_feature_angle,
+            growth_rate=args.probe_growth_rate,
+        )
+        single_response = _execute_batch(
+            _probe_script_for_hmbatch(single),
+            model_path=working_model,
+            hmbatch_path=args.hmbatch,
+            timeout_seconds=args.probe_timeout,
+        )
+        single_lines = [
+            line for line in hm._extract_probe_lines(_response_text(single_response))
+            if line.startswith("MCP_PROBE_SOLID")
+        ]
+        if single_response.get("success") and _probe_solid_has_usable_data(single_lines, sid):
+            aggregate_lines.extend(single_lines)
+            completed_solids.append(sid)
+        else:
+            reason = _probe_failure_reason(single_response, single_lines, sid)
+            skipped_solids.append(
+                {
+                    "solid_id": sid,
+                    "component_name": target.get("component_name", ""),
+                    "surf_count": target.get("surf_count", 0),
+                    "status": "probe_failed_skip_meshing",
+                    "reason": reason,
+                }
+            )
+            aggregate_lines.append(
+                "MCP_PROBE_SOLID "
+                f"id={sid} exists=1 surf_count={int(target.get('surf_count') or 0)} "
+                "elem_count=0 node_count=0 bbox_ok=0 "
+                f"mesh_error={{{reason}}}"
+            )
+            _log(f"      skipped solid {sid}: {reason}")
+        per_solid_logs.append(
+            {
+                "solid_id": sid,
+                "success": bool(single_response.get("success")),
+                "returncode": single_response.get("returncode"),
+                "timeout": bool(single_response.get("timeout")),
+                "line_count": len(single_lines),
+                "stdout_tail": str(single_response.get("stdout", ""))[-1000:],
+                "stderr_tail": str(single_response.get("stderr", ""))[-1000:],
+            }
+        )
+    aggregate_lines.append("MCP_PROBE_END")
+    probe_text = "\n".join(aggregate_lines)
     probe_path.write_text(probe_text, encoding="utf-8")
-    if not response.get("success") or not probe_text.strip():
-        raise RuntimeError("Geometry probe failed or returned no probe lines.")
+
+    response = {
+        "success": bool(completed_solids),
+        "probe_mode": "per_solid_skip_failed",
+        "fallback_from_full_probe": True,
+        "full_probe_response": response,
+        "target_response": target_response,
+        "completed_solids": completed_solids,
+        "skipped_solids": skipped_solids,
+        "skipped_count": len(skipped_solids),
+        "solid_count": len(targets),
+        "per_solid_logs": per_solid_logs,
+        "log_path": str(response_log_path),
+        "stdout": probe_text,
+        "stderr": "",
+        "response": probe_text,
+    }
+    _write_batch_log(response_log_path, response)
+    if not completed_solids:
+        raise RuntimeError("Geometry probe failed for every solid; no solids can be meshed.")
     return probe_text, response, probe_path
 
 
@@ -323,6 +558,7 @@ def _write_stopped_workflow_summary(
         "warnings": workflow["warnings"],
         "parameters": vars(args),
         "part_parameters": [],
+        "skipped_probe": workflow["steps"].get("probe", {}),
         "skipped_existing_mesh": workflow["steps"].get("existing_mesh_skip", {}),
         "generated_files": {
             "探测结果": str(probe_path) if probe_path else "",
@@ -410,8 +646,23 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "success": probe_response.get("success"),
         "output_file": str(probe_path),
         "line_count": len(probe_text.splitlines()),
+        "probe_mode": probe_response.get("probe_mode", "all_solids"),
+        "skipped_count": int(probe_response.get("skipped_count") or 0),
+        "skipped_solids": probe_response.get("skipped_solids", []) or [],
         "response": probe_response,
     }
+    if workflow["steps"]["probe"]["skipped_solids"]:
+        workflow["errors"].append(
+            {
+                "step": "probe",
+                "status": "probe_failed_skip_meshing",
+                "solid_count": workflow["steps"]["probe"]["skipped_count"],
+                "solids": workflow["steps"]["probe"]["skipped_solids"],
+            }
+        )
+        workflow["warnings"].append(
+            f"probe skipped {workflow['steps']['probe']['skipped_count']} solid(s); they will not be meshed."
+        )
     visible_runner._write_json_if_enabled(args.write_json, RUNS_DIR / f"workflow_probe_response_{stamp}.json", probe_response)
     if _stop_requested(args):
         return _write_stopped_workflow_summary(
@@ -442,6 +693,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "success": classification.get("success"),
         "total_solids": classification.get("total_solids"),
         "strategy_counts": classification.get("strategy_counts"),
+        "probe_skipped_count": workflow["steps"]["probe"].get("skipped_count", 0),
     }
     if not classification.get("success"):
         raise RuntimeError("Classification failed.")
@@ -906,6 +1158,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "warnings": workflow["warnings"],
         "parameters": vars(args),
         "part_parameters": part_parameters,
+        "skipped_probe": workflow["steps"].get("probe", {}),
         "skipped_existing_mesh": workflow["steps"].get("existing_mesh_skip", {}),
         "generated_files": {
             "探测结果": str(probe_path),

@@ -342,6 +342,21 @@ proc ::hm_mcp_launcher::build_command {{mode full}} {
         --gear-tooth-min-element-size-max $gear_tooth_min_element_size_max \
         --gear-tooth-feature-angle $gear_tooth_feature_angle]
     if {$mode eq "background"} {
+        set hmbatch_config [file normalize [file join $project_dir hypermesh_batch_path.txt]]
+        if {[file exists $hmbatch_config]} {
+            if {![catch {
+                set fh [open $hmbatch_config r]
+                fconfigure $fh -encoding utf-8
+                set hmbatch_path [string trim [gets $fh]]
+                close $fh
+            }]} {
+                if {$hmbatch_path ne "" && [file exists $hmbatch_path]} {
+                    lappend cmd --hmbatch $hmbatch_path
+                }
+            } else {
+                catch {close $fh}
+            }
+        }
         lappend cmd --input $background_input_path
         variable current_stop_file
         if {$current_stop_file ne ""} {
@@ -514,6 +529,16 @@ proc ::hm_mcp_launcher::vbs_quote {value} {
 proc ::hm_mcp_launcher::start_hidden_logged_process {cmd log_path} {
     variable project_dir
     variable current_stamp
+
+    if {![catch {
+        set pids [exec {*}$cmd > $log_path 2>@1 &]
+    } direct_err]} {
+        return $pids
+    }
+
+    if {[llength [info commands puts]] == 0} {
+        error "direct background launch failed: $direct_err; Tcl puts command is unavailable, cannot create hidden launcher files"
+    }
 
     set cmd_path [file normalize [file join $project_dir runs "panel_hidden_launch_$current_stamp.cmd"]]
     set vbs_path [file normalize [file join $project_dir runs "panel_hidden_launch_$current_stamp.vbs"]]

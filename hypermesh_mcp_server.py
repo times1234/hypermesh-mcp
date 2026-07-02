@@ -323,6 +323,15 @@ def _candidate_hmbatch_paths() -> list[Path]:
     if env_path:
         candidates.append(env_path)
 
+    local_config = ROOT / "hypermesh_batch_path.txt"
+    if local_config.exists():
+        try:
+            config_path = _normalize_path(local_config.read_text(encoding="utf-8", errors="replace").splitlines()[0])
+        except IndexError:
+            config_path = None
+        if config_path:
+            candidates.append(config_path)
+
     candidates.extend(
         [
             DEFAULT_HMBATCH,
@@ -6572,6 +6581,11 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
         if isinstance(report_data.get("skipped_existing_mesh"), dict)
         else {}
     )
+    skipped_probe = (
+        report_data.get("skipped_probe", {})
+        if isinstance(report_data.get("skipped_probe"), dict)
+        else {}
+    )
 
     def _extreme_surface_aspect(info: dict[str, Any], suffix: str = "count") -> Any:
         return info.get(f"extreme_surface_aspect_{suffix}", info.get(f"surface_aspect_over_100_{suffix}"))
@@ -6639,6 +6653,18 @@ def build_chinese_meshing_workflow_report(report_data: dict[str, Any]) -> str:
                 f"  - solid {item.get('solid_id', '')} "
                 f"{item.get('component_name', '')}: 已有单元数量={_mcp_fmt_int(item.get('element_count', 0))}"
             )
+    if skipped_probe:
+        probe_skipped_solids = skipped_probe.get("skipped_solids", []) or []
+        if probe_skipped_solids:
+            lines.append(
+                "探针失败并跳过划分的实体数量："
+                f"{_mcp_fmt_int(skipped_probe.get('skipped_count', len(probe_skipped_solids)))}"
+            )
+            for item in probe_skipped_solids:
+                lines.append(
+                    f"  - solid {item.get('solid_id', '')} "
+                    f"{item.get('component_name', '')}: {item.get('reason', item.get('status', 'probe failed'))}"
+                )
     lines.append("")
 
     lines.append("二、网格生成结果")
